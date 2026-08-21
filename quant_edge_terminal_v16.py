@@ -681,27 +681,45 @@ def run_universe_scan(tickers, period, interval, is_intraday, use_orb, rr,
         is_runner = bool(latest.get('One_Way_Runner', False))
         
         if scan_mode == "RUNNERS_ONLY" and not is_runner: continue
-        if scan_mode == "EOD_PLAYBOOK":
-            # For EOD playbook, we want daily chart setups that are Coiled (High Confluence)
-            if not (bull or bear): continue
+        if scan_mode == "EOD_PLAYBOOK" or scan_mode == "TOP5_ONLY":
+            # For EOD playbook and Top 5, we want the highest confluence setups.
+            # We don't require an active sweep right on the current candle.
+            pass
         else:
+            # For ALL live scans, require an active trigger
             if not (bull or bear) and not is_runner: continue
             
-        if not regime_fn(bull if bull else not bear): continue
+        if not passes_regime_filter(bull if bull else not bear): continue
         
         score = latest.get('Confluence_Score', 0)
         if pd.isna(score) or score < min_score: continue
         
         trig = latest['Entry_Trigger']; sl_v = latest['Stop_Loss']; tp_v = latest['Take_Profit']
-        if pd.isna(trig) or pd.isna(sl_v): continue
+        # If no active trigger, create a hypothetical one based on ATR for the table
+        if pd.isna(trig) or pd.isna(sl_v):
+            atr_val = latest.get('ATR14', latest['Close'] * 0.02)
+            is_uptrend = latest.get('EMA_20', 0) > latest.get('EMA_50', 0)
+            if is_uptrend:
+                trig = latest['Close']
+                sl_v = trig - atr_val
+                tp_v = trig + (atr_val * rr)
+            else:
+                trig = latest['Close']
+                sl_v = trig + atr_val
+                tp_v = trig - (atr_val * rr)
         
         qty, dep = position_size(capital, risk_pct, trig, sl_v)
         sig_time = latest.name.strftime('%Y-%m-%d %H:%M') if hasattr(latest.name, 'strftime') else str(latest.name)
         
         # Determine setup label
-        setup_label = 'BUY' if bull else 'SELL'
         if is_runner and scan_mode == "RUNNERS_ONLY":
             setup_label = latest.get('Runner_Type', 'RUNNER')
+        elif bull:
+            setup_label = 'BUY (Sweep/ORB)'
+        elif bear:
+            setup_label = 'SELL (Sweep/ORB)'
+        else:
+            setup_label = 'BUY (Trend)' if latest.get('EMA_20', 0) > latest.get('EMA_50', 0) else 'SELL (Trend)'
 
         rows.append({
             'Symbol': ticker.replace('.NS', ''), 'Signal': setup_label,
@@ -867,7 +885,7 @@ with st.sidebar:
 
 def passes_regime_filter(is_bull):
     if not apply_regime_filter: return True
-    if market_regime in ("CHOPPY", "UNKNOWN"): return False
+    if market_regime in ("CHOPPY", "UNKNOWN"): return True  # Allow both sides if choppy
     if market_regime == "BULL" and not is_bull: return False
     if market_regime == "BEAR" and is_bull: return False
     return True
