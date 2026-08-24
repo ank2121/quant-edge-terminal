@@ -1117,25 +1117,28 @@ def run_scanner(tickers, period, interval, is_intraday, use_orb, rr, min_score,
     return rows
 
 # =============================================================================
-# DAILY SUPERTREND DIRECTIONS (Cached)
 # =============================================================================
-@st.cache_data(ttl=1800)
-def compute_daily_st_directions(tickers_tuple):
-    tickers = list(tickers_tuple)
-    bulk = fetch_bulk_data(tuple(tickers), period="6mo", interval="1d")
+# DAILY SUPERTREND DIRECTIONS (Internal Helper)
+# =============================================================================
+def _get_daily_st_directions_internal(tickers):
     dirs = {}
-    for t in tickers:
-        d = get_symbol_df(bulk, t, "6mo", "1d", min_len=30)
-        if d.empty or len(d) < 30: dirs[t] = 0; continue
-        d = compute_supertrend(d.copy(), period=10, multiplier=2.0)
-        last_d = d['ST_Dir'].dropna()
-        dirs[t] = int(last_d.iloc[-1]) if not last_d.empty else 0
+    try:
+        bulk = fetch_bulk_data(tuple(tickers), period="6mo", interval="1d")
+        for t in tickers:
+            d = get_symbol_df(bulk, t, "6mo", "1d", min_len=30)
+            if d.empty or len(d) < 30: dirs[t] = 0; continue
+            d = compute_supertrend(d.copy(), period=10, multiplier=2.0)
+            last_d = d['ST_Dir'].dropna()
+            dirs[t] = int(last_d.iloc[-1]) if not last_d.empty else 0
+    except Exception: pass
     return dirs
 
 # =============================================================================
-# PRE-MARKET HERO SCANNER (Fixed with trend + 0.70% validation)
+# PRE-MARKET HERO SCANNER (Cached & Optimized)
 # =============================================================================
-def scan_heroes(tickers):
+@st.cache_data(ttl=120)
+def scan_heroes(tickers_tuple):
+    tickers = list(tickers_tuple)
     bulk = fetch_bulk_data(tuple(tickers), period="5d", interval="1d")
     candidates = []
     for t in tickers:
@@ -1176,21 +1179,24 @@ def scan_heroes(tickers):
     return hero_long, hero_short
 
 # =============================================================================
-# BACKGROUND SCAN THREADING
+# BACKGROUND SCAN THREADING (True Non-Blocking)
 # =============================================================================
-_scan_locks = {}
-
 def start_background_scan(scan_key, tickers, period, interval, is_intraday, use_orb,
                            rr, min_score, nifty_rs, capital, risk_pct, regime,
-                           daily_dirs, scan_mode):
-    """Launch scan in background thread — non-blocking"""
+                           scan_mode):
+    """Launch scan in background thread — instant return, zero main thread block"""
 
     def worker():
         try:
-            write_scan_status(scan_key, "running", 0)
+            write_scan_status(scan_key, "running", 0.05)
+
+            # Compute daily directions inside worker thread
+            daily_dirs = _get_daily_st_directions_internal(tickers)
+            write_scan_status(scan_key, "running", 0.15)
 
             def progress_cb(p):
-                write_scan_status(scan_key, "running", p)
+                # Scale progress from 15% to 95%
+                write_scan_status(scan_key, "running", 0.15 + (p * 0.80))
 
             results = run_scanner(
                 tickers, period, interval, is_intraday, use_orb, rr, min_score,
@@ -1251,9 +1257,9 @@ with h2:
     st.markdown(f"<div class='last-updated'>{get_ist_now().strftime('%d %b %Y • %I:%M %p IST')}</div>", unsafe_allow_html=True)
 
 # Hero Banner
-hero_long, hero_short = scan_heroes(FO_UNIVERSE)
+hero_long, hero_short = scan_heroes(tuple(FO_UNIVERSE))
 if hero_long or hero_short:
-    ht = "🏆 <b>INSTITUTIONAL HEROES</b> 🏆<br/>"
+    ht = "🏆 <b>PRE-MARKET INSTITUTIONAL HEROES</b> 🏆<br/>"
     if hero_long:
         ht += f"🟢 <b>{hero_long['Symbol']}</b> {hero_long['Conf']} (+{hero_long['Gap']:.1f}% • ₹{hero_long['Money']:.0f}Cr) "
     if hero_short:
@@ -1455,34 +1461,59 @@ def _display_list(results, live_prices):
                      height=min(450, 35 * len(rows) + 38))
 
 # =============================================================================
-# MAIN TABS — PRE-MARKET EOD | LIVE SCREENER | TOOLS
+# MAIN TABS — PRE-MARKET SCREENER | LIVE SCREENER | TOOLS
 # =============================================================================
-tab_eod, tab_live, tab_tools = st.tabs(["📅 PRE-MARKET EOD", "⚡ LIVE SCREENER", "🛠️ TOOLS"])
+tab_premarket, tab_live, tab_tools = st.tabs(["🌅 PRE-MARKET SCREENER", "⚡ LIVE SCREENER", "🛠️ TOOLS"])
 
 # ═══════════════════════════════════════════════════════════════
-# TAB 1: PRE-MARKET EOD
+# TAB 1: PRE-MARKET SCREENER
 # ═══════════════════════════════════════════════════════════════
-with tab_eod:
-    eod1, eod2 = st.tabs(["🌅 Intraday Picks", "📈 Swing Picks"])
+with tab_premarket:
+    ps1, ps2, ps3 = st.tabs(["⚡ Pre-Market Open Heroes (09:08 AM)", "📅 Intraday EOD Picks", "📈 Swing EOD Picks"])
 
-    with eod1:
-        st.markdown("### 🌅 Intraday EOD Top 5")
-        st.markdown("<div class='info-panel'>📊 Top 5 highest-conviction intraday setups from daily chart analysis • 15m+30m+1h confluence • Weekly Pivot</div>", unsafe_allow_html=True)
+    with ps1:
+        st.markdown("### ⚡ Pre-Market Open Heroes (09:00 AM – 09:08 AM)")
+        st.markdown("<div class='info-panel'>🏆 Reads NSE Pre-Open Auction data at 09:08 AM to find high-turnover institutional gap-ups and gap-downs with Daily Trend confirmation.</div>", unsafe_allow_html=True)
+        if hero_long or hero_short:
+            hc1, hc2 = st.columns(2)
+            if hero_long:
+                with hc1:
+                    st.markdown(f"""
+                    <div class='glass-card' style='border-left: 4px solid #00ffaa;'>
+                        <div style='font-size:18px;font-weight:800;color:#00ffaa;'>🟢 BULL HERO: {hero_long['Symbol']} {hero_long['Conf']}</div>
+                        <div style='font-size:14px;margin-top:6px;'>Opening Price: <b>₹{hero_long['LTP']:,.1f}</b> ({'+' if hero_long['Gap']>=0 else ''}{hero_long['Gap']:.2f}%)</div>
+                        <div style='font-size:12px;color:#8b90b0;'>Pre-Open Turnover: <b>₹{hero_long['Money']:,.0f} Cr</b></div>
+                    </div>
+                    """, unsafe_allow_html=True)
+            if hero_short:
+                with hc2:
+                    st.markdown(f"""
+                    <div class='glass-card' style='border-left: 4px solid #ff3366;'>
+                        <div style='font-size:18px;font-weight:800;color:#ff3366;'>🔴 BEAR HERO: {hero_short['Symbol']} {hero_short['Conf']}</div>
+                        <div style='font-size:14px;margin-top:6px;'>Opening Price: <b>₹{hero_short['LTP']:,.1f}</b> ({'+' if hero_short['Gap']>=0 else ''}{hero_short['Gap']:.2f}%)</div>
+                        <div style='font-size:12px;color:#8b90b0;'>Pre-Open Turnover: <b>₹{hero_short['Money']:,.0f} Cr</b></div>
+                    </div>
+                    """, unsafe_allow_html=True)
+        else:
+            st.info("🟡 Pre-market data will be available at 09:08 AM on trading days.")
+
+    with ps2:
+        st.markdown("### 📅 Intraday EOD Picks (For Tomorrow)")
+        st.markdown("<div class='info-panel'>📊 Top 5 highest-conviction intraday setups from 1-Hour chart analysis • Weekly Pivot • Pivot Compression</div>", unsafe_allow_html=True)
 
         is_scanning = render_scan_status("intraday_eod")
 
-        if st.button("🚀 Compile Intraday Top 5", key="ieodb", type="primary", disabled=is_scanning):
-            dd = compute_daily_st_directions(tuple(active_tickers))
+        if st.button("🚀 Compile Intraday EOD Top 5", key="ieodb", type="primary"):
             start_background_scan(
-                "intraday_eod", active_tickers, "2y", "1d", False, False,
+                "intraday_eod", active_tickers, "60d", "1h", True, False,
                 intra_rr, intra_min_score, nifty_rs_series, capital_base,
-                risk_per_trade, market_regime, dd, "EOD_PLAYBOOK"
+                risk_per_trade, market_regime, "EOD_PLAYBOOK"
             )
             st.rerun()
 
         # Load & display results
         if is_scanning:
-            st.info("🔄 Scan in progress... page auto-refreshes every 3s")
+            st.info("🔄 Scan running in background... You can switch tabs freely!")
         else:
             saved, stime = load_session_results("intraday_eod")
             if saved:
@@ -1491,23 +1522,22 @@ with tab_eod:
             if st.session_state.get('intraday_eod_results'):
                 display_results(st.session_state['intraday_eod_results'], scan_key="intraday_eod", fetch_live=False)
 
-    with eod2:
-        st.markdown("### 📈 Swing EOD Top 5")
-        st.markdown("<div class='info-panel'>📊 Top 5 highest-conviction swing setups • 1h+1D confluence • Monthly Pivot</div>", unsafe_allow_html=True)
+    with ps3:
+        st.markdown("### 📈 Swing EOD Picks (Multi-Day)")
+        st.markdown("<div class='info-panel'>📊 Top 5 highest-conviction swing setups • Daily + Weekly trend • Monthly Pivot</div>", unsafe_allow_html=True)
 
         is_scanning = render_scan_status("swing_eod")
 
-        if st.button("🚀 Compile Swing Top 5", key="seodb", type="primary", disabled=is_scanning):
-            dd = compute_daily_st_directions(tuple(active_tickers))
+        if st.button("🚀 Compile Swing EOD Top 5", key="seodb", type="primary"):
             start_background_scan(
                 "swing_eod", active_tickers, "2y", "1d", False, False,
                 swing_rr, swing_min_score, nifty_rs_series, capital_base,
-                risk_per_trade, market_regime, dd, "EOD_PLAYBOOK"
+                risk_per_trade, market_regime, "EOD_PLAYBOOK"
             )
             st.rerun()
 
         if is_scanning:
-            st.info("🔄 Scan in progress...")
+            st.info("🔄 Scan running in background... You can switch tabs freely!")
         else:
             saved, stime = load_session_results("swing_eod")
             if saved:
@@ -1520,7 +1550,7 @@ with tab_eod:
 # TAB 2: LIVE SCREENER
 # ═══════════════════════════════════════════════════════════════
 with tab_live:
-    ls1, ls2, ls3 = st.tabs(["⚡ Intraday Live", "📊 Swing Live", "🏃 Runners"])
+    ls1, ls2, ls3 = st.tabs(["⚡ Intraday Live", "📊 Swing Live", "🏃 One-Way Runners"])
 
     with ls1:
         st.markdown("### ⚡ Intraday Live Scanner")
@@ -1529,18 +1559,17 @@ with tab_live:
         top5_i = st.checkbox("🎯 Top 5 Only", value=True, key="strict_i")
         is_scanning = render_scan_status("intraday_live")
 
-        if st.button("🚀 Scan Intraday", key="isb", type="primary", disabled=is_scanning):
-            dd = compute_daily_st_directions(tuple(active_tickers))
+        if st.button("🚀 Scan Intraday Live", key="isb", type="primary"):
             mode = "TOP5_ONLY" if top5_i else "ALL"
             start_background_scan(
                 "intraday_live", active_tickers, "30d", "15m", True, True,
                 intra_rr, intra_min_score, None, capital_base,
-                risk_per_trade, market_regime, dd, mode
+                risk_per_trade, market_regime, mode
             )
             st.rerun()
 
         if is_scanning:
-            st.info("🔄 Scanning... You can switch tabs freely!")
+            st.info("🔄 Scanning in background... You can switch tabs freely!")
         else:
             saved, stime = load_session_results("intraday_live")
             if saved:
@@ -1550,24 +1579,23 @@ with tab_live:
                 display_results(st.session_state['intraday_live_results'], scan_key="intraday_live")
 
     with ls2:
-        st.markdown("### 📊 Swing Live Scanner")
-        st.markdown("<div class='info-panel'>🧠 Multi-TF: 1h + 1D • Monthly Pivot • Volume Profile • Institutional ADL</div>", unsafe_allow_html=True)
+        st.markdown("### 📊 Swing Live Scanner (1-Hour)")
+        st.markdown("<div class='info-panel'>🧠 Multi-TF: 1-Hour (60m) + 1D Daily Confluence • Monthly Pivot • Volume Profile • Institutional ADL</div>", unsafe_allow_html=True)
 
         top5_s = st.checkbox("🎯 Top 5 Only", value=True, key="strict_s")
         is_scanning = render_scan_status("swing_live")
 
-        if st.button("🚀 Scan Swing", key="ssb", type="primary", disabled=is_scanning):
-            dd = compute_daily_st_directions(tuple(active_tickers))
+        if st.button("🚀 Scan Swing Live", key="ssb", type="primary"):
             mode = "TOP5_ONLY" if top5_s else "ALL"
             start_background_scan(
-                "swing_live", active_tickers, "2y", "1d", False, False,
+                "swing_live", active_tickers, "60d", "60m", False, False,
                 swing_rr, swing_min_score, nifty_rs_series, capital_base,
-                risk_per_trade, market_regime, dd, mode
+                risk_per_trade, market_regime, mode
             )
             st.rerun()
 
         if is_scanning:
-            st.info("🔄 Scanning... You can switch tabs freely!")
+            st.info("🔄 Scanning in background... You can switch tabs freely!")
         else:
             saved, stime = load_session_results("swing_live")
             if saved:
@@ -1578,27 +1606,27 @@ with tab_live:
 
     with ls3:
         st.markdown("### 🏃 One-Way Momentum Runners")
-        st.markdown("<div class='info-panel'>⚡ Stocks that break ORB on massive volume & NEVER retrace past VWAP — pure one-way moves</div>", unsafe_allow_html=True)
+        st.markdown("<div class='info-panel'>⚡ Extreme momentum stocks breaking ORB on heavy volume & NEVER retracing past VWAP</div>", unsafe_allow_html=True)
 
         rc1, rc2 = st.columns(2)
         with rc1:
-            runner_intra = st.button("⚡ Intraday Runners", key="irunb", type="primary")
+            runner_intra = st.button("⚡ Scan Intraday Runners", key="irunb", type="primary")
         with rc2:
-            runner_swing = st.button("⚡ Swing Runners", key="srunb", type="primary")
+            runner_swing = st.button("⚡ Scan Swing Runners", key="srunb", type="primary")
 
         if runner_intra:
             start_background_scan(
                 "intraday_runners", active_tickers, "30d", "15m", True, False,
                 intra_rr, 0, None, capital_base, risk_per_trade,
-                market_regime, None, "RUNNERS_ONLY"
+                market_regime, "RUNNERS_ONLY"
             )
             st.rerun()
 
         if runner_swing:
             start_background_scan(
-                "swing_runners", active_tickers, "2y", "1d", False, False,
+                "swing_runners", active_tickers, "60d", "60m", False, False,
                 swing_rr, 0, None, capital_base, risk_per_trade,
-                market_regime, None, "RUNNERS_ONLY"
+                market_regime, "RUNNERS_ONLY"
             )
             st.rerun()
 
