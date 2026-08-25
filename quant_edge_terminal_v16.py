@@ -22,7 +22,7 @@ except ImportError:
 # PAGE CONFIG
 # =============================================================================
 st.set_page_config(
-    page_title="QUANT-EDGE v19 — Advanced One-Way Runner Terminal",
+    page_title="QUANT-EDGE v20 — Advanced One-Way Runner & Historical Backtest Terminal",
     page_icon="👑",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -85,12 +85,12 @@ def get_session_date():
     return now.strftime('%Y-%m-%d')
 
 # =============================================================================
-# PREMIUM GLASSMORPHISM CSS v19
+# PREMIUM GLASSMORPHISM CSS v20 — ULTRA HIGH CONTRAST & RECOGNIZABLE
 # =============================================================================
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap');
 
     .stApp {
         background: linear-gradient(160deg, #06070d 0%, #0a0d17 30%, #0d1020 60%, #0a0b14 100%);
@@ -105,15 +105,15 @@ st.markdown("""
         margin-bottom: 2px;
     }
     .sub-caption {
-        font-size: 11px; color: #4a5078; margin-bottom: 12px;
-        text-transform: uppercase; letter-spacing: 1px;
+        font-size: 11px; color: #7a82a6; margin-bottom: 12px;
+        text-transform: uppercase; letter-spacing: 1px; font-weight: 600;
     }
 
     /* Glass Card */
     .glass-card {
-        background: rgba(13, 17, 30, 0.7);
+        background: rgba(13, 17, 30, 0.75);
         backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
-        border: 1px solid rgba(255,255,255,0.05);
+        border: 1px solid rgba(255,255,255,0.08);
         border-radius: 14px; padding: 16px 18px;
         box-shadow: 0 8px 32px rgba(0,0,0,0.4);
         margin-bottom: 12px;
@@ -121,56 +121,92 @@ st.markdown("""
     }
     .glass-card:hover {
         transform: translateY(-2px);
-        box-shadow: 0 12px 48px rgba(0,136,255,0.1);
-        border-color: rgba(0,136,255,0.15);
+        box-shadow: 0 12px 48px rgba(0,136,255,0.12);
+        border-color: rgba(0,136,255,0.25);
     }
 
     /* Signal Cards */
     .signal-card {
-        background: linear-gradient(135deg, rgba(13,17,30,0.9) 0%, rgba(20,26,46,0.8) 100%);
+        background: linear-gradient(135deg, rgba(14,19,34,0.95) 0%, rgba(20,28,50,0.85) 100%);
         backdrop-filter: blur(12px);
-        border: 1px solid rgba(255,255,255,0.06);
+        border: 1px solid rgba(255,255,255,0.08);
         border-radius: 14px; padding: 14px 16px;
-        box-shadow: 0 4px 24px rgba(0,0,0,0.35);
-        margin-bottom: 10px;
+        box-shadow: 0 4px 24px rgba(0,0,0,0.38);
+        margin-bottom: 12px;
         transition: all 0.3s ease;
         position: relative; overflow: hidden;
     }
     .signal-card::before {
-        content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+        content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px;
     }
     .signal-card-buy::before { background: linear-gradient(90deg, #00ffaa, #00d4aa); }
     .signal-card-sell::before { background: linear-gradient(90deg, #ff3366, #ff6b6b); }
-    .signal-card:hover { transform: translateY(-1px); box-shadow: 0 8px 32px rgba(0,0,0,0.4); }
+    .signal-card:hover { transform: translateY(-2px); box-shadow: 0 8px 32px rgba(0,0,0,0.45); border-color: rgba(255,255,255,0.15); }
 
-    .card-symbol { font-size: 16px; font-weight: 700; color: #fff; }
+    /* Top Gainers & Losers Cards */
+    .gainer-card {
+        background: linear-gradient(135deg, rgba(8,28,22,0.85) 0%, rgba(13,38,30,0.7) 100%);
+        border: 1px solid rgba(0,255,170,0.25);
+        border-radius: 12px; padding: 14px 16px; margin-bottom: 10px;
+        box-shadow: 0 4px 20px rgba(0,255,170,0.06);
+        position: relative;
+    }
+    .gainer-card::before {
+        content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px;
+        background: linear-gradient(90deg, #00ffaa, #00d4aa);
+        border-top-left-radius: 12px; border-top-right-radius: 12px;
+    }
+    .loser-card {
+        background: linear-gradient(135deg, rgba(32,10,18,0.85) 0%, rgba(42,14,24,0.7) 100%);
+        border: 1px solid rgba(255,51,102,0.25);
+        border-radius: 12px; padding: 14px 16px; margin-bottom: 10px;
+        box-shadow: 0 4px 20px rgba(255,51,102,0.06);
+        position: relative;
+    }
+    .loser-card::before {
+        content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px;
+        background: linear-gradient(90deg, #ff3366, #ff6b6b);
+        border-top-left-radius: 12px; border-top-right-radius: 12px;
+    }
+
+    .card-symbol { font-size: 17px; font-weight: 800; color: #ffffff; letter-spacing: 0.3px; }
     .card-score {
-        font-size: 11px; font-weight: 700; padding: 3px 10px; border-radius: 20px;
+        font-size: 11px; font-weight: 800; padding: 3px 10px; border-radius: 20px;
         display: inline-block;
     }
-    .score-high { background: rgba(0,255,170,0.15); color: #00ffaa; border: 1px solid rgba(0,255,170,0.3); }
-    .score-med { background: rgba(255,170,0,0.15); color: #ffaa00; border: 1px solid rgba(255,170,0,0.3); }
-    .score-low { background: rgba(255,51,102,0.15); color: #ff3366; border: 1px solid rgba(255,51,102,0.3); }
-    .card-setup { font-size: 12px; font-weight: 600; margin: 4px 0; }
-    .card-prices { font-size: 11px; color: #8b90b0; font-family: 'JetBrains Mono', monospace; }
-    .card-meta { font-size: 10px; color: #4a5078; margin-top: 6px; }
-    .card-status { font-size: 11px; font-weight: 700; margin-top: 4px; }
-    .card-indicators { font-size: 10px; color: #6b7294; margin-top: 4px; }
-    .card-warning { font-size: 10px; color: #ffaa00; margin-top: 2px; }
+    .score-high { background: rgba(0,255,170,0.18); color: #00ffaa; border: 1px solid rgba(0,255,170,0.4); font-weight: 800; }
+    .score-med { background: rgba(255,170,0,0.18); color: #ffaa00; border: 1px solid rgba(255,170,0,0.4); font-weight: 800; }
+    .score-low { background: rgba(255,51,102,0.18); color: #ff3366; border: 1px solid rgba(255,51,102,0.4); font-weight: 800; }
+    
+    .card-setup { font-size: 12px; font-weight: 700; margin: 4px 0; color: #d0d4eb; }
+    .card-prices { font-size: 12px; color: #9da3c7; font-family: 'JetBrains Mono', monospace; font-weight: 500; }
+    .card-meta { font-size: 11px; color: #6b7294; margin-top: 6px; }
+    .card-status { font-size: 12px; font-weight: 800; margin-top: 4px; }
+    .card-indicators { font-size: 11px; color: #8b92b6; margin-top: 5px; line-height: 1.4; }
+    .card-warning { font-size: 11px; color: #ffaa00; margin-top: 3px; font-weight: 600; }
 
     /* Metric Cards */
     .metric-card {
-        background: linear-gradient(135deg, rgba(13,17,30,0.85) 0%, rgba(22,28,52,0.7) 100%);
+        background: linear-gradient(135deg, rgba(14,19,34,0.9) 0%, rgba(22,30,54,0.75) 100%);
         backdrop-filter: blur(10px);
-        border: 1px solid rgba(255,255,255,0.05);
+        border: 1px solid rgba(255,255,255,0.07);
         border-radius: 12px; padding: 14px 16px;
         box-shadow: 0 4px 20px rgba(0,0,0,0.3); margin-bottom: 10px;
     }
-    .metric-header { font-size: 9px; color: #4a5078; text-transform: uppercase; letter-spacing: 1.5px; font-weight: 700; }
-    .metric-val { font-size: 22px; font-weight: 700; color: #ffffff; margin-top: 2px; }
-    .metric-change { font-size: 11px; font-weight: 600; margin-top: 1px; }
+    .metric-header { font-size: 10px; color: #7a82a6; text-transform: uppercase; letter-spacing: 1.5px; font-weight: 800; }
+    .metric-val { font-size: 22px; font-weight: 800; color: #ffffff; margin-top: 2px; }
+    .metric-change { font-size: 12px; font-weight: 700; margin-top: 1px; }
     .change-up { color: #00ffaa; }
     .change-down { color: #ff3366; }
+
+    /* Badges */
+    .fo-badge {
+        display: inline-flex; align-items: center; gap: 4px;
+        background: rgba(0,136,255,0.15); color: #4da6ff;
+        border: 1px solid rgba(0,136,255,0.3);
+        border-radius: 6px; padding: 2px 8px;
+        font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px;
+    }
 
     /* Market Status */
     .market-status {
@@ -194,22 +230,22 @@ st.markdown("""
 
     /* Hero Banner */
     .hero-banner {
-        background: linear-gradient(135deg, rgba(255,215,0,0.1) 0%, rgba(255,140,0,0.08) 100%);
-        border: 1px solid rgba(255,215,0,0.25);
+        background: linear-gradient(135deg, rgba(255,215,0,0.12) 0%, rgba(255,140,0,0.09) 100%);
+        border: 1px solid rgba(255,215,0,0.3);
         padding: 12px 18px; border-radius: 10px; font-weight: 700; font-size: 13px;
         margin-bottom: 14px; text-align: center; color: #FFD700;
-        box-shadow: 0 4px 24px rgba(255,215,0,0.06);
+        box-shadow: 0 4px 24px rgba(255,215,0,0.08);
     }
 
     /* Stateful Radio Navigation Tabs */
     .stRadio [role="radiogroup"] {
         display: flex; flex-direction: row; gap: 8px; flex-wrap: wrap;
-        background: rgba(13, 17, 30, 0.7); padding: 6px 8px; border-radius: 12px;
-        border: 1px solid rgba(255,255,255,0.06); margin-bottom: 12px;
+        background: rgba(13, 17, 30, 0.75); padding: 6px 8px; border-radius: 12px;
+        border: 1px solid rgba(255,255,255,0.08); margin-bottom: 12px;
     }
     .stRadio [role="radiogroup"] > label {
         background: rgba(255,255,255,0.03); padding: 8px 18px; border-radius: 8px;
-        color: #8b90b0; font-weight: 600; font-size: 12px; cursor: pointer;
+        color: #9da3c7; font-weight: 600; font-size: 12px; cursor: pointer;
         border: 1px solid transparent; transition: all 0.2s ease;
     }
     .stRadio [role="radiogroup"] > label:hover {
@@ -223,40 +259,40 @@ st.markdown("""
     }
     .stRadio label > div:first-child { display: none !important; }
 
-    .last-updated { font-size: 10px; color: #3a4060; text-align: right; font-style: italic; margin-top: -6px; margin-bottom: 10px; }
+    .last-updated { font-size: 11px; color: #5a6288; text-align: right; font-style: italic; margin-top: -6px; margin-bottom: 10px; }
 
     .info-panel {
-        background: rgba(0,136,255,0.06); border: 1px solid rgba(0,136,255,0.15);
+        background: rgba(0,136,255,0.07); border: 1px solid rgba(0,136,255,0.2);
         border-radius: 8px; padding: 10px 14px; margin-bottom: 12px;
-        color: #7ba8d4; font-size: 12px;
+        color: #8bbce8; font-size: 12px; font-weight: 500;
     }
 
     .scan-status {
-        padding: 6px 14px; border-radius: 8px; font-size: 11px; font-weight: 600;
+        padding: 6px 14px; border-radius: 8px; font-size: 11px; font-weight: 700;
         display: inline-flex; align-items: center; gap: 6px; margin-bottom: 8px;
     }
-    .scan-running { background: rgba(0,136,255,0.1); color: #4da6ff; border: 1px solid rgba(0,136,255,0.2); }
-    .scan-complete { background: rgba(0,255,170,0.1); color: #00ffaa; border: 1px solid rgba(0,255,170,0.2); }
-    .scan-idle { background: rgba(100,100,140,0.1); color: #6b7294; border: 1px solid rgba(100,100,140,0.2); }
+    .scan-running { background: rgba(0,136,255,0.12); color: #4da6ff; border: 1px solid rgba(0,136,255,0.3); }
+    .scan-complete { background: rgba(0,255,170,0.12); color: #00ffaa; border: 1px solid rgba(0,255,170,0.3); }
+    .scan-idle { background: rgba(100,100,140,0.1); color: #7a82a6; border: 1px solid rgba(100,100,140,0.2); }
 
-    .view-toggle { display: flex; gap: 4px; margin-bottom: 10px; }
+    .view-toggle { display: flex; gap: 6px; margin-bottom: 10px; }
 
     .pivot-badge {
-        font-size: 9px; padding: 2px 8px; border-radius: 12px; font-weight: 600;
+        font-size: 10px; padding: 2px 8px; border-radius: 12px; font-weight: 700;
         display: inline-block; margin-right: 4px;
     }
-    .pivot-above { background: rgba(0,255,170,0.12); color: #00ffaa; }
-    .pivot-below { background: rgba(255,51,102,0.12); color: #ff3366; }
-    .pivot-near { background: rgba(255,170,0,0.12); color: #ffaa00; }
+    .pivot-above { background: rgba(0,255,170,0.15); color: #00ffaa; border: 1px solid rgba(0,255,170,0.25); }
+    .pivot-below { background: rgba(255,51,102,0.15); color: #ff3366; border: 1px solid rgba(255,51,102,0.25); }
+    .pivot-near { background: rgba(255,170,0,0.15); color: #ffaa00; border: 1px solid rgba(255,170,0,0.25); }
 
     .rr-badge {
-        display: inline-flex; align-items: center; gap: 6px;
-        padding: 4px 10px; border-radius: 8px; font-size: 11px; font-weight: 700;
+        display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap;
+        padding: 5px 12px; border-radius: 8px; font-size: 11px; font-weight: 700;
         background: rgba(0,136,255,0.12); color: #4da6ff; border: 1px solid rgba(0,136,255,0.25);
-        margin: 4px 0;
+        margin: 5px 0;
     }
-    .rr-profit { color: #00ffaa; font-weight: 700; }
-    .rr-risk { color: #ff6b6b; font-weight: 700; }
+    .rr-profit { color: #00ffaa; font-weight: 800; }
+    .rr-risk { color: #ff6b6b; font-weight: 800; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -395,6 +431,8 @@ SWING_WINNERS_DIR = os.path.join(PERF_DIR, "swing_winners")
 MANUAL_LOG_FILE = os.path.join(PERF_DIR, "manual_log.json")
 PATTERN_FILE = os.path.join(PERF_DIR, "pattern_analysis.json")
 BACKTEST_FILE = os.path.join(PERF_DIR, "backtest_results.json")
+HIST_INTRADAY_FILE = os.path.join(PERF_DIR, "historical_intraday_top3.json")
+HIST_SWING_FILE = os.path.join(PERF_DIR, "historical_swing_top3.json")
 os.makedirs(INTRADAY_WINNERS_DIR, exist_ok=True)
 os.makedirs(SWING_WINNERS_DIR, exist_ok=True)
 
@@ -432,6 +470,20 @@ def save_backtest_results(results):
 def load_backtest_results():
     data = load_perf_winners(BACKTEST_FILE)
     return data.get("results", {}) if data else {}
+
+def save_hist_intraday(data):
+    save_perf_winners(HIST_INTRADAY_FILE, {"data": data, "updated": get_ist_now().strftime('%Y-%m-%d %H:%M:%S')})
+
+def load_hist_intraday():
+    d = load_perf_winners(HIST_INTRADAY_FILE)
+    return d.get("data", []) if d else []
+
+def save_hist_swing(data):
+    save_perf_winners(HIST_SWING_FILE, {"data": data, "updated": get_ist_now().strftime('%Y-%m-%d %H:%M:%S')})
+
+def load_hist_swing():
+    d = load_perf_winners(HIST_SWING_FILE)
+    return d.get("data", []) if d else []
 
 def archive_old_performance_data(max_age_days=90):
     """Remove performance data older than max_age_days"""
@@ -1991,6 +2043,272 @@ def backtest_swing_strategy(lookback_weeks=12):
     return backtest_out
 
 # =============================================================================
+# PERFORMANCE LAB — HISTORICAL TOP 3 GAINERS & LOSERS ENGINE
+# =============================================================================
+def fetch_and_store_historical_intraday_top3(lookback_days=60, progress_cb=None):
+    """
+    Fetches past N trading days historical data for all 219 F&O stocks.
+    For each trading day, computes the Top 3 Gainers and Top 3 Losers from F&O Universe.
+    100% mathematically precise financial calculation:
+    Daily % Change = (Close_t - Close_{t-1}) / Close_{t-1} * 100
+    Day Range % = (High_t - Low_t) / Low_t * 100
+    Open-to-Close % = (Close_t - Open_t) / Open_t * 100
+    """
+    write_scan_status("hist_intraday_fetch", "running", 0.05)
+    try:
+        bulk_df = fetch_bulk_data(tuple(FO_UNIVERSE), period="120d", interval="1d")
+        if bulk_df.empty:
+            write_scan_status("hist_intraday_fetch", "error", 0, "Failed to download daily F&O data from yfinance")
+            return []
+
+        ref_df = fetch_nifty_series(period="120d", interval="1d")
+        if ref_df.empty or len(ref_df) < 5:
+            if isinstance(bulk_df.columns, pd.MultiIndex):
+                first_sym = bulk_df.columns.get_level_values(0)[0]
+                ref_df = bulk_df[first_sym].dropna(subset=['Close'])
+            else:
+                ref_df = bulk_df.dropna(subset=['Close'])
+
+        dates = [d.strftime('%Y-%m-%d') for d in ref_df.index]
+        if len(dates) < 2:
+            write_scan_status("hist_intraday_fetch", "error", 0, "Insufficient trading dates found")
+            return []
+
+        target_dates = dates[-min(lookback_days + 1, len(dates)):]
+        eval_dates = target_dates[1:]  # index 0 is baseline
+
+        daily_records = []
+        total_eval = len(eval_dates)
+
+        for i, dt_str in enumerate(eval_dates):
+            if progress_cb:
+                progress_cb((i + 1) / total_eval)
+            write_scan_status("hist_intraday_fetch", "running", 0.10 + ((i + 1) / total_eval) * 0.85)
+
+            day_stats = []
+            for ticker in FO_UNIVERSE:
+                try:
+                    df_t = None
+                    if isinstance(bulk_df.columns, pd.MultiIndex):
+                        if ticker in bulk_df.columns.get_level_values(0):
+                            df_t = bulk_df[ticker].dropna(subset=['Close'])
+                    else:
+                        df_t = bulk_df.dropna(subset=['Close'])
+
+                    if df_t is None or df_t.empty:
+                        continue
+
+                    dt_mask = df_t.index.strftime('%Y-%m-%d') == dt_str
+                    if not dt_mask.any():
+                        continue
+
+                    row_idx = df_t.index.get_loc(df_t[dt_mask].index[0])
+                    if row_idx < 1:
+                        continue
+
+                    curr = df_t.iloc[row_idx]
+                    prev = df_t.iloc[row_idx - 1]
+
+                    prev_c = float(prev['Close'])
+                    curr_c = float(curr['Close'])
+                    curr_o = float(curr.get('Open', curr_c))
+                    curr_h = float(curr.get('High', curr_c))
+                    curr_l = float(curr.get('Low', curr_c))
+                    curr_v = float(curr.get('Volume', 0))
+
+                    if prev_c <= 0 or curr_c <= 0:
+                        continue
+
+                    chg_pct = ((curr_c - prev_c) / prev_c) * 100.0
+                    intra_move_pct = ((curr_c - curr_o) / curr_o) * 100.0 if curr_o > 0 else 0.0
+                    day_range_pct = ((curr_h - curr_l) / curr_l) * 100.0 if curr_l > 0 else 0.0
+                    turnover_cr = (curr_c * curr_v) / 1e7
+
+                    day_stats.append({
+                        "symbol": ticker.replace('.NS', ''),
+                        "ticker": ticker,
+                        "date": dt_str,
+                        "prev_close": round(prev_c, 2),
+                        "open": round(curr_o, 2),
+                        "high": round(curr_h, 2),
+                        "low": round(curr_l, 2),
+                        "close": round(curr_c, 2),
+                        "change_pct": round(chg_pct, 2),
+                        "intra_move_pct": round(intra_move_pct, 2),
+                        "day_range_pct": round(day_range_pct, 2),
+                        "volume": int(curr_v),
+                        "turnover_cr": round(turnover_cr, 1),
+                        "sector": SECTOR_REVERSE.get(ticker, "Other")
+                    })
+                except Exception:
+                    continue
+
+            if not day_stats:
+                continue
+
+            day_stats.sort(key=lambda x: x['change_pct'], reverse=True)
+            top3_gainers = day_stats[:3]
+            top3_losers = sorted(day_stats[-3:], key=lambda x: x['change_pct'])
+
+            daily_records.append({
+                "date": dt_str,
+                "total_fo_scanned": len(day_stats),
+                "gainers": top3_gainers,
+                "losers": top3_losers,
+                "avg_gainer_move": round(np.mean([g['change_pct'] for g in top3_gainers]), 2) if top3_gainers else 0,
+                "avg_loser_move": round(np.mean([l['change_pct'] for l in top3_losers]), 2) if top3_losers else 0,
+            })
+
+        daily_records.reverse()  # Latest date first
+        save_hist_intraday(daily_records)
+        write_scan_status("hist_intraday_fetch", "complete", 1.0)
+        return daily_records
+    except Exception as e:
+        write_scan_status("hist_intraday_fetch", "error", 0, str(e))
+        return []
+
+def fetch_and_store_historical_swing_top3(lookback_weeks=12, progress_cb=None):
+    """
+    Fetches past N weeks historical data for all 219 F&O stocks.
+    For each weekly session (Monday to Friday), computes Top 3 Weekly Gainers and Losers.
+    100% mathematically precise financial calculation:
+    Weekly Return % = (Friday Close - Monday Open) / Monday Open * 100
+    Week Range % = (Week High - Week Low) / Week Low * 100
+    """
+    write_scan_status("hist_swing_fetch", "running", 0.05)
+    try:
+        bulk_df = fetch_bulk_data(tuple(FO_UNIVERSE), period="8mo", interval="1d")
+        if bulk_df.empty:
+            write_scan_status("hist_swing_fetch", "error", 0, "Failed to download swing data from yfinance")
+            return []
+
+        ref_df = fetch_nifty_series(period="8mo", interval="1d")
+        if ref_df.empty:
+            if isinstance(bulk_df.columns, pd.MultiIndex):
+                first_sym = bulk_df.columns.get_level_values(0)[0]
+                ref_df = bulk_df[first_sym].dropna(subset=['Close'])
+            else:
+                ref_df = bulk_df.dropna(subset=['Close'])
+
+        if ref_df.empty:
+            write_scan_status("hist_swing_fetch", "error", 0, "Insufficient index data for swing")
+            return []
+
+        ref_df = ref_df.copy()
+        ref_df['Year'] = ref_df.index.year
+        ref_df['Week'] = ref_df.index.isocalendar().week.values
+        ref_df['DateStr'] = ref_df.index.strftime('%Y-%m-%d')
+
+        week_groups = []
+        for (yr, wk), g in ref_df.groupby(['Year', 'Week']):
+            dates_in_wk = list(g['DateStr'].values)
+            if len(dates_in_wk) >= 1:
+                week_groups.append({
+                    "week_key": f"{yr}-W{wk:02d}",
+                    "dates": dates_in_wk,
+                    "week_start": dates_in_wk[0],
+                    "week_end": dates_in_wk[-1]
+                })
+
+        target_weeks = week_groups[-min(lookback_weeks, len(week_groups)):]
+        weekly_records = []
+        total_eval = len(target_weeks)
+
+        for i, wg in enumerate(target_weeks):
+            if progress_cb:
+                progress_cb((i + 1) / total_eval)
+            write_scan_status("hist_swing_fetch", "running", 0.10 + ((i + 1) / total_eval) * 0.85)
+
+            wk_key = wg["week_key"]
+            wk_dates = wg["dates"]
+            wk_start = wg["week_start"]
+            wk_end = wg["week_end"]
+
+            stock_week_stats = []
+            for ticker in FO_UNIVERSE:
+                try:
+                    df_t = None
+                    if isinstance(bulk_df.columns, pd.MultiIndex):
+                        if ticker in bulk_df.columns.get_level_values(0):
+                            df_t = bulk_df[ticker].dropna(subset=['Close'])
+                    else:
+                        df_t = bulk_df.dropna(subset=['Close'])
+
+                    if df_t is None or df_t.empty:
+                        continue
+
+                    df_t_dates = df_t.index.strftime('%Y-%m-%d')
+                    wk_sub = df_t[df_t_dates.isin(wk_dates)]
+                    if wk_sub.empty:
+                        continue
+
+                    mon_open = float(wk_sub.iloc[0].get('Open', wk_sub.iloc[0]['Close']))
+                    fri_close = float(wk_sub.iloc[-1]['Close'])
+                    wk_high = float(wk_sub['High'].max())
+                    wk_low = float(wk_sub['Low'].min())
+                    total_vol = float(wk_sub['Volume'].sum())
+
+                    if mon_open <= 0 or fri_close <= 0:
+                        continue
+
+                    weekly_return_pct = ((fri_close - mon_open) / mon_open) * 100.0
+                    week_range_pct = ((wk_high - wk_low) / wk_low) * 100.0 if wk_low > 0 else 0.0
+                    turnover_cr = (fri_close * total_vol) / 1e7
+
+                    stock_week_stats.append({
+                        "symbol": ticker.replace('.NS', ''),
+                        "ticker": ticker,
+                        "week_key": wk_key,
+                        "week_start": wk_start,
+                        "week_end": wk_end,
+                        "mon_open": round(mon_open, 2),
+                        "fri_close": round(fri_close, 2),
+                        "week_high": round(wk_high, 2),
+                        "week_low": round(wk_low, 2),
+                        "weekly_return_pct": round(weekly_return_pct, 2),
+                        "week_range_pct": round(week_range_pct, 2),
+                        "total_volume": int(total_vol),
+                        "turnover_cr": round(turnover_cr, 1),
+                        "sector": SECTOR_REVERSE.get(ticker, "Other")
+                    })
+                except Exception:
+                    continue
+
+            if not stock_week_stats:
+                continue
+
+            stock_week_stats.sort(key=lambda x: x['weekly_return_pct'], reverse=True)
+            top3_gainers = stock_week_stats[:3]
+            top3_losers = sorted(stock_week_stats[-3:], key=lambda x: x['weekly_return_pct'])
+
+            weekly_records.append({
+                "week_key": wk_key,
+                "week_start": wk_start,
+                "week_end": wk_end,
+                "total_fo_scanned": len(stock_week_stats),
+                "gainers": top3_gainers,
+                "losers": top3_losers,
+                "avg_gainer_move": round(np.mean([g['weekly_return_pct'] for g in top3_gainers]), 2) if top3_gainers else 0,
+                "avg_loser_move": round(np.mean([l['weekly_return_pct'] for l in top3_losers]), 2) if top3_losers else 0,
+            })
+
+        weekly_records.reverse()  # Latest week first
+        save_hist_swing(weekly_records)
+        write_scan_status("hist_swing_fetch", "complete", 1.0)
+        return weekly_records
+    except Exception as e:
+        write_scan_status("hist_swing_fetch", "error", 0, str(e))
+        return []
+
+def start_historical_intraday_fetch():
+    thread = threading.Thread(target=fetch_and_store_historical_intraday_top3, daemon=True)
+    thread.start()
+
+def start_historical_swing_fetch():
+    thread = threading.Thread(target=fetch_and_store_historical_swing_top3, daemon=True)
+    thread.start()
+
+# =============================================================================
 # PERFORMANCE LAB — AUTO-SCHEDULE (Daily/Weekly Discovery)
 # =============================================================================
 def _auto_discover_worker(discover_type="intraday"):
@@ -1998,8 +2316,10 @@ def _auto_discover_worker(discover_type="intraday"):
     try:
         if discover_type == "intraday":
             discover_intraday_winners()
+            fetch_and_store_historical_intraday_top3(lookback_days=60)
         elif discover_type == "swing":
             discover_swing_winners()
+            fetch_and_store_historical_swing_top3(lookback_weeks=12)
     except Exception as e:
         key = f"perf_{discover_type}_discovery"
         write_scan_status(key, "error", 0, str(e))
@@ -2015,14 +2335,14 @@ if _auto_disc_key not in st.session_state:
     st.session_state[_auto_disc_key] = False
 
 def check_auto_discovery():
-    """Check if we should auto-run discovery"""
+    """Check if we should auto-run discovery and historical updates"""
     now = get_ist_now()
     if now.weekday() >= 5:
         return  # Weekend
     if st.session_state.get(_auto_disc_key):
         return  # Already triggered today
 
-    # Intraday: after 3:35 PM
+    # Intraday: after 3:35 PM on weekdays
     if now.time() >= dtime(15, 35):
         today_str = now.strftime('%Y-%m-%d')
         filepath = os.path.join(INTRADAY_WINNERS_DIR, f"{today_str}.json")
@@ -2066,7 +2386,7 @@ market_regime = get_market_regime(nifty_daily)
 nifty_rs_series = get_nifty_rs_series(nifty_daily)
 
 # Auto-refresh while scans are running
-PERF_SCAN_KEYS = ['perf_intraday_discovery', 'perf_swing_discovery']
+PERF_SCAN_KEYS = ['perf_intraday_discovery', 'perf_swing_discovery', 'hist_intraday_fetch', 'hist_swing_fetch']
 any_scan_running = any(read_scan_status(k).get("status") == "running" for k in SCAN_KEYS + PERF_SCAN_KEYS)
 if any_scan_running and AUTOREFRESH_AVAILABLE:
     st_autorefresh(interval=3000, key="scan_poll")
@@ -2079,8 +2399,8 @@ check_auto_discovery()
 # =============================================================================
 h1, h2 = st.columns([4, 1])
 with h1:
-    st.markdown("<div class='main-header'>👑 QUANT-EDGE v19 — One-Way Runner Terminal</div>", unsafe_allow_html=True)
-    st.markdown("<div class='sub-caption'>Multi-TF Confluence • Weekly/Monthly Pivots • Volume Profile • Institutional Psychology</div>", unsafe_allow_html=True)
+    st.markdown("<div class='main-header'>👑 QUANT-EDGE v20 — One-Way Runner Terminal</div>", unsafe_allow_html=True)
+    st.markdown("<div class='sub-caption'>Multi-TF Confluence • Weekly/Monthly Pivots • Volume Profile • Institutional Psychology • 60D/12W Backtest Lab</div>", unsafe_allow_html=True)
 with h2:
     ms, mc = get_market_status()
     st.markdown(f"<div class='market-status {mc}'>{ms}</div>", unsafe_allow_html=True)
@@ -2179,15 +2499,25 @@ def render_scan_status(scan_key):
         return False
     return False
 
-def display_view_toggle(key_prefix):
-    """Card/List view toggle"""
-    c1, c2, _ = st.columns([1, 1, 8])
+def display_view_toggle(key_prefix, default="card"):
+    """Card/List view toggle with per-section state"""
+    state_key = f"view_mode_{key_prefix}"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = default
+    current_mode = st.session_state[state_key]
+
+    c1, c2, _ = st.columns([1.2, 1.2, 7.6])
     with c1:
-        if st.button("🃏 Cards", key=f"{key_prefix}_card_btn", type="secondary"):
-            st.session_state['view_mode'] = 'card'
+        type_c = "primary" if current_mode == "card" else "secondary"
+        if st.button("🃏 Cards View", key=f"{key_prefix}_card_btn", type=type_c, use_container_width=True):
+            st.session_state[state_key] = 'card'
+            st.rerun()
     with c2:
-        if st.button("📋 List", key=f"{key_prefix}_list_btn", type="secondary"):
-            st.session_state['view_mode'] = 'list'
+        type_l = "primary" if current_mode == "list" else "secondary"
+        if st.button("📋 List View", key=f"{key_prefix}_list_btn", type=type_l, use_container_width=True):
+            st.session_state[state_key] = 'list'
+            st.rerun()
+    return st.session_state[state_key]
 
 def display_results(results, scan_key="", fetch_live=True):
     """Display scan results in Card or List view"""
@@ -2204,9 +2534,9 @@ def display_results(results, scan_key="", fetch_live=True):
     if scan_time:
         st.markdown(f"<div class='last-updated'>📅 Scanned: {scan_time}</div>", unsafe_allow_html=True)
 
-    display_view_toggle(scan_key)
+    mode = display_view_toggle(scan_key, default="card")
 
-    if st.session_state.get('view_mode', 'card') == 'card':
+    if mode == 'card':
         _display_cards(results, live_prices)
     else:
         _display_list(results, live_prices)
@@ -2311,6 +2641,286 @@ def _display_list(results, live_prices):
         st.dataframe(pd.DataFrame(rows), use_container_width=True,
                      height=min(450, 35 * len(rows) + 38))
 
+def render_heroes_view(hero_long, hero_short, key_prefix="hero"):
+    if not hero_long and not hero_short:
+        st.info("🟡 Pre-market data will be available at 09:08 AM on trading days.")
+        return
+
+    mode = display_view_toggle(key_prefix, default="card")
+    if mode == "card":
+        hc1, hc2 = st.columns(2)
+        if hero_long:
+            with hc1:
+                st.markdown(f"""
+                <div class='glass-card' style='border-left: 4px solid #00ffaa;'>
+                    <div style='display:flex;justify-content:space-between;align-items:center;'>
+                        <div style='font-size:18px;font-weight:800;color:#00ffaa;'>🟢 BULL HERO: {hero_long['Symbol']} {hero_long['Conf']}</div>
+                        <span class='fo-badge'>NSE F&O</span>
+                    </div>
+                    <div style='font-size:14px;margin-top:6px;color:#fff;'>Opening Price: <b>₹{hero_long['LTP']:,.1f}</b> <span style='color:#00ffaa;'>({'+' if hero_long['Gap']>=0 else ''}{hero_long['Gap']:.2f}%)</span></div>
+                    <div style='font-size:12px;color:#9da3c7;margin-top:4px;'>Pre-Open Turnover: <b style='color:#fff;'>₹{hero_long['Money']:,.0f} Cr</b></div>
+                </div>
+                """, unsafe_allow_html=True)
+        if hero_short:
+            with hc2:
+                st.markdown(f"""
+                <div class='glass-card' style='border-left: 4px solid #ff3366;'>
+                    <div style='display:flex;justify-content:space-between;align-items:center;'>
+                        <div style='font-size:18px;font-weight:800;color:#ff3366;'>🔴 BEAR HERO: {hero_short['Symbol']} {hero_short['Conf']}</div>
+                        <span class='fo-badge'>NSE F&O</span>
+                    </div>
+                    <div style='font-size:14px;margin-top:6px;color:#fff;'>Opening Price: <b>₹{hero_short['LTP']:,.1f}</b> <span style='color:#ff3366;'>({'+' if hero_short['Gap']>=0 else ''}{hero_short['Gap']:.2f}%)</span></div>
+                    <div style='font-size:12px;color:#9da3c7;margin-top:4px;'>Pre-Open Turnover: <b style='color:#fff;'>₹{hero_short['Money']:,.0f} Cr</b></div>
+                </div>
+                """, unsafe_allow_html=True)
+    else:
+        hero_rows = []
+        if hero_long:
+            hero_rows.append({
+                "Hero Type": "🟢 BULL HERO",
+                "Symbol": hero_long["Symbol"],
+                "Confidence": hero_long["Conf"],
+                "Opening ₹": f"₹{hero_long['LTP']:,.1f}",
+                "Gap %": f"+{hero_long['Gap']:.2f}%",
+                "Turnover (Cr)": f"₹{hero_long['Money']:,.0f} Cr",
+                "Universe": "NSE F&O"
+            })
+        if hero_short:
+            hero_rows.append({
+                "Hero Type": "🔴 BEAR HERO",
+                "Symbol": hero_short["Symbol"],
+                "Confidence": hero_short["Conf"],
+                "Opening ₹": f"₹{hero_short['LTP']:,.1f}",
+                "Gap %": f"{hero_short['Gap']:.2f}%",
+                "Turnover (Cr)": f"₹{hero_short['Money']:,.0f} Cr",
+                "Universe": "NSE F&O"
+            })
+        st.dataframe(pd.DataFrame(hero_rows), use_container_width=True)
+
+def render_manual_log_view(manual_entries, key_prefix="manual_log"):
+    if not manual_entries:
+        st.info("📭 No manually logged winners yet. Add some above!")
+        return
+
+    st.markdown(f"#### 📋 Logged Winners ({len(manual_entries)} total)")
+    mode = display_view_toggle(key_prefix, default="list")
+
+    csv_data = perf_data_to_csv(manual_entries, "manual_log")
+    if csv_data:
+        st.download_button("⬇️ Download CSV", csv_data, file_name="manual_winners_log.csv", mime="text/csv", key=f"{key_prefix}_dl")
+
+    if mode == "card":
+        m_cols = st.columns(2)
+        for idx, e in enumerate(manual_entries):
+            with m_cols[idx % 2]:
+                snap = e.get("snapshot", {})
+                is_buy = e.get("direction") == "BUY"
+                card_cls = "signal-card-buy" if is_buy else "signal-card-sell"
+                emoji = "🟢" if is_buy else "🔴"
+                st.markdown(f"""
+                <div class='signal-card {card_cls}'>
+                    <div style='display:flex;justify-content:space-between;align-items:center;'>
+                        <span class='card-symbol'>{emoji} {e.get('symbol')}</span>
+                        <span class='card-score score-high'>{e.get('trade_type', '')} • {e.get('direction', '')}</span>
+                    </div>
+                    <div class='card-setup'>📅 Date: {e.get('date', '—')} • Sector: {snap.get('sector', 'N/A')}</div>
+                    <div class='card-indicators'>
+                        ST {'↑' if snap.get('daily_st_dir') == 1 else '↓'} • RSI {snap.get('rsi_14', '—')} • EMA {snap.get('ema_alignment', '—')} • Vol {snap.get('vol_ratio', 0)}x • Gap {snap.get('gap_pct', 0)}%
+                    </div>
+                    {f"<div style='font-size:11px;color:#d0d4eb;margin-top:6px;font-style:italic;'>💬 {e.get('notes')}</div>" if e.get('notes') else ""}
+                </div>
+                """, unsafe_allow_html=True)
+    else:
+        display_rows = []
+        for idx, e in enumerate(manual_entries):
+            snap = e.get("snapshot", {})
+            display_rows.append({
+                "#": idx + 1,
+                "Symbol": e.get("symbol", ""),
+                "Type": e.get("trade_type", ""),
+                "Dir": f"{'🟢' if e.get('direction') == 'BUY' else '🔴'} {e.get('direction', '')}",
+                "Date": e.get("date", ""),
+                "ST": "↑" if snap.get("daily_st_dir") == 1 else "↓",
+                "RSI": snap.get("rsi_14", "—"),
+                "EMA": snap.get("ema_alignment", "—"),
+                "Vol": f"{snap.get('vol_ratio', 0)}x",
+                "Gap%": snap.get("gap_pct", "—"),
+                "Pivot": snap.get("pivot_pos", "—"),
+                "Sector": snap.get("sector", "—"),
+                "Notes": e.get("notes", ""),
+            })
+        st.dataframe(pd.DataFrame(display_rows), use_container_width=True, height=min(500, 35 * len(display_rows) + 38))
+
+    with st.expander("🗑️ Delete Entries"):
+        del_idx = st.number_input("Entry # to delete", min_value=1, max_value=len(manual_entries), value=1, key=f"{key_prefix}_del_idx")
+        if st.button("🗑️ Delete", key=f"{key_prefix}_del_btn"):
+            manual_entries.pop(del_idx - 1)
+            save_manual_log(manual_entries)
+            st.success("Deleted!")
+            st.rerun()
+
+def render_ledger_view(all_results, key_prefix="ledger"):
+    if not all_results:
+        st.info("📭 No signals today. Run a scan to populate.")
+        return
+
+    mode = display_view_toggle(key_prefix, default="list")
+    df_ledger = pd.DataFrame(all_results)
+    
+    if mode == "card":
+        sorted_res = sorted(all_results, key=lambda x: x.get('Score', 0), reverse=True)
+        _display_cards(sorted_res, {})
+    else:
+        cols_show = [c for c in ['Source', 'Symbol', 'Setup', 'Score', 'LTP', 'Entry', 'SL', 'TP',
+                                  'Status', 'Signal_Time', 'Scan_Time', 'Pivot', 'RSI', 'Vol_Ratio'] if c in df_ledger.columns]
+        st.dataframe(df_ledger[cols_show].sort_values('Score', ascending=False),
+                    use_container_width=True, height=500)
+
+def render_winners_view(winners, is_intraday=True, key_prefix="auto_winners"):
+    if not winners:
+        st.info("No winners found for selected session.")
+        return
+
+    mode = display_view_toggle(key_prefix, default="card")
+    if mode == "card":
+        for idx, w in enumerate(winners):
+            snap = w.get("snapshot", {})
+            is_buy = w.get("direction") == "BUY"
+            card_cls = "signal-card-buy" if is_buy else "signal-card-sell"
+            emoji = "🟢" if is_buy else "🔴"
+            hist_similar = w.get("historical_similar", [])
+            hist_text = ""
+            if hist_similar:
+                avg_fwd = np.mean([h.get("fwd_return_5d", 0) for h in hist_similar])
+                hist_text = f"<div style='font-size:10px;color:#9da3c7;margin-top:4px;'>📜 {len(hist_similar)} similar setups • Avg 5d: <b style='color:{('#00ffaa' if avg_fwd > 0 else '#ff3366')}'>{avg_fwd:+.1f}%</b></div>"
+
+            if is_intraday:
+                st.markdown(f"""
+                <div class='signal-card {card_cls}'>
+                    <div style='display:flex;justify-content:space-between;align-items:center;'>
+                        <span class='card-symbol'>{emoji} {w['symbol']}</span>
+                        <span class='card-score score-high'>+{w.get('move_pct', 0):.1f}%</span>
+                    </div>
+                    <div class='card-setup'>{w.get('direction', '')} WINNER • {snap.get('sector', 'N/A')}</div>
+                    <div class='card-prices'>ORB: ₹{w.get('fc_high', 0):,.1f} / ₹{w.get('fc_low', 0):,.1f} → Day: ₹{w.get('day_high', 0):,.1f} / ₹{w.get('day_low', 0):,.1f}</div>
+                    <div class='card-indicators'>
+                        ST {'↑' if snap.get('daily_st_dir') == 1 else '↓'} • RSI {snap.get('rsi_14', '—')} • Vol {snap.get('vol_ratio', 0)}x • Gap {snap.get('gap_pct', 0):+.1f}%
+                        • <span class='pivot-badge pivot-{'above' if 'above' in snap.get('pivot_pos', '') else 'below'}'>{snap.get('pivot_pos', '—')}</span>
+                    </div>
+                    <div style='font-size:10px;color:#7a82a6;margin-top:4px;'>1st Candle: Body {w.get('fc_body_pct', 0):.2f}% • Vol Ratio {w.get('fc_vol_ratio', 0):.1f}x • ADL: {snap.get('adl_trend', '—')}</div>
+                    {hist_text}
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                <div class='signal-card {card_cls}'>
+                    <div style='display:flex;justify-content:space-between;align-items:center;'>
+                        <span class='card-symbol'>{emoji} {w['symbol']}</span>
+                        <span class='card-score score-high'>+{w.get('move_pct', 0):.1f}% weekly</span>
+                    </div>
+                    <div class='card-setup'>{w.get('direction', '')} SWING WINNER • {snap.get('sector', 'N/A')}</div>
+                    <div class='card-prices'>Week Range: ₹{w.get('week_low', 0):,.1f} → ₹{w.get('week_high', 0):,.1f} | Close: ₹{w.get('week_close', 0):,.1f}</div>
+                    <div class='card-indicators'>
+                        ST {'↑' if snap.get('daily_st_dir') == 1 else '↓'} • RSI {snap.get('rsi_14', '—')} • EMA {snap.get('ema_alignment', '—')}
+                        • <span class='pivot-badge pivot-{'above' if 'above' in snap.get('pivot_pos', '') else 'below'}'>{snap.get('pivot_pos', '—')}</span>
+                    </div>
+                    {hist_text}
+                </div>
+                """, unsafe_allow_html=True)
+    else:
+        flat_winners = []
+        for w in winners:
+            snap = w.get("snapshot", {})
+            if is_intraday:
+                flat_winners.append({
+                    "Symbol": w["symbol"],
+                    "Direction": w["direction"],
+                    "Move %": f"+{w['move_pct']:.2f}%",
+                    "1st Candle Body %": f"{w.get('fc_body_pct', 0):.2f}%",
+                    "Day High": f"₹{w.get('day_high', 0):,.1f}",
+                    "Day Low": f"₹{w.get('day_low', 0):,.1f}",
+                    "RSI": snap.get("rsi_14", "—"),
+                    "Vol Ratio": f"{snap.get('vol_ratio', 0)}x",
+                    "Sector": snap.get("sector", "—"),
+                    "Pivot": snap.get("pivot_pos", "—"),
+                })
+            else:
+                flat_winners.append({
+                    "Symbol": w["symbol"],
+                    "Direction": w["direction"],
+                    "Weekly Return %": f"+{w['move_pct']:.2f}%",
+                    "Week High": f"₹{w.get('week_high', 0):,.1f}",
+                    "Week Low": f"₹{w.get('week_low', 0):,.1f}",
+                    "ST Dir": "↑ Bull" if snap.get("daily_st_dir") == 1 else "↓ Bear",
+                    "RSI": snap.get("rsi_14", "—"),
+                    "EMA Alignment": snap.get("ema_alignment", "—"),
+                    "Monthly Pivot": snap.get("pivot_pos", "—"),
+                    "Sector": snap.get("sector", "—"),
+                })
+        st.dataframe(pd.DataFrame(flat_winners), use_container_width=True)
+
+def render_historical_top3_view(record, is_intraday=True, key_prefix="hist_top3"):
+    if not record:
+        st.info("No historical data available for selected period.")
+        return
+
+    gainers = record.get("gainers", [])
+    losers = record.get("losers", [])
+
+    mode = display_view_toggle(key_prefix, default="card")
+
+    col_g, col_l = st.columns(2)
+
+    with col_g:
+        st.markdown("<h5 style='color:#00ffaa;'>🟢 Top 3 Gainers (NSE F&O)</h5>", unsafe_allow_html=True)
+        if mode == "card":
+            for g in gainers:
+                ret_val = g.get("change_pct", g.get("weekly_return_pct", 0))
+                st.markdown(f"""
+                <div class='gainer-card'>
+                    <div style='display:flex;justify-content:space-between;align-items:center;'>
+                        <span class='card-symbol'>🟢 {g['symbol']}</span>
+                        <span class='card-score score-high'>+{ret_val:.2f}%</span>
+                    </div>
+                    <div class='card-setup'>Sector: {g.get('sector', 'N/A')} • Turnover: ₹{g.get('turnover_cr', 0):,.1f} Cr</div>
+                    <div class='card-prices'>
+                        {f"Close ₹{g.get('close', 0):,.1f} (Prev ₹{g.get('prev_close', 0):,.1f}) | High ₹{g.get('high', 0):,.1f} / Low ₹{g.get('low', 0):,.1f}" if is_intraday else f"Fri Close ₹{g.get('fri_close', 0):,.1f} (Mon Open ₹{g.get('mon_open', 0):,.1f}) | Range {g.get('week_range_pct', 0):.1f}%"}
+                    </div>
+                    <div class='card-indicators'>
+                        {f"Intraday Move: {g.get('intra_move_pct', 0):+.2f}% • Day Range: {g.get('day_range_pct', 0):.2f}% • Vol: {g.get('volume', 0):,}" if is_intraday else f"Week High ₹{g.get('week_high', 0):,.1f} / Low ₹{g.get('week_low', 0):,.1f} • Total Vol: {g.get('total_volume', 0):,}"}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            df_g = pd.DataFrame(gainers)
+            cols = [c for c in ['symbol', 'change_pct', 'weekly_return_pct', 'close', 'fri_close', 'turnover_cr', 'sector'] if c in df_g.columns]
+            st.dataframe(df_g[cols], use_container_width=True)
+
+    with col_l:
+        st.markdown("<h5 style='color:#ff3366;'>🔴 Top 3 Losers (NSE F&O)</h5>", unsafe_allow_html=True)
+        if mode == "card":
+            for l in losers:
+                ret_val = l.get("change_pct", l.get("weekly_return_pct", 0))
+                st.markdown(f"""
+                <div class='loser-card'>
+                    <div style='display:flex;justify-content:space-between;align-items:center;'>
+                        <span class='card-symbol'>🔴 {l['symbol']}</span>
+                        <span class='card-score score-low'>{ret_val:.2f}%</span>
+                    </div>
+                    <div class='card-setup'>Sector: {l.get('sector', 'N/A')} • Turnover: ₹{l.get('turnover_cr', 0):,.1f} Cr</div>
+                    <div class='card-prices'>
+                        {f"Close ₹{l.get('close', 0):,.1f} (Prev ₹{l.get('prev_close', 0):,.1f}) | High ₹{l.get('high', 0):,.1f} / Low ₹{l.get('low', 0):,.1f}" if is_intraday else f"Fri Close ₹{l.get('fri_close', 0):,.1f} (Mon Open ₹{l.get('mon_open', 0):,.1f}) | Range {l.get('week_range_pct', 0):.1f}%"}
+                    </div>
+                    <div class='card-indicators'>
+                        {f"Intraday Move: {l.get('intra_move_pct', 0):+.2f}% • Day Range: {l.get('day_range_pct', 0):.2f}% • Vol: {l.get('volume', 0):,}" if is_intraday else f"Week High ₹{l.get('week_high', 0):,.1f} / Low ₹{l.get('week_low', 0):,.1f} • Total Vol: {l.get('total_volume', 0):,}"}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            df_l = pd.DataFrame(losers)
+            cols = [c for c in ['symbol', 'change_pct', 'weekly_return_pct', 'close', 'fri_close', 'turnover_cr', 'sector'] if c in df_l.columns]
+            st.dataframe(df_l[cols], use_container_width=True)
+
 # =============================================================================
 # STATEFUL MAIN NAVIGATION (Immune to resets on rerun)
 # =============================================================================
@@ -2337,29 +2947,8 @@ if main_tab == "🌅 PRE-MARKET SCREENER":
 
     if sub_pm == "⚡ Pre-Market Open Heroes (09:08 AM)":
         st.markdown("### ⚡ Pre-Market Open Heroes (09:00 AM – 09:08 AM)")
-        st.markdown("<div class='info-panel'>🏆 Reads NSE Pre-Open Auction data at 09:08 AM to find high-turnover institutional gap-ups and gap-downs with Daily Trend confirmation.</div>", unsafe_allow_html=True)
-        if hero_long or hero_short:
-            hc1, hc2 = st.columns(2)
-            if hero_long:
-                with hc1:
-                    st.markdown(f"""
-                    <div class='glass-card' style='border-left: 4px solid #00ffaa;'>
-                        <div style='font-size:18px;font-weight:800;color:#00ffaa;'>🟢 BULL HERO: {hero_long['Symbol']} {hero_long['Conf']}</div>
-                        <div style='font-size:14px;margin-top:6px;'>Opening Price: <b>₹{hero_long['LTP']:,.1f}</b> ({'+' if hero_long['Gap']>=0 else ''}{hero_long['Gap']:.2f}%)</div>
-                        <div style='font-size:12px;color:#8b90b0;'>Pre-Open Turnover: <b>₹{hero_long['Money']:,.0f} Cr</b></div>
-                    </div>
-                    """, unsafe_allow_html=True)
-            if hero_short:
-                with hc2:
-                    st.markdown(f"""
-                    <div class='glass-card' style='border-left: 4px solid #ff3366;'>
-                        <div style='font-size:18px;font-weight:800;color:#ff3366;'>🔴 BEAR HERO: {hero_short['Symbol']} {hero_short['Conf']}</div>
-                        <div style='font-size:14px;margin-top:6px;'>Opening Price: <b>₹{hero_short['LTP']:,.1f}</b> ({'+' if hero_short['Gap']>=0 else ''}{hero_short['Gap']:.2f}%)</div>
-                        <div style='font-size:12px;color:#8b90b0;'>Pre-Open Turnover: <b>₹{hero_short['Money']:,.0f} Cr</b></div>
-                    </div>
-                    """, unsafe_allow_html=True)
-        else:
-            st.info("🟡 Pre-market data will be available at 09:08 AM on trading days.")
+        st.markdown("<div class='info-panel'>🏆 Reads NSE Pre-Open Auction data at 09:08 AM to find high-turnover institutional gap-ups and gap-downs with Daily Trend confirmation (Exclusively NSE F&O).</div>", unsafe_allow_html=True)
+        render_heroes_view(hero_long, hero_short, key_prefix="hero_pm")
 
     elif sub_pm == "📅 Intraday EOD Picks (For Tomorrow)":
         st.markdown("### 📅 Intraday EOD Picks (For Tomorrow)")
@@ -2544,36 +3133,15 @@ elif main_tab == "🎯 ENTRY PLAYBOOK":
 # TAB 4: TOOLS
 # ═══════════════════════════════════════════════════════════════
 elif main_tab == "🛠️ TOOLS":
-    sub_tool_options = ["📊 Pivot Level Calculator", "📖 Today's Signal Ledger", "ℹ️ System Architecture"]
-    if "sub_tool_nav" not in st.session_state:
+    sub_tool_options = ["📖 Today's Signal Ledger", "ℹ️ System Architecture"]
+    if "sub_tool_nav" not in st.session_state or st.session_state["sub_tool_nav"] not in sub_tool_options:
         st.session_state["sub_tool_nav"] = sub_tool_options[0]
 
     sub_tool = st.radio("Tool Sections", sub_tool_options, key="sub_tool_nav", label_visibility="collapsed")
 
-    if sub_tool == "📊 Pivot Level Calculator":
-        st.markdown("### 📊 Weekly & Monthly Pivot Calculator")
-        piv_ticker = st.text_input("Ticker (e.g. RELIANCE.NS)", value="RELIANCE.NS", key="piv_t")
-        if st.button("Calculate Pivots", key="piv_btn"):
-            d = fetch_stock_data(piv_ticker, period="6mo", interval="1d")
-            if not d.empty:
-                wp = compute_weekly_pivot(d)
-                mp = compute_monthly_pivot(d)
-                pc1, pc2 = st.columns(2)
-                with pc1:
-                    st.markdown("#### 📅 Weekly Pivot")
-                    if wp:
-                        for k, v in wp.items():
-                            color = "#00ffaa" if 'R' in k else ("#ff3366" if 'S' in k else "#ffaa00")
-                            st.markdown(f"<span style='color:{color};font-weight:700;'>{k}: ₹{v:,.2f}</span>", unsafe_allow_html=True)
-                with pc2:
-                    st.markdown("#### 📅 Monthly Pivot")
-                    if mp:
-                        for k, v in mp.items():
-                            color = "#00ffaa" if 'R' in k else ("#ff3366" if 'S' in k else "#ffaa00")
-                            st.markdown(f"<span style='color:{color};font-weight:700;'>{k}: ₹{v:,.2f}</span>", unsafe_allow_html=True)
-
-    elif sub_tool == "📖 Today's Signal Ledger":
+    if sub_tool == "📖 Today's Signal Ledger":
         st.markdown("### 📖 Today's Signal Ledger")
+        st.markdown("<div class='info-panel'>📋 Comprehensive real-time ledger of all signals generated across today's live & EOD scans with complete Risk:Reward metrics.</div>", unsafe_allow_html=True)
         all_results = []
         for key in SCAN_KEYS:
             saved, _ = load_session_results(key)
@@ -2581,32 +3149,26 @@ elif main_tab == "🛠️ TOOLS":
                 for r in saved:
                     r['Source'] = key.upper()
                 all_results.extend(saved)
-        if all_results:
-            df_ledger = pd.DataFrame(all_results)
-            cols_show = [c for c in ['Source', 'Symbol', 'Setup', 'Score', 'LTP', 'Entry', 'SL', 'TP',
-                                      'Status', 'Signal_Time', 'Scan_Time', 'Pivot', 'RSI', 'Vol_Ratio'] if c in df_ledger.columns]
-            st.dataframe(df_ledger[cols_show].sort_values('Score', ascending=False),
-                        use_container_width=True, height=500)
-        else:
-            st.info("📭 No signals today. Run a scan to populate.")
+        render_ledger_view(all_results, key_prefix="ledger")
 
     elif sub_tool == "ℹ️ System Architecture":
-        st.markdown("### ℹ️ QUANT-EDGE v19 Architecture")
+        st.markdown("### ℹ️ QUANT-EDGE v20 Architecture")
         st.markdown("""
         <div class='glass-card'>
             <b>🧠 Multi-Timeframe Confluence</b><br/>
             • Intraday: 15m + 30m + 1h scan with weekly pivots<br/>
             • Swing: 1h + 1D scan with monthly pivots<br/><br/>
-            <b>📊 Volume Profile</b><br/>
+            <b>📊 Volume Profile & Floor Pivots</b><br/>
             • POC (Point of Control) — highest volume price<br/>
-            • VAH/VAL — institutional value area boundaries<br/><br/>
+            • VAH/VAL — institutional value area boundaries<br/>
+            • Standard Weekly & Monthly Floor Pivots (P, R1-R3, S1-S3)<br/><br/>
             <b>⚡ One-Way Runner Detection</b><br/>
             • ORB breakout + VWAP never violated = pure momentum<br/>
             • 0.70% first-candle filter flags extended opens<br/><br/>
-            <b>🏦 Institutional Tracking</b><br/>
-            • ADL (Accumulation/Distribution Line)<br/>
-            • Volume at pivot levels = institutional interest<br/>
-            • VWAP as institutional benchmark<br/><br/>
+            <b>🏛️ Historical Top 3 Backtest Engine</b><br/>
+            • Intraday: Top 3 Gainers & Losers across past 60 trading days<br/>
+            • Swing: Top 3 Weekly Gainers & Losers across past 12 weeks<br/>
+            • 100% Exclusively NSE F&O Universe (219 Active Symbols)<br/><br/>
             <b>💾 Data Persistence</b><br/>
             • Scan results survive page refreshes<br/>
             • Data persists until next trading day 9:00 AM<br/>
@@ -2615,11 +3177,11 @@ elif main_tab == "🛠️ TOOLS":
         """, unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════
-# TAB: PERFORMANCE LAB
+# TAB 3: PERFORMANCE LAB (100% EXCLUSIVELY NSE F&O UNIVERSE)
 # ═══════════════════════════════════════════════════════════════
 elif main_tab == "📈 PERFORMANCE LAB":
-    sub_perf_options = ["📝 Manual Stock Logger", "🏆 Auto-Discovered Winners", "🧠 Pattern Intelligence", "📊 Backtest Results"]
-    if "sub_perf_nav" not in st.session_state:
+    sub_perf_options = ["📝 Manual Stock Logger", "🏆 Auto-Discovered Winners", "🧠 Pattern Intelligence", "📊 Backtest & Historical Top 3 Lab"]
+    if "sub_perf_nav" not in st.session_state or st.session_state["sub_perf_nav"] not in sub_perf_options:
         st.session_state["sub_perf_nav"] = sub_perf_options[0]
 
     sub_perf = st.radio("Performance Lab Sections", sub_perf_options, key="sub_perf_nav", label_visibility="collapsed")
@@ -2627,12 +3189,12 @@ elif main_tab == "📈 PERFORMANCE LAB":
     # ─── SUBTAB 1: MANUAL STOCK LOGGER ───
     if sub_perf == "📝 Manual Stock Logger":
         st.markdown("### 📝 Manual Winner Logger")
-        st.markdown("<div class='info-panel'>📋 Add stocks that performed well today. Technical data will be auto-captured. This data feeds into Pattern Intelligence to improve the screener.</div>", unsafe_allow_html=True)
+        st.markdown("<div class='info-panel'>📋 Add stocks that performed well today. Technical data will be auto-captured from the NSE F&O universe. This data feeds into Pattern Intelligence to refine screener scoring.</div>", unsafe_allow_html=True)
 
         with st.form("manual_log_form", clear_on_submit=True):
             ml_col1, ml_col2, ml_col3 = st.columns([3, 1, 1])
             with ml_col1:
-                ml_tickers = st.text_input("Stock Symbols (comma-separated)", placeholder="MCX, BANKBARODA, SAIL", key="ml_tickers")
+                ml_tickers = st.text_input("F&O Stock Symbols (comma-separated)", placeholder="MCX, BANKBARODA, SAIL", key="ml_tickers")
             with ml_col2:
                 ml_type = st.selectbox("Trade Type", ["Intraday", "Swing"], key="ml_type")
             with ml_col3:
@@ -2652,7 +3214,6 @@ elif main_tab == "📈 PERFORMANCE LAB":
                 new_entries = []
                 for sym in tickers_raw:
                     ticker = sym + ".NS" if not sym.endswith(".NS") else sym
-                    # Auto-fetch technical snapshot
                     try:
                         daily_df = yf.download(ticker, period="1y", interval="1d", progress=False, auto_adjust=True)
                         if isinstance(daily_df.columns, pd.MultiIndex):
@@ -2672,210 +3233,108 @@ elif main_tab == "📈 PERFORMANCE LAB":
                     })
                 existing_entries.extend(new_entries)
                 save_manual_log(existing_entries)
-                st.success(f"✅ Added {len(new_entries)} stocks to manual log!")
+                st.success(f"✅ Added {len(new_entries)} F&O stocks to manual log!")
                 st.rerun()
 
-        # Display existing manual log
+        # Display existing manual log in Card or List view
         manual_entries = load_manual_log()
-        if manual_entries:
-            st.markdown(f"#### 📋 Logged Winners ({len(manual_entries)} total)")
+        render_manual_log_view(manual_entries, key_prefix="manual_log")
 
-            # Download button
-            csv_data = perf_data_to_csv(manual_entries, "manual_log")
-            if csv_data:
-                st.download_button("⬇️ Download CSV", csv_data, file_name="manual_winners_log.csv", mime="text/csv", key="dl_manual")
-
-            # Display as table
-            display_rows = []
-            for idx, e in enumerate(manual_entries):
-                snap = e.get("snapshot", {})
-                display_rows.append({
-                    "#": idx + 1,
-                    "Symbol": e.get("symbol", ""),
-                    "Type": e.get("trade_type", ""),
-                    "Dir": f"{'🟢' if e.get('direction') == 'BUY' else '🔴'} {e.get('direction', '')}",
-                    "Date": e.get("date", ""),
-                    "ST": "↑" if snap.get("daily_st_dir") == 1 else "↓",
-                    "RSI": snap.get("rsi_14", "—"),
-                    "EMA": snap.get("ema_alignment", "—"),
-                    "Vol": f"{snap.get('vol_ratio', 0)}x",
-                    "Gap%": snap.get("gap_pct", "—"),
-                    "Pivot": snap.get("pivot_pos", "—"),
-                    "Sector": snap.get("sector", "—"),
-                    "Notes": e.get("notes", ""),
-                })
-            st.dataframe(pd.DataFrame(display_rows), use_container_width=True, height=min(500, 35 * len(display_rows) + 38))
-
-            # Delete entries
-            with st.expander("🗑️ Delete Entries"):
-                del_idx = st.number_input("Entry # to delete", min_value=1, max_value=len(manual_entries), value=1, key="del_idx")
-                if st.button("🗑️ Delete", key="del_manual_btn"):
-                    manual_entries.pop(del_idx - 1)
-                    save_manual_log(manual_entries)
-                    st.success("Deleted!")
-                    st.rerun()
-        else:
-            st.info("📭 No manually logged winners yet. Add some above!")
-
-    # ─── SUBTAB 2: AUTO-DISCOVERED WINNERS ───
+    # ─── SUBTAB 2: AUTO-DISCOVERED WINNERS (SIDE-BY-SIDE INTRADAY & SWING) ───
     elif sub_perf == "🏆 Auto-Discovered Winners":
-        st.markdown("### 🏆 Auto-Discovered Winners")
-        st.markdown("<div class='info-panel'>🔍 Automatically finds stocks that moved ≥2% (intraday) or ≥7% (swing) from ORB edge. Runs daily after 3:35 PM. You can also trigger manually.</div>", unsafe_allow_html=True)
+        st.markdown("### 🏆 Auto-Discovered Winners <span class='fo-badge'>💎 Exclusively NSE F&O (219 Symbols)</span>", unsafe_allow_html=True)
+        st.markdown("<div class='info-panel'>🔍 Automatically discovers stocks that made clean one-way runner moves: <b>≥2% Intraday</b> from 1st 5-min candle edge, or <b>≥7% Swing</b> from Monday 1st 1-hour candle. Runs automatically after 3:35 PM on market days.</div>", unsafe_allow_html=True)
 
-        disc_c1, disc_c2 = st.columns(2)
-
-        with disc_c1:
-            st.markdown("#### ⚡ Intraday Winners (≥2% ORB Move)")
+        disc_btn_c1, disc_btn_c2 = st.columns(2)
+        with disc_btn_c1:
             is_disc_running_i = render_scan_status("perf_intraday_discovery")
-
-            if st.button("🔍 Discover Today's Intraday Winners", key="disc_intra_btn", type="primary"):
+            if st.button("🔍 Discover Today's Intraday Winners", key="disc_intra_btn", type="primary", use_container_width=True):
                 start_auto_discovery("intraday")
                 st.rerun()
-
             if is_disc_running_i:
-                st.info("🔄 Scanning 219 stocks for intraday winners...")
+                st.info("🔄 Scanning 219 F&O stocks for intraday winners...")
 
-        with disc_c2:
-            st.markdown("#### 📈 Swing Winners (≥7% Weekly Move)")
+        with disc_btn_c2:
             is_disc_running_s = render_scan_status("perf_swing_discovery")
-
-            if st.button("🔍 Discover This Week's Swing Winners", key="disc_swing_btn", type="primary"):
+            if st.button("🔍 Discover This Week's Swing Winners", key="disc_swing_btn", type="primary", use_container_width=True):
                 start_auto_discovery("swing")
                 st.rerun()
-
             if is_disc_running_s:
-                st.info("🔄 Scanning 219 stocks for swing winners...")
+                st.info("🔄 Scanning 219 F&O stocks for swing winners...")
 
         st.markdown("---")
 
-        # Show Intraday Winners
-        intraday_dates = get_all_intraday_winner_dates()
-        if intraday_dates:
-            selected_date = st.selectbox("📅 Select Intraday Date", intraday_dates[::-1], key="sel_intra_date")
-            iw_data = load_perf_winners(os.path.join(INTRADAY_WINNERS_DIR, f"{selected_date}.json"))
-            if iw_data and iw_data.get("winners"):
-                st.markdown(f"**{iw_data['winners_found']} winners found** on {selected_date} (scanned {iw_data['total_scanned']} stocks)")
+        # Side-by-Side Results Display
+        col_intra_disp, col_swing_disp = st.columns(2)
 
-                # Download
-                flat_winners = []
-                for w in iw_data["winners"]:
-                    snap = w.get("snapshot", {})
-                    flat_winners.append({
-                        "Symbol": w["symbol"], "Direction": w["direction"],
-                        "Move%": w["move_pct"], "1st Candle Body%": w.get("fc_body_pct", ""),
-                        "1st Candle Vol Ratio": w.get("fc_vol_ratio", ""),
-                        "Day High": w.get("day_high", ""), "Day Low": w.get("day_low", ""),
-                        "ST Dir": snap.get("daily_st_dir", ""), "RSI": snap.get("rsi_14", ""),
-                        "EMA Alignment": snap.get("ema_alignment", ""),
-                        "Vol Ratio": snap.get("vol_ratio", ""),
-                        "Gap%": snap.get("gap_pct", ""),
-                        "Pivot Pos": snap.get("pivot_pos", ""),
-                        "ADL": snap.get("adl_trend", ""),
-                        "Sector": snap.get("sector", ""),
-                    })
-                csv_iw = perf_data_to_csv(flat_winners, "intraday_winners")
-                if csv_iw:
-                    st.download_button("⬇️ Download Intraday Winners CSV", csv_iw,
-                                       file_name=f"intraday_winners_{selected_date}.csv", mime="text/csv", key="dl_iw")
-
-                # Display winner cards
-                iw_cols = st.columns(2)
-                for idx, w in enumerate(iw_data["winners"]):
-                    with iw_cols[idx % 2]:
+        # ── LEFT COLUMN: INTRADAY WINNERS ──
+        with col_intra_disp:
+            st.markdown("#### ⚡ Intraday Winners (≥2% ORB Move)")
+            intraday_dates = get_all_intraday_winner_dates()
+            if intraday_dates:
+                selected_date = st.selectbox("📅 Select Intraday Session", intraday_dates[::-1], key="sel_intra_date")
+                iw_data = load_perf_winners(os.path.join(INTRADAY_WINNERS_DIR, f"{selected_date}.json"))
+                if iw_data and iw_data.get("winners"):
+                    st.markdown(f"**{iw_data['winners_found']} F&O winners** on {selected_date} (scanned {iw_data['total_scanned']} symbols)")
+                    
+                    flat_iw = []
+                    for w in iw_data["winners"]:
                         snap = w.get("snapshot", {})
-                        is_buy = w["direction"] == "BUY"
-                        card_cls = "signal-card-buy" if is_buy else "signal-card-sell"
-                        emoji = "🟢" if is_buy else "🔴"
-                        hist_similar = w.get("historical_similar", [])
-                        hist_text = ""
-                        if hist_similar:
-                            avg_fwd = np.mean([h.get("fwd_return_5d", 0) for h in hist_similar])
-                            hist_text = f"<div style='font-size:10px;color:#6b7294;margin-top:4px;'>📜 {len(hist_similar)} similar past setups found • Avg 5-day fwd return: <b style='color:{('#00ffaa' if avg_fwd > 0 else '#ff3366')}'>{avg_fwd:+.1f}%</b></div>"
+                        flat_iw.append({
+                            "Symbol": w["symbol"], "Direction": w["direction"],
+                            "Move %": w["move_pct"], "1st Candle Body %": w.get("fc_body_pct", ""),
+                            "1st Candle Vol Ratio": w.get("fc_vol_ratio", ""),
+                            "Day High": w.get("day_high", ""), "Day Low": w.get("day_low", ""),
+                            "ST Dir": snap.get("daily_st_dir", ""), "RSI": snap.get("rsi_14", ""),
+                            "EMA Alignment": snap.get("ema_alignment", ""), "Vol Ratio": snap.get("vol_ratio", ""),
+                            "Gap %": snap.get("gap_pct", ""), "Pivot": snap.get("pivot_pos", ""), "Sector": snap.get("sector", ""),
+                        })
+                    csv_iw = perf_data_to_csv(flat_iw, "intraday_winners")
+                    if csv_iw:
+                        st.download_button("⬇️ Download Intraday CSV", csv_iw, file_name=f"intraday_winners_{selected_date}.csv", mime="text/csv", key="dl_iw_btn")
 
-                        st.markdown(f"""
-                        <div class='signal-card {card_cls}'>
-                            <div style='display:flex;justify-content:space-between;align-items:center;'>
-                                <span class='card-symbol'>{emoji} {w['symbol']}</span>
-                                <span class='card-score score-high'>+{w['move_pct']:.1f}%</span>
-                            </div>
-                            <div class='card-setup'>{w['direction']} WINNER • {snap.get('sector', 'N/A')}</div>
-                            <div class='card-prices'>ORB: ₹{w.get('fc_high', 0):,.1f} / ₹{w.get('fc_low', 0):,.1f} → Day: ₹{w.get('day_high', 0):,.1f} / ₹{w.get('day_low', 0):,.1f}</div>
-                            <div class='card-indicators'>
-                                ST {'↑' if snap.get('daily_st_dir') == 1 else '↓'} •
-                                RSI {snap.get('rsi_14', '—')} •
-                                EMA {snap.get('ema_alignment', '—')} •
-                                Vol {snap.get('vol_ratio', 0)}x •
-                                Gap {snap.get('gap_pct', 0):+.1f}% •
-                                <span class='pivot-badge pivot-{'above' if 'above' in snap.get('pivot_pos', '') else 'below'}'>{snap.get('pivot_pos', '—')}</span>
-                            </div>
-                            <div style='font-size:10px;color:#4a5078;margin-top:4px;'>1st Candle: Body {w.get('fc_body_pct', 0):.2f}% • Vol Ratio {w.get('fc_vol_ratio', 0):.1f}x • ADL: {snap.get('adl_trend', '—')}</div>
-                            {hist_text}
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                        # Show historical similar setups in expander
-                        if hist_similar:
-                            with st.expander(f"📜 {len(hist_similar)} Similar Past Setups", expanded=False):
-                                hist_df = pd.DataFrame(hist_similar)
-                                st.dataframe(hist_df, use_container_width=True)
+                    render_winners_view(iw_data.get("winners", []), is_intraday=True, key_prefix="auto_intra_view")
+                else:
+                    st.info(f"No intraday winners recorded for {selected_date}.")
             else:
-                st.info(f"No winners found for {selected_date}.")
-        else:
-            st.info("📭 No intraday winner data yet. Discovery runs automatically after 3:35 PM, or click the button above.")
+                st.info("📭 No intraday winner sessions yet. Discovery runs automatically after 3:35 PM IST, or click the button above.")
 
-        # Show Swing Winners
-        st.markdown("---")
-        swing_weeks = get_all_swing_winner_weeks()
-        if swing_weeks:
-            selected_week = st.selectbox("📅 Select Swing Week", swing_weeks[::-1], key="sel_swing_week")
-            sw_data = load_perf_winners(os.path.join(SWING_WINNERS_DIR, f"{selected_week}.json"))
-            if sw_data and sw_data.get("winners"):
-                st.markdown(f"**{sw_data['winners_found']} swing winners** in week {selected_week}")
+        # ── RIGHT COLUMN: SWING WINNERS ──
+        with col_swing_disp:
+            st.markdown("#### 📈 Swing Winners (≥7% Weekly Move)")
+            swing_weeks = get_all_swing_winner_weeks()
+            if swing_weeks:
+                selected_week = st.selectbox("📅 Select Swing Session", swing_weeks[::-1], key="sel_swing_week")
+                sw_data = load_perf_winners(os.path.join(SWING_WINNERS_DIR, f"{selected_week}.json"))
+                if sw_data and sw_data.get("winners"):
+                    st.markdown(f"**{sw_data['winners_found']} F&O swing winners** in week {selected_week}")
 
-                flat_sw = []
-                for w in sw_data["winners"]:
-                    snap = w.get("snapshot", {})
-                    flat_sw.append({
-                        "Symbol": w["symbol"], "Direction": w["direction"],
-                        "Move%": w["move_pct"],
-                        "Week High": w.get("week_high", ""), "Week Low": w.get("week_low", ""),
-                        "ST Dir": snap.get("daily_st_dir", ""), "RSI": snap.get("rsi_14", ""),
-                        "EMA": snap.get("ema_alignment", ""),
-                        "Pivot": snap.get("pivot_pos", ""),
-                        "Sector": snap.get("sector", ""),
-                    })
-                csv_sw = perf_data_to_csv(flat_sw, "swing_winners")
-                if csv_sw:
-                    st.download_button("⬇️ Download Swing Winners CSV", csv_sw,
-                                       file_name=f"swing_winners_{selected_week}.csv", mime="text/csv", key="dl_sw")
-
-                sw_cols = st.columns(2)
-                for idx, w in enumerate(sw_data["winners"]):
-                    with sw_cols[idx % 2]:
+                    flat_sw = []
+                    for w in sw_data["winners"]:
                         snap = w.get("snapshot", {})
-                        is_buy = w["direction"] == "BUY"
-                        emoji = "🟢" if is_buy else "🔴"
-                        card_cls = "signal-card-buy" if is_buy else "signal-card-sell"
-                        st.markdown(f"""
-                        <div class='signal-card {card_cls}'>
-                            <span class='card-symbol'>{emoji} {w['symbol']}</span>
-                            <span class='card-score score-high'>+{w['move_pct']:.1f}% weekly</span>
-                            <div class='card-setup'>{w['direction']} SWING WINNER • {snap.get('sector', 'N/A')}</div>
-                            <div class='card-indicators'>ST {'↑' if snap.get('daily_st_dir') == 1 else '↓'} • RSI {snap.get('rsi_14', '—')} • EMA {snap.get('ema_alignment', '—')} • Pivot {snap.get('pivot_pos', '—')}</div>
-                        </div>
-                        """, unsafe_allow_html=True)
+                        flat_sw.append({
+                            "Symbol": w["symbol"], "Direction": w["direction"],
+                            "Move %": w["move_pct"], "Week High": w.get("week_high", ""), "Week Low": w.get("week_low", ""),
+                            "ST Dir": snap.get("daily_st_dir", ""), "RSI": snap.get("rsi_14", ""),
+                            "EMA": snap.get("ema_alignment", ""), "Monthly Pivot": snap.get("pivot_pos", ""), "Sector": snap.get("sector", ""),
+                        })
+                    csv_sw = perf_data_to_csv(flat_sw, "swing_winners")
+                    if csv_sw:
+                        st.download_button("⬇️ Download Swing CSV", csv_sw, file_name=f"swing_winners_{selected_week}.csv", mime="text/csv", key="dl_sw_btn")
+
+                    render_winners_view(sw_data.get("winners", []), is_intraday=False, key_prefix="auto_swing_view")
+                else:
+                    st.info(f"No swing winners recorded for week {selected_week}.")
             else:
-                st.info(f"No swing winners for week {selected_week}.")
-        else:
-            st.info("📭 No swing winner data yet. Discovery runs automatically on Fridays after 3:35 PM.")
+                st.info("📭 No swing winner sessions yet. Discovery runs automatically on Fridays after 3:35 PM IST, or click the button above.")
 
     # ─── SUBTAB 3: PATTERN INTELLIGENCE ───
     elif sub_perf == "🧠 Pattern Intelligence":
-        st.markdown("### 🧠 Pattern Intelligence — Golden Rules")
-        st.markdown("<div class='info-panel'>🧪 Analyzes all winners (auto-discovered + manually logged) to find the most common technical traits. Use these rules to improve stock selection.</div>", unsafe_allow_html=True)
+        st.markdown("### 🧠 Pattern Intelligence — Golden Rules <span class='fo-badge'>💎 NSE F&O</span>", unsafe_allow_html=True)
+        st.markdown("<div class='info-panel'>🧪 Statistically analyzes all historical winners to compute high-probability technical confluence rules for stock selection.</div>", unsafe_allow_html=True)
 
         if st.button("🔬 Analyze All Winner Patterns", key="analyze_btn", type="primary"):
-            with st.spinner("Analyzing all winner data..."):
+            with st.spinner("Analyzing winner data across 219 F&O symbols..."):
                 patterns = analyze_winner_patterns()
                 st.success("✅ Pattern analysis complete!")
 
@@ -2886,20 +3345,19 @@ elif main_tab == "📈 PERFORMANCE LAB":
             pat_c1, pat_c2 = st.columns(2)
 
             for col, label, key, sample_key in [
-                (pat_c1, "⚡ Intraday Winners", "intraday", "intraday_sample_size"),
-                (pat_c2, "📈 Swing Winners", "swing", "swing_sample_size")
+                (pat_c1, "⚡ Intraday Golden Rules", "intraday", "intraday_sample_size"),
+                (pat_c2, "📈 Swing Golden Rules", "swing", "swing_sample_size")
             ]:
                 with col:
                     st.markdown(f"#### {label}")
                     rules = patterns.get(key, {})
                     sample_size = patterns.get(sample_key, 0)
-                    st.caption(f"Sample size: {sample_size} winners")
+                    st.caption(f"📊 Sample size: {sample_size} F&O winners")
 
                     if not rules or rules.get("_total_winners", 0) == 0:
-                        st.info("🔍 Not enough data yet. Add winners or run auto-discovery first.")
+                        st.info("🔍 Not enough winner samples yet. Run discovery or log winners first.")
                         continue
 
-                    # Golden Rules — sorted by frequency
                     sorted_rules = sorted(
                         [(k, v) for k, v in rules.items() if isinstance(v, (int, float)) and not k.startswith("_")],
                         key=lambda x: x[1], reverse=True
@@ -2912,14 +3370,13 @@ elif main_tab == "📈 PERFORMANCE LAB":
                         bar_width = min(pct, 100)
                         st.markdown(f"""
                         <div style='margin-bottom:8px;'>
-                            <div style='font-size:12px;font-weight:600;color:#e2e4ef;'>{medal} {pct:.0f}% — {rule_name}</div>
+                            <div style='font-size:12px;font-weight:700;color:#e2e4ef;'>{medal} {pct:.0f}% — {rule_name}</div>
                             <div style='background:rgba(255,255,255,0.05);border-radius:4px;height:8px;margin-top:2px;'>
-                                <div style='background:{color};width:{bar_width}%;height:100%;border-radius:4px;transition:width 0.5s ease;'></div>
+                                <div style='background:{color};width:{bar_width}%;height:100%;border-radius:4px;'></div>
                             </div>
                         </div>
                         """, unsafe_allow_html=True)
 
-                    # Sector distribution
                     sector_dist = rules.get("_sector_distribution", {})
                     if sector_dist:
                         st.markdown("##### 🏭 Sector Distribution")
@@ -2929,107 +3386,277 @@ elif main_tab == "📈 PERFORMANCE LAB":
                         ])
                         st.dataframe(sector_df, use_container_width=True, height=200)
 
-            # Download patterns
             st.markdown("---")
             pat_json = json.dumps(patterns, indent=2, default=str)
-            st.download_button("⬇️ Download Pattern Analysis (JSON)", pat_json,
-                               file_name="pattern_analysis.json", mime="application/json", key="dl_pat")
+            st.download_button("⬇️ Download Pattern Analysis (JSON)", pat_json, file_name="pattern_analysis.json", mime="application/json", key="dl_pat")
         else:
             st.info("🔍 No pattern analysis yet. Click 'Analyze' after collecting winner data.")
 
-    # ─── SUBTAB 4: BACKTEST RESULTS ───
-    elif sub_perf == "📊 Backtest Results":
-        st.markdown("### 📊 Strategy Backtest — Hit Rate Analysis")
-        st.markdown("<div class='info-panel'>📈 Tests whether our screener would have found the actual winners before the move happened. Requires auto-discovered winner data for past dates.</div>", unsafe_allow_html=True)
+    # ─── SUBTAB 4: BACKTEST & HISTORICAL TOP 3 LAB ───
+    elif sub_perf == "📊 Backtest & Historical Top 3 Lab":
+        st.markdown("### 📊 Backtest & Historical Top 3 Lab <span class='fo-badge'>💎 Exclusively NSE F&O</span>", unsafe_allow_html=True)
+        st.markdown("<div class='info-panel'>🏛️ Complete historical quantitative performance laboratory. Features <b>60-Day Intraday Top 3 Gainers & Losers</b>, <b>12-Week Swing Top 3 Gainers & Losers</b>, and Strategy Screener Backtesting.</div>", unsafe_allow_html=True)
 
-        bt_c1, bt_c2 = st.columns(2)
-        with bt_c1:
-            if st.button("🧪 Run Intraday Backtest (60 days)", key="bt_intra_btn", type="primary"):
-                with st.spinner("Backtesting intraday strategy..."):
-                    bt_result = backtest_intraday_strategy(lookback_days=60)
-                    st.success(f"✅ Backtest complete! Avg Hit Rate: {bt_result.get('avg_hit_rate', 0):.1f}%")
+        bt_tab_choice = st.radio("Backtest Module", [
+            "⚡ 60-Day Intraday Top 3 (Daily Backtest)",
+            "📈 12-Week Swing Top 3 (Weekly Backtest)",
+            "🧪 Strategy Screener Hit-Rate Backtest"
+        ], horizontal=True, key="bt_mod_tab")
 
-        with bt_c2:
-            if st.button("🧪 Run Swing Backtest (12 weeks)", key="bt_swing_btn", type="primary"):
-                with st.spinner("Backtesting swing strategy..."):
-                    bt_result = backtest_swing_strategy(lookback_weeks=12)
-                    st.success(f"✅ Backtest complete! Avg Hit Rate: {bt_result.get('avg_hit_rate', 0):.1f}%")
+        # ── 1. 60-DAY INTRADAY TOP 3 GAINERS & LOSERS ──
+        if bt_tab_choice == "⚡ 60-Day Intraday Top 3 (Daily Backtest)":
+            st.markdown("#### ⚡ Past 60 Days Intraday Top 3 Gainers & Losers (NSE F&O)")
+            st.markdown("<div class='info-panel' style='font-size:11px;'>Calculates the Top 3 Gainers & Top 3 Losers for every single trading day across the 219 NSE F&O stocks. Mathematical formula: <code>Daily Return % = (Close - Prev_Close) / Prev_Close * 100</code>.</div>", unsafe_allow_html=True)
 
-        bt_data = load_backtest_results()
-        if bt_data:
-            st.markdown(f"<div class='last-updated'>🕐 Last backtest: {bt_data.get('run_at', 'Never')}</div>", unsafe_allow_html=True)
+            is_hist_intra_running = render_scan_status("hist_intraday_fetch")
+            c_fetch_i1, c_fetch_i2 = st.columns([1.5, 3.5])
+            with c_fetch_i1:
+                if st.button("🚀 Fetch / Refresh 60-Day Data", key="btn_fetch_hist_intra", type="primary", use_container_width=True):
+                    start_historical_intraday_fetch()
+                    st.rerun()
+            with c_fetch_i2:
+                if is_hist_intra_running:
+                    st.info("🔄 Downloading & calculating 60-day historical data for all 219 F&O stocks...")
 
-            bt_type = bt_data.get("type", "intraday")
+            hist_intra_records = load_hist_intraday()
+            if hist_intra_records:
+                # Summary metrics
+                all_g_moves = [g['change_pct'] for r in hist_intra_records for g in r.get('gainers', [])]
+                all_l_moves = [l['change_pct'] for r in hist_intra_records for l in r.get('losers', [])]
+                max_g = max(all_g_moves) if all_g_moves else 0
+                avg_g = np.mean(all_g_moves) if all_g_moves else 0
+                avg_l = np.mean(all_l_moves) if all_l_moves else 0
 
-            # Summary metrics
-            m1, m2, m3, m4 = st.columns(4)
-            with m1:
-                avg_hr = bt_data.get("avg_hit_rate", 0)
-                hr_color = "#00ffaa" if avg_hr >= 50 else ("#ffaa00" if avg_hr >= 30 else "#ff3366")
-                st.markdown(f"""<div class='metric-card'>
-                    <div class='metric-header'>AVG HIT RATE</div>
-                    <div class='metric-val' style='color:{hr_color};'>{avg_hr:.1f}%</div>
-                </div>""", unsafe_allow_html=True)
-            with m2:
-                total_w = bt_data.get("total_winners_found", sum(r.get("total_winners", 0) for r in bt_data.get("daily_results", bt_data.get("weekly_results", []))))
-                st.markdown(f"""<div class='metric-card'>
-                    <div class='metric-header'>TOTAL WINNERS</div>
-                    <div class='metric-val'>{total_w}</div>
-                </div>""", unsafe_allow_html=True)
-            with m3:
-                total_hits = bt_data.get("total_screener_hits", sum(r.get("screener_found", 0) for r in bt_data.get("daily_results", bt_data.get("weekly_results", []))))
-                st.markdown(f"""<div class='metric-card'>
-                    <div class='metric-header'>SCREENER HITS</div>
-                    <div class='metric-val' style='color:#00ffaa;'>{total_hits}</div>
-                </div>""", unsafe_allow_html=True)
-            with m4:
-                days_tested = len(bt_data.get("daily_results", bt_data.get("weekly_results", [])))
-                period_label = "Days" if bt_type == "intraday" else "Weeks"
-                st.markdown(f"""<div class='metric-card'>
-                    <div class='metric-header'>{period_label.upper()} TESTED</div>
-                    <div class='metric-val'>{days_tested}</div>
-                </div>""", unsafe_allow_html=True)
+                sm1, sm2, sm3, sm4 = st.columns(4)
+                with sm1:
+                    st.markdown(f"""<div class='metric-card'>
+                        <div class='metric-header'>DAYS AVAILABLE</div>
+                        <div class='metric-val'>{len(hist_intra_records)}</div>
+                    </div>""", unsafe_allow_html=True)
+                with sm2:
+                    st.markdown(f"""<div class='metric-card'>
+                        <div class='metric-header'>AVG TOP 3 GAINER</div>
+                        <div class='metric-val' style='color:#00ffaa;'>+{avg_g:.2f}%</div>
+                    </div>""", unsafe_allow_html=True)
+                with sm3:
+                    st.markdown(f"""<div class='metric-card'>
+                        <div class='metric-header'>AVG TOP 3 LOSER</div>
+                        <div class='metric-val' style='color:#ff3366;'>{avg_l:.2f}%</div>
+                    </div>""", unsafe_allow_html=True)
+                with sm4:
+                    st.markdown(f"""<div class='metric-card'>
+                        <div class='metric-header'>MAX SINGLE DAY GAIN</div>
+                        <div class='metric-val' style='color:#FFD700;'>+{max_g:.2f}%</div>
+                    </div>""", unsafe_allow_html=True)
 
-            # Results table
-            result_rows = bt_data.get("daily_results", bt_data.get("weekly_results", []))
-            if result_rows:
-                st.markdown("#### 📊 Detailed Results")
-                bt_df = pd.DataFrame(result_rows)
-                date_col = "date" if "date" in bt_df.columns else "week"
-                display_cols = [c for c in [date_col, "total_winners", "screener_found", "hit_rate", "missed"] if c in bt_df.columns]
-                st.dataframe(bt_df[display_cols], use_container_width=True, height=400)
+                st.markdown("---")
+                
+                # Date selector
+                date_options = [r["date"] for r in hist_intra_records]
+                c_sel1, c_sel2 = st.columns([2, 2])
+                with c_sel1:
+                    selected_date = st.selectbox("📅 Select Trading Day to Inspect", date_options, key="sel_hist_intra_date")
+                with c_sel2:
+                    # CSV Download of full 60 days
+                    flat_hist_rows = []
+                    for r in hist_intra_records:
+                        dt = r["date"]
+                        for rank, g in enumerate(r.get("gainers", []), 1):
+                            flat_hist_rows.append({
+                                "Date": dt, "Category": "Top Gainer", "Rank": rank, "Symbol": g["symbol"],
+                                "Change %": g["change_pct"], "Intra Move %": g.get("intra_move_pct", ""),
+                                "Prev Close": g.get("prev_close", ""), "Open": g.get("open", ""),
+                                "High": g.get("high", ""), "Low": g.get("low", ""), "Close": g.get("close", ""),
+                                "Volume": g.get("volume", ""), "Turnover Cr": g.get("turnover_cr", ""), "Sector": g.get("sector", "")
+                            })
+                        for rank, l in enumerate(r.get("losers", []), 1):
+                            flat_hist_rows.append({
+                                "Date": dt, "Category": "Top Loser", "Rank": rank, "Symbol": l["symbol"],
+                                "Change %": l["change_pct"], "Intra Move %": l.get("intra_move_pct", ""),
+                                "Prev Close": l.get("prev_close", ""), "Open": l.get("open", ""),
+                                "High": l.get("high", ""), "Low": l.get("low", ""), "Close": l.get("close", ""),
+                                "Volume": l.get("volume", ""), "Turnover Cr": l.get("turnover_cr", ""), "Sector": l.get("sector", "")
+                            })
+                    csv_intra_all = perf_data_to_csv(flat_hist_rows, "historical_intraday_60d")
+                    st.download_button("⬇️ Download Full 60-Day Top 3 Dataset (CSV)", csv_intra_all, file_name="historical_intraday_top3_60days.csv", mime="text/csv", key="dl_hist_intra_all")
 
-                # Hit rate chart
-                if "hit_rate" in bt_df.columns and len(bt_df) > 1:
-                    chart_df = bt_df[bt_df["total_winners"] > 0].copy()
-                    if not chart_df.empty:
-                        fig = go.Figure()
-                        fig.add_trace(go.Scatter(
-                            x=chart_df[date_col], y=chart_df["hit_rate"],
-                            mode='lines+markers', name='Hit Rate %',
-                            line=dict(color='#00ffaa', width=2),
-                            marker=dict(size=6)
-                        ))
-                        fig.add_hline(y=50, line_dash="dash", line_color="#ffaa00", annotation_text="50% target")
-                        fig.update_layout(
-                            title="Screener Hit Rate Over Time",
-                            template="plotly_dark",
-                            paper_bgcolor='rgba(0,0,0,0)',
-                            plot_bgcolor='rgba(0,0,0,0)',
-                            height=350,
-                            margin=dict(l=40, r=20, t=40, b=40)
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
+                target_rec = next((r for r in hist_intra_records if r["date"] == selected_date), None)
+                if target_rec:
+                    st.markdown(f"##### 📊 Daily Performance for **{selected_date}** (Scanned {target_rec.get('total_fo_scanned', 219)} F&O Symbols)")
+                    render_historical_top3_view(target_rec, is_intraday=True, key_prefix=f"hist_intra_{selected_date}")
+            else:
+                st.info("📭 No historical intraday data stored yet. Click '🚀 Fetch / Refresh 60-Day Data' to generate!")
 
-                # Download
-                bt_csv = bt_df.to_csv(index=False)
-                st.download_button("⬇️ Download Backtest Results CSV", bt_csv,
-                                   file_name=f"backtest_{bt_type}_results.csv", mime="text/csv", key="dl_bt")
-        else:
-            st.info("📭 No backtest results yet. Run a backtest after collecting auto-discovered winner data.")
+        # ── 2. 12-WEEK SWING TOP 3 GAINERS & LOSERS ──
+        elif bt_tab_choice == "📈 12-Week Swing Top 3 (Weekly Backtest)":
+            st.markdown("#### 📈 Past 12 Weeks Swing Top 3 Gainers & Losers (NSE F&O)")
+            st.markdown("<div class='info-panel' style='font-size:11px;'>Calculates the Top 3 Weekly Gainers & Top 3 Weekly Losers for every weekly session (Monday to Friday) across the 219 NSE F&O stocks. Mathematical formula: <code>Weekly Session Return % = (Friday Close - Monday Open) / Monday Open * 100</code>.</div>", unsafe_allow_html=True)
+
+            is_hist_swing_running = render_scan_status("hist_swing_fetch")
+            c_fetch_s1, c_fetch_s2 = st.columns([1.5, 3.5])
+            with c_fetch_s1:
+                if st.button("🚀 Fetch / Refresh 12-Week Data", key="btn_fetch_hist_swing", type="primary", use_container_width=True):
+                    start_historical_swing_fetch()
+                    st.rerun()
+            with c_fetch_s2:
+                if is_hist_swing_running:
+                    st.info("🔄 Downloading & calculating 12-week historical data for all 219 F&O stocks...")
+
+            hist_swing_records = load_hist_swing()
+            if hist_swing_records:
+                all_g_sw_moves = [g['weekly_return_pct'] for r in hist_swing_records for g in r.get('gainers', [])]
+                all_l_sw_moves = [l['weekly_return_pct'] for r in hist_swing_records for l in r.get('losers', [])]
+                max_sw_g = max(all_g_sw_moves) if all_g_sw_moves else 0
+                avg_sw_g = np.mean(all_g_sw_moves) if all_g_sw_moves else 0
+                avg_sw_l = np.mean(all_l_sw_moves) if all_l_sw_moves else 0
+
+                wm1, wm2, wm3, wm4 = st.columns(4)
+                with wm1:
+                    st.markdown(f"""<div class='metric-card'>
+                        <div class='metric-header'>WEEKS AVAILABLE</div>
+                        <div class='metric-val'>{len(hist_swing_records)}</div>
+                    </div>""", unsafe_allow_html=True)
+                with wm2:
+                    st.markdown(f"""<div class='metric-card'>
+                        <div class='metric-header'>AVG WEEKLY GAINER</div>
+                        <div class='metric-val' style='color:#00ffaa;'>+{avg_sw_g:.2f}%</div>
+                    </div>""", unsafe_allow_html=True)
+                with wm3:
+                    st.markdown(f"""<div class='metric-card'>
+                        <div class='metric-header'>AVG WEEKLY LOSER</div>
+                        <div class='metric-val' style='color:#ff3366;'>{avg_sw_l:.2f}%</div>
+                    </div>""", unsafe_allow_html=True)
+                with wm4:
+                    st.markdown(f"""<div class='metric-card'>
+                        <div class='metric-header'>MAX WEEKLY GAIN</div>
+                        <div class='metric-val' style='color:#FFD700;'>+{max_sw_g:.2f}%</div>
+                    </div>""", unsafe_allow_html=True)
+
+                st.markdown("---")
+
+                week_options = [r["week_key"] for r in hist_swing_records]
+                c_sel_w1, c_sel_w2 = st.columns([2, 2])
+                with c_sel_w1:
+                    selected_wk = st.selectbox("📅 Select Weekly Session to Inspect", week_options, key="sel_hist_swing_wk")
+                with c_sel_w2:
+                    flat_hist_sw_rows = []
+                    for r in hist_swing_records:
+                        wk = r["week_key"]
+                        for rank, g in enumerate(r.get("gainers", []), 1):
+                            flat_hist_sw_rows.append({
+                                "Week": wk, "Week Start": r.get("week_start", ""), "Week End": r.get("week_end", ""),
+                                "Category": "Top Weekly Gainer", "Rank": rank, "Symbol": g["symbol"],
+                                "Weekly Return %": g["weekly_return_pct"], "Monday Open": g.get("mon_open", ""),
+                                "Friday Close": g.get("fri_close", ""), "Week High": g.get("week_high", ""),
+                                "Week Low": g.get("week_low", ""), "Week Range %": g.get("week_range_pct", ""),
+                                "Total Volume": g.get("total_volume", ""), "Turnover Cr": g.get("turnover_cr", ""), "Sector": g.get("sector", "")
+                            })
+                        for rank, l in enumerate(r.get("losers", []), 1):
+                            flat_hist_sw_rows.append({
+                                "Week": wk, "Week Start": r.get("week_start", ""), "Week End": r.get("week_end", ""),
+                                "Category": "Top Weekly Loser", "Rank": rank, "Symbol": l["symbol"],
+                                "Weekly Return %": l["weekly_return_pct"], "Monday Open": l.get("mon_open", ""),
+                                "Friday Close": l.get("fri_close", ""), "Week High": l.get("week_high", ""),
+                                "Week Low": l.get("week_low", ""), "Week Range %": l.get("week_range_pct", ""),
+                                "Total Volume": l.get("total_volume", ""), "Turnover Cr": l.get("turnover_cr", ""), "Sector": l.get("sector", "")
+                            })
+                    csv_swing_all = perf_data_to_csv(flat_hist_sw_rows, "historical_swing_12w")
+                    st.download_button("⬇️ Download Full 12-Week Top 3 Dataset (CSV)", csv_swing_all, file_name="historical_swing_top3_12weeks.csv", mime="text/csv", key="dl_hist_swing_all")
+
+                target_wk_rec = next((r for r in hist_swing_records if r["week_key"] == selected_wk), None)
+                if target_wk_rec:
+                    st.markdown(f"##### 📊 Weekly Session: **{target_wk_rec.get('week_start')} to {target_wk_rec.get('week_end')} ({selected_wk})**")
+                    render_historical_top3_view(target_wk_rec, is_intraday=False, key_prefix=f"hist_swing_{selected_wk}")
+            else:
+                st.info("📭 No historical swing data stored yet. Click '🚀 Fetch / Refresh 12-Week Data' to generate!")
+
+        # ── 3. STRATEGY SCREENER HIT-RATE BACKTEST ──
+        elif bt_tab_choice == "🧪 Strategy Screener Hit-Rate Backtest":
+            st.markdown("#### 🧪 Strategy Screener Hit-Rate Analysis")
+            st.markdown("<div class='info-panel' style='font-size:11px;'>Cross-validates whether our pre-market and intraday screener setups accurately caught the confirmed winners before their moves.</div>", unsafe_allow_html=True)
+
+            bt_c1, bt_c2 = st.columns(2)
+            with bt_c1:
+                if st.button("🧪 Run Intraday Screener Backtest (60 days)", key="bt_intra_btn", type="primary", use_container_width=True):
+                    with st.spinner("Backtesting intraday strategy hit-rate..."):
+                        bt_result = backtest_intraday_strategy(lookback_days=60)
+                        st.success(f"✅ Intraday Backtest Complete! Avg Hit Rate: {bt_result.get('avg_hit_rate', 0):.1f}%")
+
+            with bt_c2:
+                if st.button("🧪 Run Swing Screener Backtest (12 weeks)", key="bt_swing_btn", type="primary", use_container_width=True):
+                    with st.spinner("Backtesting swing strategy hit-rate..."):
+                        bt_result = backtest_swing_strategy(lookback_weeks=12)
+                        st.success(f"✅ Swing Backtest Complete! Avg Hit Rate: {bt_result.get('avg_hit_rate', 0):.1f}%")
+
+            bt_data = load_backtest_results()
+            if bt_data:
+                st.markdown(f"<div class='last-updated'>🕐 Last backtest run: {bt_data.get('run_at', 'Never')}</div>", unsafe_allow_html=True)
+                bt_type = bt_data.get("type", "intraday")
+
+                m1, m2, m3, m4 = st.columns(4)
+                with m1:
+                    avg_hr = bt_data.get("avg_hit_rate", 0)
+                    hr_color = "#00ffaa" if avg_hr >= 50 else ("#ffaa00" if avg_hr >= 30 else "#ff3366")
+                    st.markdown(f"""<div class='metric-card'>
+                        <div class='metric-header'>AVG HIT RATE</div>
+                        <div class='metric-val' style='color:{hr_color};'>{avg_hr:.1f}%</div>
+                    </div>""", unsafe_allow_html=True)
+                with m2:
+                    total_w = bt_data.get("total_winners_found", sum(r.get("total_winners", 0) for r in bt_data.get("daily_results", bt_data.get("weekly_results", []))))
+                    st.markdown(f"""<div class='metric-card'>
+                        <div class='metric-header'>TOTAL WINNERS</div>
+                        <div class='metric-val'>{total_w}</div>
+                    </div>""", unsafe_allow_html=True)
+                with m3:
+                    total_hits = bt_data.get("total_screener_hits", sum(r.get("screener_found", 0) for r in bt_data.get("daily_results", bt_data.get("weekly_results", []))))
+                    st.markdown(f"""<div class='metric-card'>
+                        <div class='metric-header'>SCREENER HITS</div>
+                        <div class='metric-val' style='color:#00ffaa;'>{total_hits}</div>
+                    </div>""", unsafe_allow_html=True)
+                with m4:
+                    days_tested = len(bt_data.get("daily_results", bt_data.get("weekly_results", [])))
+                    period_label = "Days" if bt_type == "intraday" else "Weeks"
+                    st.markdown(f"""<div class='metric-card'>
+                        <div class='metric-header'>{period_label.upper()} TESTED</div>
+                        <div class='metric-val'>{days_tested}</div>
+                    </div>""", unsafe_allow_html=True)
+
+                result_rows = bt_data.get("daily_results", bt_data.get("weekly_results", []))
+                if result_rows:
+                    st.markdown("#### 📊 Detailed Hit-Rate Breakdown")
+                    bt_df = pd.DataFrame(result_rows)
+                    date_col = "date" if "date" in bt_df.columns else "week"
+                    display_cols = [c for c in [date_col, "total_winners", "screener_found", "hit_rate", "missed"] if c in bt_df.columns]
+                    st.dataframe(bt_df[display_cols], use_container_width=True, height=350)
+
+                    if "hit_rate" in bt_df.columns and len(bt_df) > 1:
+                        chart_df = bt_df[bt_df["total_winners"] > 0].copy()
+                        if not chart_df.empty:
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(
+                                x=chart_df[date_col], y=chart_df["hit_rate"],
+                                mode='lines+markers', name='Hit Rate %',
+                                line=dict(color='#00ffaa', width=2),
+                                marker=dict(size=6)
+                            ))
+                            fig.add_hline(y=50, line_dash="dash", line_color="#ffaa00", annotation_text="50% target")
+                            fig.update_layout(
+                                title="Screener Hit Rate Over Time",
+                                template="plotly_dark",
+                                paper_bgcolor='rgba(0,0,0,0)',
+                                plot_bgcolor='rgba(0,0,0,0)',
+                                height=320,
+                                margin=dict(l=40, r=20, t=40, b=40)
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+
+                    bt_csv = bt_df.to_csv(index=False)
+                    st.download_button("⬇️ Download Hit-Rate CSV", bt_csv, file_name=f"backtest_{bt_type}_results.csv", mime="text/csv", key="dl_bt_hitrate")
+            else:
+                st.info("📭 No hit-rate backtest results yet. Click a button above to run.")
 
 # =============================================================================
 # FOOTER
 # =============================================================================
 st.markdown("---")
-st.markdown(f"<div style='text-align:center;color:#3a4060;font-size:10px;padding:8px;'>👑 QUANT-EDGE v19 • Multi-TF Confluence • Pivots • VP • Institutional Psychology • Performance Lab • {get_ist_now().strftime('%d %b %Y, %I:%M %p IST')}</div>", unsafe_allow_html=True)
+st.markdown(f"<div style='text-align:center;color:#6b7294;font-size:11px;padding:8px;font-weight:600;'>👑 QUANT-EDGE v20 • Multi-TF Confluence • Floor Pivots • Volume Profile • Institutional Psychology • 60D/12W Backtest Lab • {get_ist_now().strftime('%d %b %Y, %I:%M %p IST')}</div>", unsafe_allow_html=True)
