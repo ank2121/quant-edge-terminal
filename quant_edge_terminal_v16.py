@@ -1,92 +1,269 @@
-import streamlit as st
-import pandas as pd
+"""
+================================================================================
+ QUANT-EDGE v21  —  INSTITUTIONAL ORB TERMINAL  (NSE F&O)
+================================================================================
+ Zero-decision screener. Three engines, one calibrated probability model each:
+
+   1. PRE-MARKET  (08:55-09:08)  -> TOP 1 BUY + TOP 1 SELL for the day
+   2. LIVE ORB    (09:20-14:30)  -> close-confirmed 5m ORB order tickets
+   3. EOD         (15:40-23:59)  -> TOP 5 watchlist for tomorrow
+   4. SWING       (Fri EOD)      -> LONG-ONLY weekly plan, Monday 1h ORB entry
+
+ EVERYTHING BELOW IS CALIBRATED ON REAL DATA, NOT ON INTUITION.
+ Study set: 215 F&O names, 744 daily sessions (3y), 59 sessions of 5-minute bars,
+ 12,598 real ORB trigger events, 3y of 60-minute bars for the swing engine.
+
+ KEY EMPIRICAL FINDINGS THAT DRIVE THIS VERSION  (see calibration report):
+ ------------------------------------------------------------------------------
+ * Base rate: 20.7% of liquid names travel >=2% UP from open on any given day,
+   22.8% travel >=2% DOWN.  ~33 names/day move >=2.5% either way.  Your
+   observation of "6 to 8 stocks" is the >=4-5% tail; >=2.5% is much wider.
+ * D-1 features predict CAPABILITY, not DIRECTION.  Top predictors of a big
+   move are atr_pct (1.63x lift), adr20 (1.56x), vol20 (1.48x),
+   big_moves_60 (1.46x), bbw (1.33x), rvol (1.2x).  Momentum/MACD are weak.
+ * GAPS MEAN-REVERT INTRADAY.  P(+2% from open | gap < -2%) = 60.0% versus
+   P(-2%) = 33.7%.  For gap > +2%: P(-2%) = 47.8% > P(+2%) = 41.0%.
+   v20 did the OPPOSITE (bought gap-ups, shorted gap-downs). Now inverted.
+ * ENTRY STYLE IS THE BIGGEST SINGLE LEVER.  Requiring a 5-minute candle to
+   CLOSE beyond the ORB level instead of merely touching it lifted expectancy
+   from -0.04% to +0.19% per trade at k=3 and from 28.3% to 37.5% target-hit
+   at k=1.  15-minute ORB was clearly worse than 5-minute.
+ * STOP MUST BE CAPPED.  Median ORB-range risk is 2.4-2.7%, which destroys the
+   2% target's reward:risk.  SL = min(opposite ORB edge, 1.0%), floor 0.35%.
+ * LONG >> SHORT.  Walk-forward long expectancy is positive in every
+   close-confirmed configuration; short ORB was flat-to-negative. Shorts are
+   kept but gated behind a higher probability threshold and marked LOW-CONF.
+ * Realistic ceiling: top-1 ranked long setup hits the full +2% target on
+   ~37% of days, is profitable on ~50-67% of days, expectancy ~+0.3%/trade
+   after 0.06% costs.  A guaranteed 2% every single day is NOT in the data -
+   this build maximises the odds, it cannot manufacture them.
+================================================================================
+"""
+
+import os, sys, json, time, math, glob, threading, warnings, traceback
+from datetime import datetime, timedelta, date, time as dtime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict
+
 import numpy as np
+import pandas as pd
+import streamlit as st
 import yfinance as yf
-import plotly.graph_objects as go
-from datetime import datetime, timedelta, time as dtime, timezone, date
-import os, json, threading, hashlib, time
+
+warnings.filterwarnings("ignore")
+
+try:
+    import pytz
+    IST = pytz.timezone("Asia/Kolkata")
+except Exception:
+    from zoneinfo import ZoneInfo
+    IST = ZoneInfo("Asia/Kolkata")
+
+try:
+    import requests
+    HAS_REQ = True
+except Exception:
+    HAS_REQ = False
 
 try:
     from streamlit_autorefresh import st_autorefresh
-    AUTOREFRESH_AVAILABLE = True
-except ImportError:
-    AUTOREFRESH_AVAILABLE = False
+    HAS_AUTOREFRESH = True
+except Exception:
+    HAS_AUTOREFRESH = False
 
 try:
     from fyers_apiv3 import fyersModel
-    FYERS_SDK_AVAILABLE = True
-except ImportError:
-    FYERS_SDK_AVAILABLE = False
+    HAS_FYERS = True
+except Exception:
+    HAS_FYERS = False
+
+st.set_page_config(page_title="QUANT-EDGE v21 — Institutional ORB Terminal",
+                   page_icon="⚡", layout="wide", initial_sidebar_state="expanded")
 
 # =============================================================================
-# PAGE CONFIG
+# PATHS
 # =============================================================================
-st.set_page_config(
-    page_title="QUANT-EDGE v20 — Advanced One-Way Runner & Historical Backtest Terminal",
-    page_icon="👑",
-    layout="wide",
-    initial_sidebar_state="expanded"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+DIRS = {
+    "sessions":  os.path.join(DATA_DIR, "sessions"),
+    "scans":     os.path.join(DATA_DIR, "scans"),
+    "perf":      os.path.join(DATA_DIR, "performance"),
+    "train":     os.path.join(DATA_DIR, "training"),
+    "models":    os.path.join(DATA_DIR, "models"),
+    "cache":     os.path.join(DATA_DIR, "cache"),
+    "journal":   os.path.join(DATA_DIR, "journal"),
+}
+for _d in DIRS.values():
+    os.makedirs(_d, exist_ok=True)
+
+# yfinance's threaded downloader opens a socket + sqlite handle per worker; on a
+# default 1024-descriptor limit a full-universe intraday scan exhausts it and
+# pandas then fails with "Too many open files" on an unrelated CSV write.
+try:
+    import resource
+    _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (max(_soft, min(_hard, 8192)), _hard))
+except Exception:
+    pass
+
+# yfinance keeps a shared sqlite timezone cache; several download threads hitting
+# the default path raise OperationalError('unable to open database file') and
+# silently drop symbols. Give it a private writable directory.
+try:
+    _yfc = os.path.join(DATA_DIR, "cache", "yf")
+    os.makedirs(_yfc, exist_ok=True)
+    yf.set_tz_cache_location(_yfc)
+except Exception:
+    pass
+
+F_UNIVERSE_OK   = os.path.join(DIRS["cache"],   "universe_validated.json")
+F_MODEL_LONG    = os.path.join(DIRS["models"],  "model_intraday_long.json")
+F_MODEL_SHORT   = os.path.join(DIRS["models"],  "model_intraday_short.json")
+F_MODEL_SWING   = os.path.join(DIRS["models"],  "model_swing_long.json")
+F_TRAIN_INTRA   = os.path.join(DIRS["train"],   "intraday_orb_events.csv")
+F_TRAIN_SWING   = os.path.join(DIRS["train"],   "swing_events.csv")
+F_JOURNAL       = os.path.join(DIRS["journal"], "trade_journal.csv")
+F_HOLIDAYS      = os.path.join(DIRS["cache"],   "nse_holidays.json")
+
+# =============================================================================
+# TRADING CONSTANTS  (all calibrated — do not tune by feel)
+# =============================================================================
+CFG = dict(
+    MIN_TURNOVER_CR      = 25.0,   # 20d avg traded value floor (liquidity)
+    MIN_PRICE            = 60.0,
+    MAX_PRICE            = 25000.0,
+    ORB_MINUTES          = 5,      # 5m beat 15m in the study
+    ENTRY_CONFIRM        = "close", # close-confirmed break (biggest single lever)
+    SL_CAP_PCT           = 1.00,   # hard cap on risk
+    SL_FLOOR_PCT         = 0.35,
+    TARGET_PCT           = 2.00,   # intraday objective
+    PARTIAL_PCT          = 1.00,   # book half here, stop to breakeven
+    USE_PARTIAL          = True,
+    MAX_TRADES_DAY       = 2,      # k=1..2 held the best expectancy
+    COST_PCT             = 0.06,   # round-trip cost assumption
+    LAST_ENTRY_TIME      = dtime(13, 0),
+    SQUARE_OFF_TIME      = dtime(15, 10),
+    MIN_P_LONG           = 0.16,   # model prob floor (long)
+    MIN_P_SHORT          = 0.22,   # shorts need a bigger edge to be worth it
+    MIN_ATR_PCT          = 1.60,   # feasibility: can it travel 2% at all
+    MIN_ADR_PCT          = 1.80,
+    SWING_TARGET_PCT     = 10.0,
+    SWING_SL_PCT         = 4.0,
+    SWING_TOP_N          = 3,
+    SWING_MIN_ATR_PCT    = 2.2,
+    RISK_PER_TRADE_PCT   = 1.0,    # position sizing on account equity
+    DEFAULT_CAPITAL      = 500000,
 )
 
 # =============================================================================
-# IST TIMEZONE & MARKET HOURS
+# UNIVERSE  —  NSE F&O + high-velocity movers.
+# Dead tickers found in validation (LTIM, PEL, TATAMOTORS post-demerger) are
+# auto-pruned at startup and cached, so a stale name can never break a scan.
 # =============================================================================
-IST = timezone(timedelta(hours=5, minutes=30))
+RENAMES = {"TATAMOTORS.NS": "TMPV.NS", "ZOMATO.NS": "ETERNAL.NS",
+           "CAMSONLINE.NS": "CAMS.NS", "KALPATPOWR.NS": "KPIL.NS",
+           "LTIM.NS": None, "PEL.NS": None, "MINDTREE.NS": None,
+           "SRTRANSFIN.NS": "SHRIRAMFIN.NS", "HDFC.NS": None}
 
-def get_ist_now():
-    return datetime.now(IST)
+UNIVERSE_RAW = [
+ # ---- Index heavyweights / Nifty50
+ "RELIANCE.NS","HDFCBANK.NS","ICICIBANK.NS","INFY.NS","TCS.NS","SBIN.NS","BHARTIARTL.NS",
+ "ITC.NS","LT.NS","KOTAKBANK.NS","AXISBANK.NS","HINDUNILVR.NS","BAJFINANCE.NS","MARUTI.NS",
+ "SUNPHARMA.NS","TITAN.NS","ULTRACEMCO.NS","ASIANPAINT.NS","NESTLEIND.NS","WIPRO.NS",
+ "HCLTECH.NS","TECHM.NS","POWERGRID.NS","NTPC.NS","ONGC.NS","COALINDIA.NS","JSWSTEEL.NS",
+ "TATASTEEL.NS","HINDALCO.NS","GRASIM.NS","ADANIENT.NS","ADANIPORTS.NS","BAJAJFINSV.NS",
+ "BAJAJ-AUTO.NS","HEROMOTOCO.NS","EICHERMOT.NS","M&M.NS","CIPLA.NS","DRREDDY.NS",
+ "DIVISLAB.NS","APOLLOHOSP.NS","BRITANNIA.NS","TATACONSUM.NS","SHRIRAMFIN.NS","SBILIFE.NS",
+ "HDFCLIFE.NS","INDUSINDBK.NS","BPCL.NS","IOC.NS","TRENT.NS","JIOFIN.NS","ETERNAL.NS",
+ # ---- Banks / NBFC / capital markets (highest intraday velocity group)
+ "BANKBARODA.NS","PNB.NS","CANBK.NS","UNIONBANK.NS","IDFCFIRSTB.NS","FEDERALBNK.NS",
+ "BANDHANBNK.NS","AUBANK.NS","RBLBANK.NS","YESBANK.NS","INDIANB.NS","IOB.NS","UCOBANK.NS",
+ "CHOLAFIN.NS","MUTHOOTFIN.NS","MANAPPURAM.NS","LICHSGFIN.NS","PFC.NS","RECLTD.NS",
+ "IRFC.NS","SBICARD.NS","POONAWALLA.NS","LTF.NS","ABCAPITAL.NS","IIFL.NS","ANGELONE.NS",
+ "MOTILALOFS.NS","NUVAMA.NS","360ONE.NS","BSE.NS","MCX.NS","CDSL.NS","IEX.NS","KFINTECH.NS",
+ "NAM-INDIA.NS","HDFCAMC.NS","CAMSONLINE.NS","PAYTM.NS","POLICYBZR.NS","SAMMAANCAP.NS",
+ # ---- Auto & ancillary
+ "TVSMOTOR.NS","ASHOKLEY.NS","TMPV.NS","BHARATFORG.NS","MOTHERSON.NS","BALKRISIND.NS",
+ "APOLLOTYRE.NS","MRF.NS","EXIDEIND.NS","SONACOMS.NS","UNOMINDA.NS","ENDURANCE.NS",
+ "TIINDIA.NS","BOSCHLTD.NS","SCHAEFFLER.NS","FORCEMOT.NS","HYUNDAI.NS","OLECTRA.NS",
+ # ---- Metals, mining, energy
+ "VEDL.NS","SAIL.NS","NMDC.NS","JINDALSTEL.NS","NATIONALUM.NS","HINDZINC.NS","HINDCOPPER.NS",
+ "JSL.NS","APLAPOLLO.NS","WELCORP.NS","GAIL.NS","PETRONET.NS","IGL.NS","MGL.NS","OIL.NS",
+ "ATGL.NS","ADANIGREEN.NS","ADANIPOWER.NS","TATAPOWER.NS","JSWENERGY.NS","NHPC.NS","SJVN.NS",
+ "TORNTPOWER.NS","CESC.NS","POWERINDIA.NS","PREMIERENE.NS","WAAREEENER.NS","SUZLON.NS","INOXWIND.NS",
+ # ---- Infra, capital goods, defence, railways
+ "BEL.NS","HAL.NS","BDL.NS","MAZDOCK.NS","COCHINSHIP.NS","GRSE.NS","BHEL.NS","SIEMENS.NS",
+ "ABB.NS","CUMMINSIND.NS","THERMAX.NS","KEC.NS","KALPATPOWR.NS","NCC.NS","IRB.NS","GMRAIRPORT.NS",
+ "RVNL.NS","IRCON.NS","RAILTEL.NS","TITAGARH.NS","JWL.NS","IRCTC.NS","CONCOR.NS","NBCC.NS",
+ "HUDCO.NS","SOLARINDS.NS","AMBER.NS","PGEL.NS","DIXON.NS","KAYNES.NS","CGPOWER.NS","POLYCAB.NS",
+ "HAVELLS.NS","VOLTAS.NS","BLUESTARCO.NS","CROMPTON.NS","KEI.NS","SUPREMEIND.NS","ASTRAL.NS",
+ # ---- Pharma & healthcare
+ "LUPIN.NS","AUROPHARMA.NS","ZYDUSLIFE.NS","ALKEM.NS","TORNTPHARM.NS","MANKIND.NS","IPCALAB.NS",
+ "GLENMARK.NS","LAURUSLABS.NS","BIOCON.NS","GRANULES.NS","NATCOPHARM.NS","AJANTPHARM.NS",
+ "PPLPHARMA.NS","ABBOTINDIA.NS","MAXHEALTH.NS","FORTIS.NS","SYNGENE.NS","METROPOLIS.NS","LALPATHLAB.NS",
+ # ---- IT & new-age
+ "LTTS.NS","MPHASIS.NS","PERSISTENT.NS","COFORGE.NS","KPITTECH.NS","CYIENT.NS","TATAELXSI.NS",
+ "OFSS.NS","SONATSOFTW.NS","NAUKRI.NS","SWIGGY.NS","NYKAA.NS","DELHIVERY.NS","ZEEL.NS",
+ # ---- Consumer, retail, cement, chemicals, others
+ "DMART.NS","JUBLFOOD.NS","DEVYANI.NS","VBL.NS","UBL.NS","RADICO.NS","MARICO.NS","DABUR.NS",
+ "GODREJCP.NS","COLPAL.NS","PGHH.NS","EMAMILTD.NS","BATAINDIA.NS","PAGEIND.NS","ABFRL.NS",
+ "GODFRYPHLP.NS","SHREECEM.NS","AMBUJACEM.NS","ACC.NS","DALBHARAT.NS","JKCEMENT.NS","RAMCOCEM.NS",
+ "PIDILITIND.NS","SRF.NS","PIIND.NS","DEEPAKNTR.NS","AARTIIND.NS","TATACHEM.NS","UPL.NS",
+ "COROMANDEL.NS","CHAMBLFERT.NS","GNFC.NS","NAVINFLUOR.NS","ATUL.NS","VINATIORGA.NS",
+ "INDIGO.NS","SPICEJET.NS","INDHOTEL.NS","LEMONTREE.NS","OBEROIRLTY.NS","DLF.NS","GODREJPROP.NS",
+ "PRESTIGE.NS","LODHA.NS","PHOENIXLTD.NS","BRIGADE.NS","SOBHA.NS","CENTURYPLY.NS",
+ "TATACOMM.NS","IDEA.NS","HFCL.NS","INDUSTOWER.NS","BSOFT.NS","ITI.NS",
+]
 
-def is_market_hours():
-    now = get_ist_now()
-    if now.weekday() >= 5: return False
-    return dtime(9, 15) <= now.time() <= dtime(15, 30)
+SECTOR_MAP = {
+ "BANK": ["HDFCBANK","ICICIBANK","SBIN","KOTAKBANK","AXISBANK","INDUSINDBK","BANKBARODA","PNB",
+          "CANBK","UNIONBANK","IDFCFIRSTB","FEDERALBNK","BANDHANBNK","AUBANK","RBLBANK","YESBANK",
+          "INDIANB","IOB","UCOBANK"],
+ "NBFC/CAPMKT": ["BAJFINANCE","BAJAJFINSV","CHOLAFIN","MUTHOOTFIN","MANAPPURAM","LICHSGFIN","PFC",
+          "RECLTD","IRFC","SBICARD","POONAWALLA","LTF","ABCAPITAL","IIFL","ANGELONE","MOTILALOFS",
+          "NUVAMA","360ONE","BSE","MCX","CDSL","IEX","KFINTECH","NAM-INDIA","HDFCAMC","CAMS",
+          "PAYTM","POLICYBZR","SAMMAANCAP","JIOFIN","SHRIRAMFIN","SBILIFE","HDFCLIFE"],
+ "IT": ["INFY","TCS","WIPRO","HCLTECH","TECHM","LTTS","MPHASIS","PERSISTENT","COFORGE","KPITTECH",
+        "CYIENT","TATAELXSI","OFSS","SONATSOFTW","BSOFT"],
+ "AUTO": ["MARUTI","M&M","BAJAJ-AUTO","HEROMOTOCO","EICHERMOT","TVSMOTOR","ASHOKLEY","TMPV",
+          "BHARATFORG","MOTHERSON","BALKRISIND","APOLLOTYRE","MRF","EXIDEIND","SONACOMS","UNOMINDA",
+          "ENDURANCE","TIINDIA","BOSCHLTD","SCHAEFFLER","FORCEMOT","HYUNDAI","OLECTRA"],
+ "METAL": ["TATASTEEL","JSWSTEEL","HINDALCO","VEDL","SAIL","NMDC","JINDALSTEL","NATIONALUM",
+           "HINDZINC","HINDCOPPER","JSL","APLAPOLLO","WELCORP","COALINDIA"],
+ "ENERGY": ["RELIANCE","ONGC","BPCL","IOC","GAIL","PETRONET","IGL","MGL","OIL","ATGL","ADANIGREEN",
+            "ADANIPOWER","TATAPOWER","JSWENERGY","NHPC","SJVN","TORNTPOWER","CESC","NTPC","POWERGRID",
+            "POWERINDIA","PREMIERENE","WAAREEENER","SUZLON","INOXWIND"],
+ "PHARMA": ["SUNPHARMA","CIPLA","DRREDDY","DIVISLAB","LUPIN","AUROPHARMA","ZYDUSLIFE","ALKEM",
+            "TORNTPHARM","MANKIND","IPCALAB","GLENMARK","LAURUSLABS","BIOCON","GRANULES","NATCOPHARM",
+            "AJANTPHARM","PPLPHARMA","ABBOTINDIA","APOLLOHOSP","MAXHEALTH","FORTIS","SYNGENE",
+            "METROPOLIS","LALPATHLAB"],
+ "FMCG/RETAIL": ["HINDUNILVR","ITC","NESTLEIND","BRITANNIA","TATACONSUM","DMART","TRENT","JUBLFOOD",
+            "DEVYANI","VBL","UBL","RADICO","MARICO","DABUR","GODREJCP","COLPAL","PGHH","EMAMILTD",
+            "BATAINDIA","PAGEIND","ABFRL","GODFRYPHLP","TITAN","NYKAA","ETERNAL","SWIGGY"],
+ "INFRA/CAPGOODS": ["LT","BEL","HAL","BDL","MAZDOCK","COCHINSHIP","GRSE","BHEL","SIEMENS","ABB",
+            "CUMMINSIND","THERMAX","KEC","KPIL","NCC","IRB","GMRAIRPORT","RVNL","IRCON",
+            "RAILTEL","TITAGARH","JWL","IRCTC","CONCOR","NBCC","HUDCO","SOLARINDS","AMBER","PGEL",
+            "DIXON","KAYNES","CGPOWER","POLYCAB","HAVELLS","VOLTAS","BLUESTARCO","CROMPTON","KEI",
+            "SUPREMEIND","ASTRAL","ADANIENT","ADANIPORTS"],
+ "CEMENT/CHEM": ["ULTRACEMCO","SHREECEM","AMBUJACEM","ACC","DALBHARAT","JKCEMENT","RAMCOCEM","GRASIM",
+            "ASIANPAINT","PIDILITIND","SRF","PIIND","DEEPAKNTR","AARTIIND","TATACHEM","UPL",
+            "COROMANDEL","CHAMBLFERT","GNFC","NAVINFLUOR","ATUL","VINATIORGA"],
+ "REALTY/HOTEL": ["DLF","GODREJPROP","OBEROIRLTY","PRESTIGE","LODHA","PHOENIXLTD","BRIGADE","SOBHA",
+            "CENTURYPLY","INDHOTEL","LEMONTREE","INDIGO","SPICEJET"],
+ "TELECOM/MEDIA": ["BHARTIARTL","IDEA","TATACOMM","INDUSTOWER","HFCL","ITI","ZEEL","NAUKRI","DELHIVERY"],
+}
+SECTOR_OF = {}
+for _s, _lst in SECTOR_MAP.items():
+    for _t in _lst:
+        SECTOR_OF[_t] = _s
 
-def is_premarket():
-    now = get_ist_now()
-    if now.weekday() >= 5: return False
-    return dtime(9, 0) <= now.time() < dtime(9, 15)
+def sector_of(sym):
+    return SECTOR_OF.get(sym.replace(".NS", ""), "OTHER")
 
-def get_market_status():
-    if is_premarket(): return "🟡 PRE-MARKET", "status-premarket"
-    elif is_market_hours(): return "🟢 LIVE", "status-open"
-    else: return "🔴 CLOSED", "status-closed"
+NIFTY = "^NSEI"
+BANKNIFTY = "^NSEBANK"
 
-def get_next_trading_day_9am():
-    """Returns next trading day 9:00 AM IST datetime"""
-    now = get_ist_now()
-    next_day = now + timedelta(days=1)
-    while next_day.weekday() >= 5:  # Skip weekends
-        next_day += timedelta(days=1)
-    return next_day.replace(hour=9, minute=0, second=0, microsecond=0)
-
-def is_session_expired():
-    """Check if current session data should be expired"""
-    now = get_ist_now()
-    today = now.date()
-    # If it's a weekday and past 9:00 AM, today's data is fresh
-    # If it's before 9:00 AM, yesterday's data should still show
-    if now.weekday() >= 5:  # Weekend - show Friday's data
-        return False
-    if now.time() < dtime(9, 0):  # Before 9 AM - show yesterday's data
-        return False
-    return True  # After 9 AM on weekday - today is a new session
-
-def get_session_date():
-    """Get the session date for data storage"""
-    now = get_ist_now()
-    if now.weekday() >= 5:  # Weekend
-        days_since_friday = now.weekday() - 4
-        return (now - timedelta(days=days_since_friday)).strftime('%Y-%m-%d')
-    if now.time() < dtime(9, 0):  # Before 9 AM
-        prev = now - timedelta(days=1)
-        while prev.weekday() >= 5:
-            prev -= timedelta(days=1)
-        return prev.strftime('%Y-%m-%d')
-    return now.strftime('%Y-%m-%d')
-
-# =============================================================================
-# PREMIUM GLASSMORPHISM CSS v20 — ULTRA HIGH CONTRAST & RECOGNIZABLE
-# =============================================================================
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
@@ -296,4172 +473,1886 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+
 # =============================================================================
-# F&O UNIVERSE & SECTOR MAPS
+# TIME / MARKET CALENDAR  (holiday-aware — v20 only skipped weekends)
 # =============================================================================
-FO_UNIVERSE = [
-    "360ONE.NS", "AARTIIND.NS", "ABB.NS", "ABBOTINDIA.NS", "ABCAPITAL.NS", "ABFRL.NS", "ACC.NS", "ADANIENSOL.NS",
-    "ADANIENT.NS", "ADANIGREEN.NS", "ADANIPORTS.NS", "ADANIPOWER.NS", "ALKEM.NS", "AMBER.NS", "AMBUJACEM.NS",
-    "ANGELONE.NS", "APOLLOHOSP.NS", "APOLLOTYRE.NS", "ASHOKLEY.NS", "ASIANPAINT.NS", "ASTRAL.NS", "ATUL.NS",
-    "AUBANK.NS", "AUROPHARMA.NS", "AXISBANK.NS", "BAJAJ-AUTO.NS", "BAJAJFINSV.NS", "BAJAJHLDNG.NS", "BAJFINANCE.NS",
-    "BALKRISIND.NS", "BALRAMCHIN.NS", "BANDHANBNK.NS", "BANKBARODA.NS", "BANKINDIA.NS", "BATAINDIA.NS", "BEL.NS",
-    "BERGEPAINT.NS", "BHARATFORG.NS", "BHARTIARTL.NS", "BHEL.NS", "BIOCON.NS", "BLUESTARCO.NS", "BOSCHLTD.NS",
-    "BPCL.NS", "BRITANNIA.NS", "BSE.NS", "BSOFT.NS", "CANBK.NS", "CANFINHOME.NS", "CASTROLIND.NS", "CDSL.NS",
-    "CHAMBLFERT.NS", "CHOLAFIN.NS", "CIPLA.NS", "COALINDIA.NS", "COCHINSHIP.NS", "COFORGE.NS", "COLPAL.NS",
-    "CONCOR.NS", "COROMANDEL.NS", "CROMPTON.NS", "CUB.NS", "CUMMINSIND.NS", "DABUR.NS", "DALBHARAT.NS", "DEEPAKNTR.NS",
-    "DELHIVERY.NS", "DIVISLAB.NS", "DIXON.NS", "DLF.NS", "DMART.NS", "DRREDDY.NS", "EICHERMOT.NS", "ESCORTS.NS",
-    "EXIDEIND.NS", "FEDERALBNK.NS", "FORCEMOT.NS", "GAIL.NS", "GLAND.NS", "GLENMARK.NS", "GMRAIRPORT.NS", "GNFC.NS",
-    "GODFRYPHLP.NS", "GODREJCP.NS", "GODREJPROP.NS", "GRANULES.NS", "GRASIM.NS", "GUJGASLTD.NS", "HAL.NS",
-    "HAVELLS.NS", "HCLTECH.NS", "HDFCBANK.NS", "HDFCLIFE.NS", "HEROMOTOCO.NS", "HINDALCO.NS", "HINDCOPPER.NS",
-    "HINDPETRO.NS", "HINDUNILVR.NS", "HONAUT.NS", "HYUNDAI.NS", "ICICIBANK.NS", "ICICIGI.NS", "ICICIPRULI.NS",
-    "IDEA.NS", "IDFCFIRSTB.NS", "IEX.NS", "IGL.NS", "INDHOTEL.NS", "INDIACEM.NS", "INDIAMART.NS", "INDIGO.NS",
-    "INDUSINDBK.NS", "INDUSTOWER.NS", "INFY.NS", "IOC.NS", "IPCALAB.NS", "IRCTC.NS", "ITC.NS", "JINDALSTEL.NS",
-    "JIOFIN.NS", "JKCEMENT.NS", "JSWENERGY.NS", "JSWSTEEL.NS", "JUBLFOOD.NS", "KFINTECH.NS", "KOTAKBANK.NS",
-    "LTF.NS", "LALPATHLAB.NS", "LICHSGFIN.NS", "LICI.NS", "LT.NS", "LTIM.NS", "LTTS.NS", "LUPIN.NS", "M&M.NS",
-    "M&MFIN.NS", "MANAPPURAM.NS", "MARUTI.NS", "UNITDSPR.NS", "MCX.NS", "METROPOLIS.NS", "MFSL.NS", "MGL.NS",
-    "MOTHERSON.NS", "MOTILALOFS.NS", "MPHASIS.NS", "MRF.NS", "MRPL.NS", "MUTHOOTFIN.NS", "NAM-INDIA.NS",
-    "NATIONALUM.NS", "NAVINFLUOR.NS", "NBCC.NS", "NESTLEIND.NS", "NHPC.NS", "NMDC.NS", "NTPC.NS", "NUVAMA.NS",
-    "OBEROIRLTY.NS", "OFSS.NS", "ONGC.NS", "PAGEIND.NS", "PEL.NS", "PERSISTENT.NS", "PETRONET.NS", "PFC.NS",
-    "PGEL.NS", "PHOENIXLTD.NS", "PIDILITIND.NS", "PIIND.NS", "PNB.NS", "POLYCAB.NS", "POWERGRID.NS", "POWERINDIA.NS",
-    "PREMIERENE.NS", "PVRINOX.NS", "RAMCOCEM.NS", "RBLBANK.NS", "RECLTD.NS", "RELIANCE.NS", "SAIL.NS", "SAMMAANCAP.NS",
-    "SBICARD.NS", "SBILIFE.NS", "SBIN.NS", "SHREECEM.NS", "SHRIRAMFIN.NS", "SIEMENS.NS", "SJVN.NS", "SOLARINDS.NS",
-    "SRF.NS", "SUNPHARMA.NS", "SUNTV.NS", "SUZLON.NS", "SWIGGY.NS", "SYNGENE.NS", "TATACOMM.NS", "TATACONSUM.NS",
-    "TATAELXSI.NS", "TATAMOTORS.NS", "TATAPOWER.NS", "TATASTEEL.NS", "TCS.NS", "TECHM.NS", "TITAN.NS", "TORNTPHARM.NS",
-    "TORNTPOWER.NS", "TRENT.NS", "TVSMOTOR.NS", "UBL.NS", "ULTRACEMCO.NS", "UPL.NS", "VBL.NS", "VEDL.NS",
-    "VOLTAS.NS", "WAAREEENER.NS", "WIPRO.NS", "ZEEL.NS", "ZYDUSLIFE.NS"
+# NSE equity full-day trading holidays 2026 -- weekday closures only.
+# Cross-checked against the published exchange calendar (Groww / CalendarLabs
+# agree line-for-line) and against actual missing sessions in 3 years of daily
+# bars for Jan-Aug. Weekend-falling festivals are omitted deliberately.
+# Nov 08 2026 (Sun) is Diwali Muhurat trading -- a special session, not a holiday.
+STATIC_HOLIDAYS_2026 = [
+ "2026-01-26",  # Republic Day
+ "2026-03-03",  # Holi
+ "2026-03-26",  # Shri Ram Navami
+ "2026-03-31",  # Mahavir Jayanti
+ "2026-04-03",  # Good Friday
+ "2026-04-14",  # Ambedkar Jayanti
+ "2026-05-01",  # Maharashtra Day
+ "2026-05-28",  # Bakri Id
+ "2026-06-26",  # Muharram
+ "2026-09-14",  # Ganesh Chaturthi
+ "2026-10-02",  # Gandhi Jayanti
+ "2026-10-20",  # Dussehra
+ "2026-11-10",  # Diwali Balipratipada
+ "2026-11-24",  # Guru Nanak Jayanti
+ "2026-12-25",  # Christmas
 ]
 
-SECTOR_MAP = {
-    "🏦 Banking": "AUBANK.NS,AXISBANK.NS,BANDHANBNK.NS,BANKBARODA.NS,BANKINDIA.NS,CANBK.NS,CUB.NS,FEDERALBNK.NS,HDFCBANK.NS,ICICIBANK.NS,IDFCFIRSTB.NS,INDUSINDBK.NS,KOTAKBANK.NS,PNB.NS,RBLBANK.NS,SBIN.NS",
-    "💳 Financial Services & NBFC": "360ONE.NS,ABCAPITAL.NS,ANGELONE.NS,BAJAJFINSV.NS,BAJAJHLDNG.NS,BAJFINANCE.NS,BSE.NS,CANFINHOME.NS,CDSL.NS,CHOLAFIN.NS,HDFCLIFE.NS,ICICIGI.NS,ICICIPRULI.NS,IEX.NS,JIOFIN.NS,KFINTECH.NS,LTF.NS,LICHSGFIN.NS,LICI.NS,MANAPPURAM.NS,MCX.NS,MFSL.NS,MOTILALOFS.NS,MUTHOOTFIN.NS,NAM-INDIA.NS,NUVAMA.NS,PEL.NS,PFC.NS,RECLTD.NS,SAMMAANCAP.NS,SBICARD.NS,SBILIFE.NS,SHRIRAMFIN.NS",
-    "💻 IT & Tech": "BSOFT.NS,COFORGE.NS,HCLTECH.NS,INFY.NS,LTIM.NS,LTTS.NS,MPHASIS.NS,OFSS.NS,PERSISTENT.NS,TATAELXSI.NS,TCS.NS,TECHM.NS,WIPRO.NS",
-    "🚗 Auto & Auto Parts": "APOLLOTYRE.NS,ASHOKLEY.NS,BAJAJ-AUTO.NS,BALKRISIND.NS,BHARATFORG.NS,BOSCHLTD.NS,EICHERMOT.NS,ESCORTS.NS,EXIDEIND.NS,FORCEMOT.NS,HEROMOTOCO.NS,HYUNDAI.NS,M&M.NS,M&MFIN.NS,MARUTI.NS,MOTHERSON.NS,MRF.NS,TATAMOTORS.NS,TVSMOTOR.NS",
-    "⚡ Power & Renewable Energy": "ADANIENSOL.NS,ADANIGREEN.NS,ADANIPOWER.NS,JSWENERGY.NS,NHPC.NS,NTPC.NS,POWERGRID.NS,POWERINDIA.NS,PREMIERENE.NS,SJVN.NS,SUZLON.NS,TATAPOWER.NS,TORNTPOWER.NS,WAAREEENER.NS",
-    "🏗️ Metal & Mining": "COALINDIA.NS,HINDALCO.NS,HINDCOPPER.NS,JINDALSTEL.NS,JSWSTEEL.NS,NATIONALUM.NS,NMDC.NS,SAIL.NS,TATASTEEL.NS,VEDL.NS",
-    "💊 Pharma & Healthcare": "ABBOTINDIA.NS,ALKEM.NS,APOLLOHOSP.NS,AUROPHARMA.NS,BIOCON.NS,CIPLA.NS,DIVISLAB.NS,DRREDDY.NS,GLAND.NS,GLENMARK.NS,GRANULES.NS,IPCALAB.NS,LALPATHLAB.NS,LUPIN.NS,METROPOLIS.NS,SUNPHARMA.NS,SYNGENE.NS,TORNTPHARM.NS,ZYDUSLIFE.NS",
-    "🛒 FMCG & Consumption": "BRITANNIA.NS,COLPAL.NS,DABUR.NS,GODFRYPHLP.NS,GODREJCP.NS,HINDUNILVR.NS,ITC.NS,UNITDSPR.NS,NESTLEIND.NS,TATACONSUM.NS,UBL.NS,VBL.NS,BALRAMCHIN.NS",
-    "🧱 Cement & Building Materials": "ACC.NS,AMBUJACEM.NS,ASTRAL.NS,DALBHARAT.NS,GRASIM.NS,INDIACEM.NS,JKCEMENT.NS,RAMCOCEM.NS,SHREECEM.NS,ULTRACEMCO.NS",
-    "🏭 Capital Goods & Defense": "ABB.NS,BEL.NS,BHEL.NS,COCHINSHIP.NS,CUMMINSIND.NS,HAL.NS,HAVELLS.NS,HONAUT.NS,LT.NS,POLYCAB.NS,SIEMENS.NS,SOLARINDS.NS,VOLTAS.NS",
-    "🛢️ Oil, Gas & Petrochemicals": "BPCL.NS,CASTROLIND.NS,GAIL.NS,GUJGASLTD.NS,HINDPETRO.NS,IGL.NS,IOC.NS,MGL.NS,MRPL.NS,ONGC.NS,PETRONET.NS,RELIANCE.NS",
-    "🧪 Chemicals & Fertilizers": "AARTIIND.NS,ATUL.NS,CHAMBLFERT.NS,COROMANDEL.NS,DEEPAKNTR.NS,GNFC.NS,NAVINFLUOR.NS,PIDILITIND.NS,PIIND.NS,SRF.NS,UPL.NS",
-    "🏢 Realty & Infrastructure": "ADANIENT.NS,ADANIPORTS.NS,CONCOR.NS,DELHIVERY.NS,DLF.NS,GMRAIRPORT.NS,GODREJPROP.NS,NBCC.NS,OBEROIRLTY.NS,PHOENIXLTD.NS",
-    "🛍️ Retail, Consumer & Logistics": "ABFRL.NS,AMBER.NS,ASIANPAINT.NS,BATAINDIA.NS,BERGEPAINT.NS,BLUESTARCO.NS,CROMPTON.NS,DIXON.NS,DMART.NS,INDHOTEL.NS,INDIAMART.NS,INDIGO.NS,IRCTC.NS,JUBLFOOD.NS,PAGEIND.NS,PGEL.NS,SWIGGY.NS,TITAN.NS,TRENT.NS",
-    "📡 Telecom & Media": "BHARTIARTL.NS,IDEA.NS,INDUSTOWER.NS,PVRINOX.NS,SUNTV.NS,TATACOMM.NS,ZEEL.NS"
-}
+def get_ist_now():
+    return datetime.now(IST)
 
-SECTOR_REVERSE = {}
-for sec_name, sec_tickers_str in SECTOR_MAP.items():
-    for t in sec_tickers_str.split(","):
-        sym_clean = t.strip()
-        if sym_clean:
-            SECTOR_REVERSE[sym_clean] = sec_name
-            SECTOR_REVERSE[sym_clean.replace('.NS', '')] = sec_name
+def _load_holidays():
+    hol = set(STATIC_HOLIDAYS_2026)
+    try:
+        if os.path.exists(F_HOLIDAYS):
+            hol |= set(json.load(open(F_HOLIDAYS)).get("dates", []))
+    except Exception:
+        pass
+    return hol
 
-def get_stock_sector(ticker):
-    """Guaranteed sector lookup with multi-fallback for all NSE F&O & custom stocks"""
-    if not ticker: return "Other"
-    clean_sym = str(ticker).replace('.NS', '').strip().upper()
-    full_sym = f"{clean_sym}.NS"
-    if full_sym in SECTOR_REVERSE:
-        return SECTOR_REVERSE[full_sym]
-    if clean_sym in SECTOR_REVERSE:
-        return SECTOR_REVERSE[clean_sym]
-    return "Other"
+HOLIDAYS = _load_holidays()
+
+def is_trading_day(d):
+    if isinstance(d, datetime):
+        d = d.date()
+    if d.weekday() >= 5:
+        return False
+    return d.strftime("%Y-%m-%d") not in HOLIDAYS
+
+def prev_trading_day(d=None):
+    d = (d or get_ist_now().date())
+    d = d - timedelta(days=1)
+    for _ in range(15):
+        if is_trading_day(d):
+            return d
+        d -= timedelta(days=1)
+    return d
+
+def next_trading_day(d=None):
+    d = (d or get_ist_now().date()) + timedelta(days=1)
+    for _ in range(15):
+        if is_trading_day(d):
+            return d
+        d += timedelta(days=1)
+    return d
+
+MKT_OPEN, MKT_CLOSE = dtime(9, 15), dtime(15, 30)
+PRE_OPEN_START, PRE_OPEN_END = dtime(9, 0), dtime(9, 15)
+
+def market_phase(now=None):
+    """PRE_OPEN | OPEN_AUCTION | ORB | LIVE | POST | CLOSED | HOLIDAY"""
+    now = now or get_ist_now()
+    if not is_trading_day(now):
+        return "HOLIDAY"
+    t = now.time()
+    if t < dtime(8, 45):
+        return "CLOSED"
+    if t < PRE_OPEN_START:
+        return "PRE_OPEN"           # our 08:45-09:00 prep window
+    if t < PRE_OPEN_END:
+        return "OPEN_AUCTION"       # NSE pre-open call auction, real data available
+    if t < dtime(9, 20):
+        return "ORB"                # first 5m candle forming
+    if t <= MKT_CLOSE:
+        return "LIVE"
+    if t <= dtime(23, 59):
+        return "POST"
+    return "CLOSED"
+
+def session_date(now=None):
+    """Trading date a scan belongs to. Boundary at 15:40 (not 09:00 as in v20,
+    which caused pre-9am heroes to be filed under the wrong day)."""
+    now = now or get_ist_now()
+    if is_trading_day(now) and now.time() >= dtime(15, 40):
+        return now.date()                # today is done -> EOD scan is for today
+    if is_trading_day(now):
+        return now.date()
+    return prev_trading_day(now.date() + timedelta(days=1))
+
+def fmt_ist(dt=None):
+    return (dt or get_ist_now()).strftime("%d %b %Y • %I:%M:%S %p IST")
+
+# =============================================================================
+# THREAD-SAFE TTL CACHE
+# v20 bug: @st.cache_data functions were called from bare background threads,
+# which have no ScriptRunContext. This cache works from any thread.
+# =============================================================================
+class TTLCache:
+    def __init__(self):
+        self._d = {}
+        self._lock = threading.RLock()
+
+    def get(self, key):
+        with self._lock:
+            v = self._d.get(key)
+            if not v:
+                return None
+            val, exp = v
+            if time.time() > exp:
+                self._d.pop(key, None)
+                return None
+            return val
+
+    def set(self, key, val, ttl=300):
+        with self._lock:
+            self._d[key] = (val, time.time() + ttl)
+
+    def clear(self):
+        with self._lock:
+            self._d.clear()
+
+CACHE = TTLCache()
+DL_LOCK = threading.Semaphore(4)   # be polite to the data provider
+
+def _norm_cols(df, tickers):
+    """yfinance returns (Field, Ticker) columns unless group_by='ticker'.
+    v20 bug #2: fetch_live_prices indexed df[t]['Close'] on a (Field,Ticker)
+    frame -> KeyError swallowed -> prices NEVER returned. Normalise here once."""
+    if df is None or len(df) == 0:
+        return {}
+    out = {}
+    if isinstance(df.columns, pd.MultiIndex):
+        lvl0 = set(df.columns.get_level_values(0))
+        by_ticker = len(set(tickers) & lvl0) > 0
+        for t in tickers:
+            try:
+                sub = df[t] if by_ticker else df.xs(t, axis=1, level=1)
+                sub = sub.dropna(how="all")
+                if len(sub):
+                    out[t] = sub
+            except Exception:
+                continue
+    else:
+        if len(tickers) == 1:
+            sub = df.dropna(how="all")
+            if len(sub):
+                out[tickers[0]] = sub
+    return out
+
+def download(tickers, period=None, interval="1d", start=None, end=None,
+             ttl=300, retries=2, chunk=60):
+    """Batch download -> {ticker: DataFrame}. Chunked, retried, cached, thread-safe."""
+    if isinstance(tickers, str):
+        tickers = [tickers]
+    tickers = [t for t in dict.fromkeys(tickers) if t]
+    key = ("dl", tuple(tickers), period, interval, str(start), str(end))
+    hit = CACHE.get(key)
+    if hit is not None:
+        return hit
+    out = {}
+    for i in range(0, len(tickers), chunk):
+        part = tickers[i:i + chunk]
+        for attempt in range(retries + 1):
+            try:
+                with DL_LOCK:
+                    df = yf.download(part, period=period, interval=interval,
+                                     start=start, end=end, progress=False,
+                                     auto_adjust=True, threads=True,
+                                     group_by="ticker" if len(part) > 1 else "column")
+                got = _norm_cols(df, part)
+                if got:
+                    out.update(got)
+                    break
+            except Exception:
+                pass
+            time.sleep(1.2 * (attempt + 1))
+    CACHE.set(key, out, ttl)
+    return out
+
+# =============================================================================
+# UNIVERSE VALIDATION  (v20 bug #11: LTIM.NS, PEL.NS, TATAMOTORS.NS are dead)
+# =============================================================================
+def validated_universe(force=False, max_age_days=7):
+    if not force and os.path.exists(F_UNIVERSE_OK):
+        try:
+            j = json.load(open(F_UNIVERSE_OK))
+            age = (get_ist_now() - datetime.fromisoformat(j["ts"]).replace(tzinfo=IST)).days
+            if age <= max_age_days and j.get("ok"):
+                return j["ok"], j.get("dead", [])
+        except Exception:
+            pass
+    raw = []
+    for t in UNIVERSE_RAW:
+        r = RENAMES.get(t, t)
+        if r:
+            raw.append(r)
+    raw = list(dict.fromkeys(raw))
+    data = download(raw, period="10d", interval="1d", ttl=3600)
+    ok = sorted([t for t in raw if t in data and len(data[t]) >= 3])
+    dead = sorted([t for t in raw if t not in ok])
+    try:
+        json.dump({"ts": get_ist_now().isoformat(), "ok": ok, "dead": dead},
+                  open(F_UNIVERSE_OK, "w"))
+    except Exception:
+        pass
+    return ok, dead
+
+# =============================================================================
+# INDICATORS  (vectorised; no Python row loops anywhere)
+# =============================================================================
+def ema(s, n):
+    return s.ewm(span=n, adjust=False).mean()
+
+def rma(s, n):
+    return s.ewm(alpha=1 / n, adjust=False).mean()
+
+def true_range(h, l, c):
+    pc = c.shift(1)
+    return pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+
+def atr(h, l, c, n=14):
+    return rma(true_range(h, l, c), n)
+
+def rsi(c, n=14):
+    d = c.diff()
+    return 100 - 100 / (1 + rma(d.clip(lower=0), n) / rma(-d.clip(upper=0), n).replace(0, np.nan))
+
+def macd(c, f=12, s=26, sig=9):
+    line = ema(c, f) - ema(c, s)
+    sg = ema(line, sig)
+    return line, sg, line - sg
+
+def adx(h, l, c, n=14):
+    up = h.diff()
+    dn = -l.diff()
+    plus = np.where((up > dn) & (up > 0), up, 0.0)
+    minus = np.where((dn > up) & (dn > 0), dn, 0.0)
+    tr = rma(true_range(h, l, c), n)
+    pdi = 100 * rma(pd.Series(plus, index=h.index), n) / tr.replace(0, np.nan)
+    mdi = 100 * rma(pd.Series(minus, index=h.index), n) / tr.replace(0, np.nan)
+    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    return rma(dx, n), pdi, mdi
+
+def bollinger(c, n=20, k=2.0):
+    m = c.rolling(n).mean()
+    sd = c.rolling(n).std()
+    return m + k * sd, m, m - k * sd
+
+def supertrend(h, l, c, n=10, mult=3.0):
+    """Correct recursive SuperTrend (direction series)."""
+    a = atr(h, l, c, n)
+    hl2 = (h + l) / 2
+    ub = (hl2 + mult * a).to_numpy()
+    lb = (hl2 - mult * a).to_numpy()
+    cc = c.to_numpy()
+    n_ = len(cc)
+    fub = np.full(n_, np.nan)
+    flb = np.full(n_, np.nan)
+    dirn = np.ones(n_)
+    for i in range(1, n_):
+        fub[i] = ub[i] if (ub[i] < fub[i - 1] or cc[i - 1] > fub[i - 1] or np.isnan(fub[i - 1])) else fub[i - 1]
+        flb[i] = lb[i] if (lb[i] > flb[i - 1] or cc[i - 1] < flb[i - 1] or np.isnan(flb[i - 1])) else flb[i - 1]
+        if cc[i] > (fub[i - 1] if not np.isnan(fub[i - 1]) else ub[i]):
+            dirn[i] = 1
+        elif cc[i] < (flb[i - 1] if not np.isnan(flb[i - 1]) else lb[i]):
+            dirn[i] = -1
+        else:
+            dirn[i] = dirn[i - 1]
+    return pd.Series(dirn, index=c.index), pd.Series(flb, index=c.index), pd.Series(fub, index=c.index)
+
+def vwap(df):
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3
+    v = df["Volume"].replace(0, np.nan)
+    return (tp * v).cumsum() / v.cumsum()
+
+# =============================================================================
+# PIVOTS  —  daily CPR + weekly + monthly.
+# v20 bug #6: weekly grouping used calendar year + ISO week, which mis-buckets
+# the year boundary. Fixed with isocalendar().year. v20 bug #7: no daily pivot.
+# =============================================================================
+def _pivot_set(h, l, c):
+    p = (h + l + c) / 3
+    bc = (h + l) / 2
+    tc = 2 * p - bc
+    if tc < bc:
+        tc, bc = bc, tc
+    r = h - l
+    return dict(P=p, TC=tc, BC=bc, CPR_W=(tc - bc) / c * 100 if c else np.nan,
+                R1=2 * p - l, R2=p + r, R3=h + 2 * (p - l),
+                S1=2 * p - h, S2=p - r, S3=l - 2 * (h - p))
+
+def pivots_all(d):
+    """d = daily OHLC frame. Returns daily/weekly/monthly pivot dicts from the
+    LAST COMPLETED period of each timeframe (new pivot every day/week/month)."""
+    out = {}
+    if d is None or len(d) < 25:
+        return out
+    d = d.dropna(subset=["High", "Low", "Close"])
+    idx = pd.DatetimeIndex(d.index)
+    # daily -> previous session
+    if len(d) >= 2:
+        r = d.iloc[-2]
+        out["D"] = _pivot_set(float(r.High), float(r.Low), float(r.Close))
+    # weekly -> previous ISO week
+    iso = idx.isocalendar()
+    wk = pd.Series(list(zip(iso.year, iso.week)), index=idx)
+    groups = list(dict.fromkeys(wk.tolist()))
+    if len(groups) >= 2:
+        m = wk == groups[-2]
+        s = d[m.to_numpy()]
+        if len(s):
+            out["W"] = _pivot_set(float(s.High.max()), float(s.Low.min()), float(s.Close.iloc[-1]))
+    # monthly -> previous calendar month
+    mo = pd.Series([(x.year, x.month) for x in idx], index=idx)
+    mg = list(dict.fromkeys(mo.tolist()))
+    if len(mg) >= 2:
+        m = mo == mg[-2]
+        s = d[m.to_numpy()]
+        if len(s):
+            out["M"] = _pivot_set(float(s.High.max()), float(s.Low.min()), float(s.Close.iloc[-1]))
+    return out
+
+def pivot_context(price, piv):
+    """Where price sits vs each pivot set + nearest resistance/support."""
+    ctx = {"levels": [], "above": {}, "nearest_res": None, "nearest_sup": None}
+    for tf, p in piv.items():
+        for k in ("S3", "S2", "S1", "BC", "P", "TC", "R1", "R2", "R3"):
+            v = p.get(k)
+            if v and np.isfinite(v):
+                ctx["levels"].append((f"{tf}-{k}", float(v)))
+        ctx["above"][tf] = bool(price > p.get("P", np.nan)) if np.isfinite(p.get("P", np.nan)) else None
+    res = [(n, v) for n, v in ctx["levels"] if v > price]
+    sup = [(n, v) for n, v in ctx["levels"] if v < price]
+    if res:
+        ctx["nearest_res"] = min(res, key=lambda x: x[1] - price)
+    if sup:
+        ctx["nearest_sup"] = max(sup, key=lambda x: x[1])
+    return ctx
+
+# =============================================================================
+# FEATURE ENGINE
+# These definitions are IDENTICAL to the ones the models were calibrated on.
+# Do not "improve" a formula here without refitting — the coefficients in
+# data/models/*.json are tied to these exact definitions.
+# Everything is panel-vectorised (all tickers at once): 215 names in one pass
+# instead of v20's per-ticker Python loops (bug #10, the main speed problem).
+# =============================================================================
+def make_panel(data):
+    """{ticker: OHLCV df} -> dict of aligned DataFrames keyed by field."""
+    fields = ["Open", "High", "Low", "Close", "Volume"]
+    cols = {}
+    for f in fields:
+        ser = {}
+        for t, d in data.items():
+            if d is None or len(d) == 0 or f not in d.columns:
+                continue
+            s = pd.Series(pd.to_numeric(d[f], errors="coerce").to_numpy().ravel(),
+                          index=pd.DatetimeIndex(d.index).tz_localize(None))
+            ser[t] = s[~s.index.duplicated(keep="last")]
+        cols[f] = pd.DataFrame(ser).sort_index() if ser else pd.DataFrame()
+    if len(cols["Close"]):
+        idx = cols["Close"].index
+        for f in fields:
+            cols[f] = cols[f].reindex(index=idx, columns=cols["Close"].columns)
+    return cols
+
+def _ema(d, n):
+    return d.ewm(span=n, adjust=False).mean()
+
+def _rsi_df(x, n=14):
+    d = x.diff()
+    up = d.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    dn = (-d).clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    return 100 - 100 / (1 + up / dn.replace(0, np.nan))
+
+def _supertrend_dir(H, L, C, n=10, mult=3.0):
+    pc = C.shift(1)
+    tr = pd.concat([H - L, (H - pc).abs(), (L - pc).abs()]).groupby(level=0).max().reindex(C.index)
+    a = tr.ewm(span=n, adjust=False).mean()
+    hl2 = (H + L) / 2
+    # np.array(..., copy=True): pandas 3 returns read-only views, and this loop
+    # writes back into up/lo in place.
+    up = np.array((hl2 + mult * a).to_numpy(float), copy=True)
+    lo = np.array((hl2 - mult * a).to_numpy(float), copy=True)
+    c = np.array(C.to_numpy(float), copy=True)
+    d = np.ones_like(c)
+    for i in range(1, len(c)):
+        pu, pl, pcv = up[i - 1], lo[i - 1], c[i - 1]
+        m1 = (lo[i] < pl) & (pcv > pl)
+        lo[i] = np.where(m1, pl, lo[i])
+        m2 = (up[i] > pu) & (pcv < pu)
+        up[i] = np.where(m2, pu, up[i])
+        d[i] = np.where(c[i] > up[i], 1, np.where(c[i] < lo[i], -1, d[i - 1]))
+    return pd.DataFrame(d, index=C.index, columns=C.columns)
+
+def build_features(px, fast=False):
+    """px = make_panel(...) output. Returns {feature_name: DataFrame}."""
+    O, H, L, C, V = px["Open"], px["High"], px["Low"], px["Close"], px["Volume"]
+    F = {}
+    pc = C.shift(1)
+    tr = pd.concat([H - L, (H - pc).abs(), (L - pc).abs()]).groupby(level=0).max().reindex(C.index)
+    atr14 = tr.ewm(span=14, adjust=False).mean()
+    F["atr"] = atr14
+    F["atr_pct"] = atr14 / C * 100
+    F["adr20"] = ((H - L) / C * 100).rolling(20).mean()
+    F["rvol"] = V / V.rolling(20).mean()
+    F["turn_cr"] = C * V / 1e7
+    F["turn_ma_cr"] = (C * V / 1e7).rolling(20).mean()
+    for n in (1, 3, 5, 10, 21, 63):
+        F[f"ret{n}"] = C.pct_change(n) * 100
+    F["gap"] = (O / C.shift(1) - 1) * 100
+    rng = (H - L).replace(0, np.nan)
+    F["clv"] = (C - L) / rng
+    F["body"] = (C - O) / rng
+    e20, e50 = _ema(C, 20), _ema(C, 50)
+    F["ema9"], F["ema20"], F["ema50"], F["ema200"] = _ema(C, 9), e20, e50, _ema(C, 200)
+    F["px_vs_e20"] = (C / e20 - 1) * 100
+    F["e20_vs_e50"] = (e20 / e50 - 1) * 100
+    F["stack_up"] = ((C > e20) & (e20 > e50)).astype(float)
+    F["stack_dn"] = ((C < e20) & (e20 < e50)).astype(float)
+    F["rsi"] = _rsi_df(C)
+    ml = _ema(C, 12) - _ema(C, 26)
+    F["macd_h"] = ml - _ema(ml, 9)
+    F["macd_h_norm"] = F["macd_h"] / C * 100
+    F["d_hi20"] = (C / H.rolling(20).max() - 1) * 100
+    F["d_lo20"] = (C / L.rolling(20).min() - 1) * 100
+    F["d_hi52"] = (C / H.rolling(252).max() - 1) * 100
+    F["d_lo52"] = (C / L.rolling(252).min() - 1) * 100
+    F["d_hi52r"] = (C / H.rolling(252, min_periods=100).max() - 1) * 100
+    F["d_lo52r"] = (C / L.rolling(252, min_periods=100).min() - 1) * 100
+    sd20 = C.pct_change().rolling(20).std() * 100
+    F["vol20"] = sd20
+    F["vol_ratio_5_20"] = (C.pct_change().rolling(5).std() * 100) / sd20
+    bbw = (C.rolling(20).std() * 4) / C.rolling(20).mean() * 100
+    F["bbw"] = bbw
+    F["bbw_pctile"] = bbw.rolling(120).rank(pct=True)
+    F["bbw_pct_r"] = bbw.rolling(120, min_periods=60).rank(pct=True)
+    F["nr7"] = ((H - L) <= (H - L).rolling(7).min()).astype(float)
+    absr = C.pct_change().abs() * 100
+    F["big_moves_20"] = (absr >= 2.5).rolling(20).sum()
+    F["big_moves_60"] = (absr >= 2.5).rolling(60).sum()
+    F["st_dir"] = pd.DataFrame(1.0, index=C.index, columns=C.columns) if fast else _supertrend_dir(H, L, C)
+    F["px"] = C
+    F["up3"] = (C.diff() > 0).astype(int).rolling(3).sum()
+    mkt21 = C.pct_change(21).median(axis=1)
+    F["rs21"] = C.pct_change(21) * 100 - (mkt21 * 100).to_numpy()[:, None]
+    mkt1 = C.pct_change(1).median(axis=1)
+    F["rs1"] = C.pct_change(1) * 100 - (mkt1 * 100).to_numpy()[:, None]
+    F["acc2"] = ((C.diff() > 0) & (F["rvol"] > 1.3)).rolling(2).sum()
+    F["adx"] = _adx_panel(H, L, C)
+    return F
+
+def _adx_panel(H, L, C, n=14):
+    up = H.diff()
+    dn = -L.diff()
+    plus = up.where((up > dn) & (up > 0), 0.0)
+    minus = dn.where((dn > up) & (dn > 0), 0.0)
+    pc = C.shift(1)
+    tr = pd.concat([H - L, (H - pc).abs(), (L - pc).abs()]).groupby(level=0).max().reindex(C.index)
+    a = tr.ewm(alpha=1 / n, adjust=False).mean()
+    pdi = 100 * plus.ewm(alpha=1 / n, adjust=False).mean() / a.replace(0, np.nan)
+    mdi = 100 * minus.ewm(alpha=1 / n, adjust=False).mean() / a.replace(0, np.nan)
+    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    return dx.ewm(alpha=1 / n, adjust=False).mean()
+
+def snapshot(F, when=-1):
+    """Feature dict of the row at position `when` -> {ticker: {feature: value}}."""
+    out = defaultdict(dict)
+    for k, df in F.items():
+        if df is None or len(df) == 0:
+            continue
+        try:
+            row = df.iloc[when]
+        except Exception:
+            continue
+        for t, v in row.items():
+            out[t][k] = float(v) if v == v and np.isfinite(v) else np.nan
+    return dict(out)
+
+# ---------------------------------------------------------------------------
+# SWING (weekly) extras — mirrors the swing calibration exactly.
+# ---------------------------------------------------------------------------
+def swing_extras(px, F, ref_pos=-1):
+    O, H, L, C, V = px["Open"], px["High"], px["Low"], px["Close"], px["Volume"]
+    idx = C.index
+    ref = idx[ref_pos]
+    iso = idx.isocalendar()
+    wk = pd.Series([f"{a}-W{b:02d}" for a, b in zip(iso.year, iso.week)], index=idx)
+    wC = C.groupby(wk).last(); wH = H.groupby(wk).max(); wL = L.groupby(wk).min()
+    w_ret = (wC / wC.shift(1) - 1) * 100
+    w_ret4 = (wC / wC.shift(4) - 1) * 100
+    w_rng = (wH - wL) / wL * 100
+    w_clv = (wC - wL) / (wH - wL).replace(0, np.nan)
+    w_rsi = _rsi_df(wC)
+    w_up2 = (w_ret > 0).astype(float) + (w_ret.shift(1) > 0).astype(float)
+    cur_wk = wk.loc[ref]
+    prev_wks = [k for k in wC.index if k < cur_wk]
+    if not prev_wks:
+        return {}
+    pw = max(prev_wks)
+    mk = pd.Series([f"{d.year}-{d.month:02d}" for d in idx], index=idx)
+    mH = H.groupby(mk).max(); mL = L.groupby(mk).min(); mC = C.groupby(mk).last()
+    P = (mH.shift(1) + mL.shift(1) + mC.shift(1)) / 3
+    rangeM = mH.shift(1) - mL.shift(1)
+    R1 = 2 * P - mL.shift(1); S1 = 2 * P - mH.shift(1)
+    R2 = P + rangeM
+    mkey = mk.loc[ref]
+    if mkey not in P.index:
+        return {}
+    cl = C.loc[ref]
+    ex = {}
+    ex["prev_wk_ret"] = w_ret.loc[pw]
+    ex["prev_wk_ret4"] = w_ret4.loc[pw]
+    ex["prev_wk_rng"] = w_rng.loc[pw]
+    ex["prev_wk_clv"] = w_clv.loc[pw]
+    ex["prev_wk_near_hi"] = (w_clv.loc[pw] >= 0.8).astype(float)
+    ex["w_rsi"] = w_rsi.loc[pw]
+    ex["w_up2"] = w_up2.loc[pw]
+    ex["piv_pos"] = (cl - P.loc[mkey]) / rangeM.loc[mkey].replace(0, np.nan) * 100
+    ex["above_P"] = (cl > P.loc[mkey]).astype(float)
+    ex["above_R1"] = (cl > R1.loc[mkey]).astype(float)
+    ex["above_R2"] = (cl > R2.loc[mkey]).astype(float)
+    ex["below_S1"] = (cl < S1.loc[mkey]).astype(float)
+    ex["d_R1"] = (cl / R1.loc[mkey] - 1) * 100
+    ex["d_S1"] = (cl / S1.loc[mkey] - 1) * 100
+    # sector momentum (median member ret5 / ret21)
+    r5, r21 = F["ret5"].loc[ref], F["ret21"].loc[ref]
+    sm1, sm4 = {}, {}
+    for s, lst in SECTOR_MAP.items():
+        mem = [f"{t}.NS" for t in lst if f"{t}.NS" in C.columns]
+        if not mem:
+            continue
+        sm1[s] = float(np.nanmedian(r5[mem].to_numpy(float)))
+        sm4[s] = float(np.nanmedian(r21[mem].to_numpy(float)))
+    sec = pd.Series({t: sector_of(t) for t in C.columns})
+    ex["sec_mom1"] = sec.map(sm1)
+    ex["sec_mom4"] = sec.map(sm4)
+    ex["rs_sec1"] = F["ret5"].loc[ref] - ex["sec_mom1"]
+    ex["_pivots"] = dict(P=P.loc[mkey], R1=R1.loc[mkey], R2=R2.loc[mkey], S1=S1.loc[mkey])
+    return ex
+
+# ---------------------------------------------------------------------------
+# INTRADAY ORB features from a 5-minute frame (single ticker, single day)
+# ---------------------------------------------------------------------------
+def orb_from_bars(g, minutes=5):
+    """g: intraday 5m bars for one ticker/day, ascending, from 09:15.
+    Returns ORB candle stats + the current close-confirmed break state."""
+    if g is None or len(g) < 1:
+        return None
+    g = g.sort_index()
+    nbars = max(1, int(minutes // 5))
+    fc = g.iloc[:nbars]
+    if len(fc) < nbars:
+        return None
+    oh, ol = float(fc.High.max()), float(fc.Low.min())
+    oo, oc = float(fc.Open.iloc[0]), float(fc.Close.iloc[-1])
+    if not (oh > 0 and ol > 0 and oo > 0):
+        return None
+    rest = g.iloc[nbars:]
+    day_vol = float(g.Volume.sum())
+    r = dict(orb_h=oh, orb_l=ol, orb_o=oo, orb_c=oc,
+             orb_range_pct=(oh - ol) / oo * 100,
+             fc_body=(oc - oo) / oo * 100,
+             fc_vol_share=(float(fc.Volume.sum()) / day_vol) if day_vol > 0 else np.nan,
+             bars=len(g), last=float(g.Close.iloc[-1]),
+             day_high=float(g.High.max()), day_low=float(g.Low.min()),
+             L_trig=0, S_trig=0, L_trig_min=np.nan, S_trig_min=np.nan,
+             L_entry=np.nan, S_entry=np.nan, L_trig_time=None, S_trig_time=None)
+    if len(rest) == 0:
+        return r
+    Cc = rest.Close.to_numpy(float)
+    t0 = g.index[0]
+    up = Cc > oh
+    if up.any():
+        i = int(np.argmax(up))
+        r["L_trig"] = 1
+        r["L_entry"] = float(Cc[i])
+        r["L_trig_min"] = int((rest.index[i] - t0).total_seconds() // 60) + 5
+        r["L_trig_time"] = rest.index[i]
+    dn = Cc < ol
+    if dn.any():
+        i = int(np.argmax(dn))
+        r["S_trig"] = 1
+        r["S_entry"] = float(Cc[i])
+        r["S_trig_min"] = int((rest.index[i] - t0).total_seconds() // 60) + 5
+        r["S_trig_time"] = rest.index[i]
+    return r
+
+def orb_model_features(base, orb, pdh, pdl, pdc, nfctx, side):
+    """Assemble the exact feature vector the intraday models expect."""
+    f = dict(base)
+    f["gap_today"] = (orb["orb_o"] / pdc - 1) * 100 if pdc else np.nan
+    f["gap_x_atr"] = f["gap_today"] / f.get("atr_pct", np.nan) if f.get("atr_pct") else np.nan
+    f["orb_range_pct"] = orb["orb_range_pct"]
+    f["orb_rng_x_atr"] = orb["orb_range_pct"] / f["atr_pct"] if f.get("atr_pct") else np.nan
+    f["fc_body"] = orb["fc_body"]
+    f["fc_vol_share"] = orb["fc_vol_share"]
+    f["orb_pos_in_pd"] = (orb["orb_o"] - pdl) / (pdh - pdl) if (pdh and pdl and pdh != pdl) else np.nan
+    f["nf_gap"] = nfctx.get("nf_gap", 0.0)
+    f["nf_fc"] = nfctx.get("nf_fc", 0.0)
+    f["nf_fc_range"] = nfctx.get("nf_fc_range", 0.0)
+    if side == "L":
+        f["orb_h_vs_pdh"] = (orb["orb_h"] / pdh - 1) * 100 if pdh else np.nan
+        f["long_break_pct"] = (orb["orb_h"] / orb["orb_o"] - 1) * 100
+        f["room_to_pdh"] = (pdh / orb["orb_h"] - 1) * 100 if pdh else np.nan
+        f["L_trig_min"] = orb.get("L_trig_min", 20) if orb.get("L_trig_min") == orb.get("L_trig_min") else 20
+    else:
+        f["orb_l_vs_pdl"] = (orb["orb_l"] / pdl - 1) * 100 if pdl else np.nan
+        f["short_break_pct"] = (1 - orb["orb_l"] / orb["orb_o"]) * 100
+        f["room_to_pdl"] = (1 - pdl / orb["orb_l"]) * 100 if pdl else np.nan
+        f["S_trig_min"] = orb.get("S_trig_min", 20) if orb.get("S_trig_min") == orb.get("S_trig_min") else 20
+    return f
+
+def nifty_context(nf5=None, nfd=None):
+    """Nifty gap + first-candle behaviour, exactly as in calibration."""
+    ctx = dict(nf_gap=0.0, nf_fc=0.0, nf_fc_range=0.0, nf_now=0.0, regime="NEUTRAL")
+    try:
+        if nfd is not None and len(nfd) > 200:
+            c = pd.to_numeric(nfd["Close"], errors="coerce").dropna()
+            e50 = _ema(c, 50).iloc[-1]; e200 = _ema(c, 200).iloc[-1]
+            r21 = (c.iloc[-1] / c.iloc[-22] - 1) * 100 if len(c) > 22 else 0
+            if c.iloc[-1] > e50 > e200 and r21 > 0:
+                ctx["regime"] = "BULL"
+            elif c.iloc[-1] < e50 < e200 and r21 < 0:
+                ctx["regime"] = "BEAR"
+            else:
+                ctx["regime"] = "NEUTRAL"
+            ctx["nf_ret21"] = float(r21)
+        if nf5 is not None and len(nf5) >= 2 and nfd is not None:
+            g = nf5.sort_index()
+            g = g[g.index.date == g.index[-1].date()]
+            if len(g) >= 1:
+                o = g.iloc[0]
+                pcs = pd.to_numeric(nfd["Close"], errors="coerce").dropna()
+                prevc = float(pcs.iloc[-2]) if len(pcs) > 1 else float(o.Open)
+                ctx["nf_gap"] = (float(o.Open) / prevc - 1) * 100
+                ctx["nf_fc"] = (float(o.Close) / float(o.Open) - 1) * 100
+                ctx["nf_fc_range"] = (float(o.High) - float(o.Low)) / float(o.Open) * 100
+                ctx["nf_now"] = (float(g.iloc[-1].Close) / float(o.Open) - 1) * 100
+    except Exception:
+        pass
+    return ctx
 
 
 # =============================================================================
-# PERSISTENT STORAGE SYSTEM
+# CALIBRATED PROBABILITY MODEL  (logistic; coefficients fitted offline and
+# refitted by the learning loop). v20 used hand-set weights capped at 100 while
+# the max was ~130, so dozens of names tied at the top (bug #4). Probabilities
+# do not tie and are directly interpretable.
 # =============================================================================
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-SESSIONS_DIR = os.path.join(DATA_DIR, "sessions")
-SCANS_DIR = os.path.join(DATA_DIR, "scans")
-SETTINGS_FILE = os.path.join(DATA_DIR, "user_settings.json")
-os.makedirs(SESSIONS_DIR, exist_ok=True)
-os.makedirs(SCANS_DIR, exist_ok=True)
+class LogitModel:
+    def __init__(self, spec):
+        self.features = spec["features"]
+        self.coef = np.array(spec["coef"], float)
+        self.b = float(spec["intercept"])
+        self.mean = np.array(spec["mean"], float)
+        self.scale = np.array(spec["scale"], float)
+        self.n = spec.get("n", 0)
+        self.trained_at = spec.get("trained_at", "offline calibration")
 
-def save_settings(settings):
+    def prob(self, feat):
+        x = np.array([feat.get(k, np.nan) for k in self.features], float)
+        if np.isnan(x).any():
+            med = np.nan_to_num(self.mean)
+            x = np.where(np.isnan(x), med, x)
+        z = (x - self.mean) / np.where(self.scale == 0, 1, self.scale)
+        z = np.clip(z, -5, 5)
+        return float(1 / (1 + math.exp(-(float(z @ self.coef) + self.b))))
+
+    def top_drivers(self, feat, k=4):
+        x = np.array([feat.get(f, np.nan) for f in self.features], float)
+        x = np.where(np.isnan(x), self.mean, x)
+        z = np.clip((x - self.mean) / np.where(self.scale == 0, 1, self.scale), -5, 5)
+        contrib = z * self.coef
+        order = np.argsort(-np.abs(contrib))[:k]
+        return [(self.features[i], float(contrib[i])) for i in order]
+
+def load_model(path, embedded=None):
     try:
-        with open(SETTINGS_FILE, 'w') as f: json.dump(settings, f, indent=2)
-    except Exception: pass
-
-def load_settings():
-    try:
-        if os.path.exists(SETTINGS_FILE):
-            with open(SETTINGS_FILE, 'r') as f: return json.load(f)
-    except Exception: pass
-    return {"capital": 200000, "risk_pct": 1.0}
-
-def save_session_results(scan_key, results, scan_time=None):
-    """Save scan results to disk — persists across page refreshes"""
-    if not results: return
-    session_date = get_session_date()
-    filepath = os.path.join(SESSIONS_DIR, f"{scan_key}_{session_date}.json")
-    payload = {
-        "scan_key": scan_key,
-        "session_date": session_date,
-        "scan_time": scan_time or get_ist_now().strftime('%Y-%m-%d %H:%M:%S'),
-        "results": results
-    }
-    try:
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(payload, f, indent=2, default=str)
-    except Exception: pass
-
-def load_session_results(scan_key):
-    """Load today's scan results from disk"""
-    session_date = get_session_date()
-    filepath = os.path.join(SESSIONS_DIR, f"{scan_key}_{session_date}.json")
-    try:
-        if os.path.exists(filepath):
-            with open(filepath, 'r', encoding='utf-8') as f:
-                payload = json.load(f)
-            return payload.get("results", []), payload.get("scan_time", "")
-    except Exception: pass
-    return None, None
-
-def save_premarket_heroes(heroes_data):
-    """Save premarket heroes to disk — permanently locked for the entire day"""
-    if not heroes_data: return
-    session_date = get_session_date()
-    filepath = os.path.join(SESSIONS_DIR, f"premarket_heroes_{session_date}.json")
-    payload = {
-        "session_date": session_date,
-        "locked_at": get_ist_now().strftime('%Y-%m-%d %H:%M:%S'),
-        "heroes": heroes_data
-    }
-    try:
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(payload, f, indent=2, default=str)
-    except Exception: pass
-
-def load_premarket_heroes():
-    """Load locked premarket heroes for today's session"""
-    session_date = get_session_date()
-    filepath = os.path.join(SESSIONS_DIR, f"premarket_heroes_{session_date}.json")
-    try:
-        if os.path.exists(filepath):
-            with open(filepath, 'r', encoding='utf-8') as f:
-                payload = json.load(f)
-            raw = payload.get("heroes", None)
-            if isinstance(raw, dict) and "bull_heroes" in raw:
-                hl = raw.get("hero_long")
-                hs = raw.get("hero_short")
-                bh = raw.get("bull_heroes", [hl] if hl else [])
-                sh = raw.get("bear_heroes", [hs] if hs else [])
-                return (hl, hs, bh, sh), payload.get("locked_at", "")
-            elif isinstance(raw, (list, tuple)) and len(raw) >= 4:
-                return (raw[0], raw[1], raw[2], raw[3]), payload.get("locked_at", "")
-    except Exception: pass
-    return (None, None, [], []), None
-
-def cleanup_old_sessions():
-    """Remove session files older than 3 days"""
-    try:
-        cutoff = get_ist_now() - timedelta(days=3)
-        for fname in os.listdir(SESSIONS_DIR):
-            fpath = os.path.join(SESSIONS_DIR, fname)
-            if os.path.isfile(fpath):
-                mtime = datetime.fromtimestamp(os.path.getmtime(fpath), tz=IST)
-                if mtime < cutoff:
-                    os.remove(fpath)
-    except Exception: pass
-
-# Background scan status tracking (file-based for thread safety)
-def write_scan_status(scan_key, status, progress=0, error=""):
-    fpath = os.path.join(SCANS_DIR, f"{scan_key}_status.json")
-    try:
-        with open(fpath, 'w') as f:
-            json.dump({"status": status, "progress": progress, "error": error,
-                        "time": get_ist_now().strftime('%H:%M:%S')}, f)
-    except Exception: pass
-
-def read_scan_status(scan_key):
-    fpath = os.path.join(SCANS_DIR, f"{scan_key}_status.json")
-    try:
-        if os.path.exists(fpath):
-            with open(fpath, 'r') as f: return json.load(f)
-    except Exception: pass
-    return {"status": "idle", "progress": 0}
-
-cleanup_old_sessions()
-
-# =============================================================================
-# PERFORMANCE LAB — DATA LAYER
-# =============================================================================
-PERF_DIR = os.path.join(DATA_DIR, "performance")
-INTRADAY_WINNERS_DIR = os.path.join(PERF_DIR, "intraday_winners")
-SWING_WINNERS_DIR = os.path.join(PERF_DIR, "swing_winners")
-MANUAL_LOG_FILE = os.path.join(PERF_DIR, "manual_log.json")
-PATTERN_FILE = os.path.join(PERF_DIR, "pattern_analysis.json")
-BACKTEST_FILE = os.path.join(PERF_DIR, "backtest_results.json")
-HIST_INTRADAY_FILE = os.path.join(PERF_DIR, "historical_intraday_top3.json")
-HIST_SWING_FILE = os.path.join(PERF_DIR, "historical_swing_top3.json")
-ADAPTIVE_WEIGHTS_FILE = os.path.join(PERF_DIR, "adaptive_weights.json")
-os.makedirs(INTRADAY_WINNERS_DIR, exist_ok=True)
-os.makedirs(SWING_WINNERS_DIR, exist_ok=True)
-
-def save_perf_winners(filepath, data):
-    try:
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, default=str)
-    except Exception: pass
-
-def load_perf_winners(filepath):
-    try:
-        if os.path.exists(filepath):
-            with open(filepath, 'r', encoding='utf-8') as f:
-                return json.load(f)
-    except Exception: pass
+        if os.path.exists(path):
+            return LogitModel(json.load(open(path)))
+    except Exception:
+        pass
+    if embedded:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            json.dump(embedded, open(path, "w"))
+        except Exception:
+            pass
+        return LogitModel(embedded)
     return None
 
-def save_manual_log(entries):
-    save_perf_winners(MANUAL_LOG_FILE, {"entries": entries, "updated": get_ist_now().strftime('%Y-%m-%d %H:%M:%S')})
+# =============================================================================
 
-def load_manual_log():
-    data = load_perf_winners(MANUAL_LOG_FILE)
-    return data.get("entries", []) if data else []
+# EMBEDDED CALIBRATED MODELS  (fitted offline on the full study sample)
 
-def save_pattern_analysis(patterns):
-    save_perf_winners(PATTERN_FILE, {"patterns": patterns, "updated": get_ist_now().strftime('%Y-%m-%d %H:%M:%S')})
+# Regenerated automatically by the learning loop into data/models/*.json.
 
-def load_pattern_analysis():
-    data = load_perf_winners(PATTERN_FILE)
-    return data.get("patterns", {}) if data else {}
+# =============================================================================
 
-def save_adaptive_weights(weights):
-    save_perf_winners(ADAPTIVE_WEIGHTS_FILE, {"weights": weights, "updated": get_ist_now().strftime('%Y-%m-%d %H:%M:%S')})
+EMB_LONG = dict(
+  features=['atr_pct', 'adr20', 'vol20', 'big_moves_20', 'big_moves_60', 'bbw', 'bbw_pctile', 'rvol', 'ret1', 'ret3', 'ret5', 'ret21', 'gap_today', 'gap_x_atr', 'clv', 'body', 'px_vs_e20', 'e20_vs_e50', 'rsi', 'macd_h_norm', 'd_hi20', 'd_lo20', 'd_hi52', 'd_lo52', 'st_dir', 'rs21', 'rs1', 'acc2', 'orb_range_pct', 'orb_rng_x_atr', 'fc_body', 'orb_pos_in_pd', 'nf_gap', 'nf_fc', 'nf_fc_range', 'turn_ma_cr', 'px', 'orb_h_vs_pdh', 'long_break_pct', 'room_to_pdh', 'L_trig_min'],
+  coef=[0.18083033, 0.02633692, 0.14291853, 0.02566966, 0.17181047, -0.05313657, -0.02048169, 0.01916862, -0.07098634, -0.04268473, 0.01900845, 0.39863376, 0.02340167, 8.026e-05, -0.05787861, 0.04771921, 0.05651406, -0.09871257, -0.15878899, -0.05545435, 0.21548272, -0.07067705, -0.11937098, 0.18261505, 0.0555955, -0.32014754, -0.00715987, 0.07626524, 0.06676832, 0.25515546, 0.05178576, 0.21034861, 0.12971936, 0.0156963, -0.0524823, -0.11156248, -0.03142569, -0.12554577, 0.03731731, 0.06733564, -0.59476752],
+  intercept=-2.36207775,
+  mean=[2.57848127, 2.48251041, 1.76259277, 2.75740517, 9.97949337, 11.39442122, 0.38811542, 0.96561571, 0.02271691, 0.19570207, 0.2960721, 1.37910898, 0.11605456, 0.04184956, 0.46567761, -0.06153242, 0.3909272, 0.6474431, 51.37746988, -0.02089715, -5.40202171, 6.7506139, -17.09130535, 30.60842363, 0.05857124, 0.44117949, 0.05638601, 0.20721083, 0.80443012, 0.3150812, 0.11531403, 0.6398848, 0.05775785, 0.00532797, 0.25803658, 313.00036412, 2282.12611728, -0.47057368, 0.44013948, 0.49466932, 45.67216191],
+  scale=[0.68499393, 0.61498745, 0.59455605, 2.02725377, 5.23867883, 5.56895208, 0.2808568, 0.80471341, 1.82207479, 3.05034258, 3.87035114, 7.54503773, 0.75426996, 0.28942527, 0.28312261, 0.50887929, 3.44284145, 2.93521217, 11.00239137, 0.57123955, 3.96011915, 5.45257336, 11.37850701, 25.46225631, 0.99828323, 7.33738072, 1.63203483, 0.45925706, 0.46963472, 0.1636733, 0.60923913, 0.57138511, 0.48782951, 0.17452143, 0.08013684, 350.59597387, 4109.11955903, 1.46644736, 0.50197667, 1.48526026, 77.15409823],
+  n=7461,
+  trained_at='offline calibration 2026-08-27',
+  note='P(+2% from close-confirmed 5m ORB high before capped stop). Walk-forward top-1 target-hit 37.5%, expectancy +0.32%/trade after costs.',
+)
 
-def load_adaptive_weights():
-    data = load_perf_winners(ADAPTIVE_WEIGHTS_FILE)
-    return data.get("weights", {}) if data else {}
+EMB_SHORT = dict(
+  features=['atr_pct', 'adr20', 'vol20', 'big_moves_20', 'big_moves_60', 'bbw', 'bbw_pctile', 'rvol', 'ret1', 'ret3', 'ret5', 'ret21', 'gap_today', 'gap_x_atr', 'clv', 'body', 'px_vs_e20', 'e20_vs_e50', 'rsi', 'macd_h_norm', 'd_hi20', 'd_lo20', 'd_hi52', 'd_lo52', 'st_dir', 'rs21', 'rs1', 'acc2', 'orb_range_pct', 'orb_rng_x_atr', 'fc_body', 'orb_pos_in_pd', 'nf_gap', 'nf_fc', 'nf_fc_range', 'turn_ma_cr', 'px', 'orb_l_vs_pdl', 'short_break_pct', 'room_to_pdl', 'S_trig_min'],
+  coef=[-0.1056424, 0.42845958, -0.11851633, -0.07123081, 0.19703245, 0.1558002, -0.17626433, -0.01504971, 0.09740448, -0.01878963, 0.01010589, 0.13492799, -0.01481683, -0.0866516, -0.03882722, 0.155875, -0.26276068, 0.18482643, 0.16080909, 0.22403774, 0.02071291, -0.00837516, -0.0309619, 0.10862821, -0.00869091, -0.22061007, -0.26688805, 0.0863963, 0.2097631, 0.16930441, -0.02685223, 0.02485294, -0.23082518, 0.05882071, -0.0548983, -0.11746585, 0.02084141, 0.2406635, 0.06611457, -0.01063444, -0.52165259],
+  intercept=-2.75420633,
+  mean=[2.58296004, 2.49542239, 1.76938181, 2.76631183, 10.0338134, 11.45196761, 0.38576967, 0.96778681, 0.12262535, 0.29464413, 0.35518591, 1.3980886, 0.13915648, 0.05134345, 0.48605101, -0.0361171, 0.45912762, 0.64337411, 51.55022665, -0.01164366, -5.36767423, 6.8688771, -17.13882232, 31.61879033, 0.07326237, 0.44421976, 0.12314913, 0.21815905, 0.79242951, 0.31076407, -0.12718236, 0.66339353, 0.06926131, -0.01011709, 0.2588878, 315.22552895, 2268.34097288, 1.13479881, 0.45994793, 1.09886601, 51.05197245],
+  scale=[0.68985433, 0.62092136, 0.60444468, 2.04170475, 5.2568692, 5.57058641, 0.27997348, 0.82305196, 1.79077924, 3.0326244, 3.90476394, 7.51207508, 0.72574851, 0.28123589, 0.28607415, 0.51015698, 3.44574283, 3.06245419, 10.96716861, 0.5770299, 3.96478966, 5.44694511, 11.55570578, 26.56610607, 0.9973127, 7.34571095, 1.65270103, 0.47425477, 0.43828165, 0.15570381, 0.58762175, 0.56095256, 0.46376182, 0.17711859, 0.08261423, 346.42905922, 4236.19741129, 1.56052307, 0.45303664, 1.50478514, 84.64860766],
+  n=7985,
+  trained_at='offline calibration 2026-08-27',
+  note='Short side. LOW CONFIDENCE: walk-forward expectancy was flat to negative; gated behind a higher probability floor.',
+)
 
-def save_backtest_results(results):
-    save_perf_winners(BACKTEST_FILE, {"results": results, "updated": get_ist_now().strftime('%Y-%m-%d %H:%M:%S')})
+EMB_SWING = dict(
+  features=['atr_pct', 'adr20', 'rvol', 'ret1', 'ret3', 'ret5', 'ret10', 'ret21', 'ret63', 'gap', 'clv', 'body', 'px_vs_e20', 'e20_vs_e50', 'stack_up', 'stack_dn', 'rsi', 'macd_h_norm', 'd_hi20', 'd_lo20', 'd_hi52r', 'd_lo52r', 'vol20', 'bbw', 'bbw_pct_r', 'nr7', 'big_moves_20', 'big_moves_60', 'st_dir', 'up3', 'rs21', 'rs1', 'acc2', 'vol_ratio_5_20', 'prev_wk_ret', 'prev_wk_ret4', 'prev_wk_rng', 'prev_wk_clv', 'prev_wk_near_hi', 'w_rsi', 'w_up2', 'piv_pos', 'above_P', 'above_R1', 'above_R2', 'below_S1', 'd_R1', 'd_S1', 'sec_mom1', 'sec_mom4', 'rs_sec1'],
+  coef=[0.6017352, 0.03616755, 0.03138237, 0.31280621, 0.01548216, 0.10397431, 0.01519405, -0.36653044, -0.07918463, -0.10179828, 0.22352433, -0.1623062, 0.07392996, 0.00397589, 0.0763303, 0.03171071, -0.09208648, 0.00602606, 0.00394262, 0.02609112, -0.08975369, -0.03108508, -0.18781406, -0.05434638, -0.01498761, -0.04738981, 0.10302892, 0.30111404, -0.05020722, 0.03233397, 0.39207104, -0.23622975, -0.01608623, -0.04818707, -0.2572753, -0.12070456, -0.22333147, -0.06482767, -0.07529861, 0.05031699, -0.07007477, 0.03948895, 0.0476469, 0.08807566, -0.03010436, -0.05037109, 0.04741024, 0.02741372, 0.01760314, 0.03688957, 0.12006628],
+  intercept=-2.83221247,
+  mean=[2.9306779, 2.82682216, 1.05576296, -0.06561863, 0.24393955, 0.29295819, 0.58635873, 1.15361405, 4.4657052, 0.10150807, 0.4643419, -0.06771195, 0.30841248, 0.60384833, 0.39065802, 0.30772938, 51.04809467, -0.00824056, -6.22548576, 8.10469498, -16.19053378, 43.27222864, 1.94409175, 13.22008169, 0.49989652, 0.14580167, 3.35918443, 10.05408712, 0.02094532, 1.49267841, 0.75943844, 0.09908197, 0.24307692, 0.92733198, 0.29740526, 1.10559925, 6.89828016, 0.49390013, 0.2089342, 54.29002352, 1.02365153, 5.30689111, 0.53308619, 0.16048193, 0.0473772, 0.11714551, -5.97839472, 9.06868467, 0.12263918, 0.57686173, 0.17031901],
+  scale=[1.01745412, 0.90708116, 0.88797782, 2.01361547, 3.64693482, 4.72169491, 6.54412491, 9.41670658, 18.19169302, 0.83291944, 0.27465408, 0.50922285, 4.31893216, 3.71670418, 0.48789787, 0.46155391, 12.14134936, 0.71587851, 4.98176921, 7.27793761, 12.08718578, 42.74673069, 0.86416725, 8.10022191, 0.30401355, 0.35290727, 2.59085768, 6.19259053, 0.99978062, 0.87070123, 8.39451272, 1.74851088, 0.49009256, 0.37713327, 4.53575116, 8.88298609, 4.2411396, 0.29390729, 0.40654729, 12.78815198, 0.69386055, 58.846691, 0.4989041, 0.36705242, 0.21244435, 0.32159359, 7.12517695, 10.75376774, 2.96498522, 5.64116057, 3.65416429],
+  n=26975,
+  trained_at='offline calibration 2026-08-27 (3y 60m bars, 133 weeks)',
+  note='P(+7% before -5% stop) on Monday 1h-ORB long. Validated top-3 = 19.8% vs 6.2% base; +10% top-3 = 11.1% vs 2.1% base.',
+)
 
-def load_backtest_results():
-    data = load_perf_winners(BACKTEST_FILE)
-    return data.get("results", {}) if data else {}
 
-def save_hist_intraday(data):
-    save_perf_winners(HIST_INTRADAY_FILE, {"data": data, "updated": get_ist_now().strftime('%Y-%m-%d %H:%M:%S')})
+# =============================================================================
+# MODEL LOADING  (embedded calibrated coefficients — the app works out of the
+# box; the learning loop overwrites data/models/*.json after each refit)
+# =============================================================================
+MODEL_L = load_model(F_MODEL_LONG,  embedded=EMB_LONG)
+MODEL_S = load_model(F_MODEL_SHORT, embedded=EMB_SHORT)
+MODEL_SW = load_model(F_MODEL_SWING, embedded=EMB_SWING)
 
-def load_hist_intraday():
-    d = load_perf_winners(HIST_INTRADAY_FILE)
-    return d.get("data", []) if d else []
+# =============================================================================
+# NSE PRE-OPEN  (v20 CRITICAL bug #1: the 09:08 scan read yesterday's bars as
+# "today", so the entire pre-market engine ran on the wrong day's data.
+# We now pull the real pre-open call-auction book from NSE.)
+# =============================================================================
+NSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/market-data/pre-open-market-cm-and-emerge-market",
+}
 
-def save_hist_swing(data):
-    save_perf_winners(HIST_SWING_FILE, {"data": data, "updated": get_ist_now().strftime('%Y-%m-%d %H:%M:%S')})
-
-def load_hist_swing():
-    d = load_perf_winners(HIST_SWING_FILE)
-    return d.get("data", []) if d else []
-
-def archive_old_performance_data(max_age_days=1000):
-    """Remove performance data older than max_age_days (preserves 180+ days & 104 weeks history)"""
-    cutoff = get_ist_now() - timedelta(days=max_age_days)
-    for d in [INTRADAY_WINNERS_DIR, SWING_WINNERS_DIR]:
-        try:
-            for fname in os.listdir(d):
-                fpath = os.path.join(d, fname)
-                if os.path.isfile(fpath):
-                    mtime = datetime.fromtimestamp(os.path.getmtime(fpath), tz=IST)
-                    if mtime < cutoff:
-                        os.remove(fpath)
-        except Exception: pass
-
-def get_all_intraday_winner_dates():
-    """List all dates for which we have intraday winner data"""
-    dates = []
+def fetch_nse_preopen(timeout=8):
+    """{SYMBOL.NS: {'pre_open': px, 'prev_close': px, 'gap_pct': x, 'qty': n}}
+    Empty dict if NSE is unreachable — every caller has a fallback."""
+    if not HAS_REQ:
+        return {}
+    hit = CACHE.get("preopen")
+    if hit is not None:
+        return hit
+    out = {}
     try:
-        for fname in sorted(os.listdir(INTRADAY_WINNERS_DIR)):
-            if fname.endswith('.json'):
-                dates.append(fname.replace('.json', ''))
-    except Exception: pass
-    return dates
-
-def get_all_swing_winner_weeks():
-    """List all weeks for which we have swing winner data"""
-    weeks = []
-    try:
-        for fname in sorted(os.listdir(SWING_WINNERS_DIR)):
-            if fname.endswith('.json'):
-                weeks.append(fname.replace('.json', ''))
-    except Exception: pass
-    return weeks
-
-def perf_data_to_csv(data_list, filename):
-    """Convert list of dicts to CSV string for download"""
-    if not data_list: return ""
-    df = pd.DataFrame(data_list)
-    return df.to_csv(index=False)
-
-archive_old_performance_data()
-
-# =============================================================================
-# DATA FETCHING
-# =============================================================================
-@st.cache_data(ttl=60)
-def fetch_market_indices():
-    indices = {"NIFTY 50": "^NSEI", "BANK NIFTY": "^NSEBANK", "SENSEX": "^BSESN"}
-    res = {}
-    for name, sym in indices.items():
-        try:
-            df = yf.download(sym, period="2d", interval="1d", progress=False, auto_adjust=True)
-            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-            if not df.empty and len(df) >= 2:
-                ltp = float(df['Close'].iloc[-1]); prev = float(df['Close'].iloc[-2])
-                res[name] = {"LTP": ltp, "Chg": ltp - prev, "Pct": ((ltp - prev) / prev) * 100}
-            elif not df.empty and len(df) == 1:
-                res[name] = {"LTP": float(df['Close'].iloc[-1]), "Chg": 0.0, "Pct": 0.0}
-            else:
-                res[name] = {"LTP": 0.0, "Chg": 0.0, "Pct": 0.0}
-        except Exception:
-            res[name] = {"LTP": 0.0, "Chg": 0.0, "Pct": 0.0}
-    return res
-
-@st.cache_data(ttl=900)
-def fetch_stock_data(ticker, period="3y", interval="1d"):
-    try:
-        data = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
-        if isinstance(data.columns, pd.MultiIndex): data.columns = data.columns.get_level_values(0)
-        return data.dropna(subset=['Close'])
-    except Exception: return pd.DataFrame()
-
-@st.cache_data(ttl=900)
-def fetch_bulk_data(tickers_tuple, period="1y", interval="1d"):
-    try:
-        return yf.download(list(tickers_tuple), period=period, interval=interval,
-                           group_by="ticker", progress=False, auto_adjust=True)
-    except Exception: return pd.DataFrame()
-
-def get_symbol_df(bulk_df, ticker, fb_period, fb_interval, min_len=50):
-    df = pd.DataFrame()
-    if not bulk_df.empty:
-        try:
-            if isinstance(bulk_df.columns, pd.MultiIndex):
-                if ticker in bulk_df.columns.get_level_values(0):
-                    df = bulk_df[ticker].dropna(how='all')
-            else: df = bulk_df.dropna(how='all')
-        except Exception: pass
-    if df.empty or len(df) < min_len:
-        df = fetch_stock_data(ticker, period=fb_period, interval=fb_interval)
-    return df
-
-@st.cache_data(ttl=900)
-def fetch_nifty_series(period="2y", interval="1d"):
-    return fetch_stock_data("^NSEI", period=period, interval=interval)
-
-@st.cache_data(ttl=30)
-def fetch_live_prices(tickers_tuple):
-    tickers = list(tickers_tuple)
-    if not tickers: return {}
-    try:
-        df = yf.download(tickers, period="1d", interval="1m", progress=False, auto_adjust=True)
-        if df.empty: df = yf.download(tickers, period="2d", interval="1d", progress=False, auto_adjust=True)
-        if df.empty: return {}
-        prices = {}
-        if isinstance(df.columns, pd.MultiIndex):
-            for t in tickers:
-                try:
-                    close = df[t]['Close'].dropna()
-                    if not close.empty: prices[t] = float(close.iloc[-1])
-                except Exception: pass
-        elif len(tickers) == 1:
-            cols = df.columns
-            if isinstance(cols, pd.MultiIndex): cols = cols.get_level_values(0)
-            close = df['Close'].dropna() if 'Close' in cols else pd.Series()
-            if not close.empty: prices[tickers[0]] = float(close.iloc[-1])
-        return prices
-    except Exception: return {}
-
-# =============================================================================
-# INDICATOR ENGINE
-# =============================================================================
-def compute_rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0); loss = (-delta).clip(lower=0)
-    avg_gain = gain.ewm(alpha=1.0/period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1.0/period, min_periods=period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-def compute_macd(series, fast=12, slow=26, signal=9):
-    ema_f = series.ewm(span=fast, adjust=False).mean()
-    ema_s = series.ewm(span=slow, adjust=False).mean()
-    macd = ema_f - ema_s
-    sig = macd.ewm(span=signal, adjust=False).mean()
-    return macd, sig, macd - sig
-
-def compute_supertrend(df, period=10, multiplier=2.0):
-    if df.empty or len(df) < period + 1:
-        df['Supertrend'] = np.nan; df['ST_Dir'] = 0; return df
-    h = df['High'].values.astype(float); l = df['Low'].values.astype(float); c = df['Close'].values.astype(float)
-    pc = np.roll(c, 1); pc[0] = c[0]
-    tr = np.maximum(h - l, np.maximum(np.abs(h - pc), np.abs(l - pc)))
-    atr = pd.Series(tr).ewm(span=period, adjust=False).mean().values
-    hl2 = (h + l) / 2.0; upper = hl2 + multiplier * atr; lower = hl2 - multiplier * atr
-    direction = np.ones(len(df), dtype=int); st_val = np.full(len(df), np.nan)
-    for i in range(1, len(df)):
-        if lower[i] < lower[i-1] and c[i-1] > lower[i-1]: lower[i] = lower[i-1]
-        if upper[i] > upper[i-1] and c[i-1] < upper[i-1]: upper[i] = upper[i-1]
-        if c[i] > upper[i]: direction[i] = 1
-        elif c[i] < lower[i]: direction[i] = -1
-        else: direction[i] = direction[i-1]
-        st_val[i] = lower[i] if direction[i] == 1 else upper[i]
-    df['Supertrend'] = st_val; df['ST_Dir'] = direction
-    return df
-
-def add_atr(df, period=14):
-    if df.empty or len(df) < period + 1: df['ATR14'] = np.nan; return df
-    hl = df['High'] - df['Low']
-    hc = (df['High'] - df['Close'].shift(1)).abs()
-    lc = (df['Low'] - df['Close'].shift(1)).abs()
-    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    df['ATR14'] = tr.ewm(span=period, adjust=False).mean()
-    return df
-
-def compute_all_indicators(df, is_intraday=False):
-    if df.empty or len(df) < (15 if is_intraday else 50): return df
-    df = df.copy()
-    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-    df['EMA_9'] = df['Close'].ewm(span=9, adjust=False).mean()
-    df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
-    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
-    df = add_atr(df)
-    df['RSI_14'] = compute_rsi(df['Close'], 14)
-    df['MACD'], df['MACD_Signal'], df['MACD_Hist'] = compute_macd(df['Close'])
-    df = compute_supertrend(df, period=10, multiplier=2.0)
-    df['Vol_MA_20'] = df['Volume'].rolling(20).mean()
-    df['Inst_Vol_Spike'] = df['Volume'] > (df['Vol_MA_20'] * 1.5)
-
-    # Accumulation/Distribution Line
-    mfm = ((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / (df['High'] - df['Low']).replace(0, np.nan)
-    mfv = mfm.fillna(0) * df['Volume']
-    df['ADL'] = mfv.cumsum()
-
-    if is_intraday:
-        df['Date_Group'] = df.index.date
-        typical = (df['High'] + df['Low'] + df['Close']) / 3.0
-        df['TP_Vol'] = typical * df['Volume']
-        df['Cum_TP_Vol'] = df.groupby('Date_Group')['TP_Vol'].transform(pd.Series.cumsum)
-        df['Cum_Vol'] = df.groupby('Date_Group')['Volume'].transform(pd.Series.cumsum)
-        df['VWAP'] = df['Cum_TP_Vol'] / df['Cum_Vol'].replace(0, np.nan)
-        df.drop(columns=['Date_Group', 'TP_Vol', 'Cum_TP_Vol', 'Cum_Vol'], inplace=True, errors='ignore')
-    else:
-        df['VWAP'] = df['EMA_20']
-    return df
-
-# =============================================================================
-# PIVOT CALCULATOR (Weekly + Monthly)
-# =============================================================================
-def compute_weekly_pivot(df_daily):
-    """Compute weekly pivot from previous week's data. New pivot every Monday."""
-    if df_daily.empty or len(df_daily) < 10: return {}
-    df = df_daily.copy()
-    df['Week'] = df.index.isocalendar().week.values
-    df['Year'] = df.index.year
-    weeks = df.groupby(['Year', 'Week']).agg({'High': 'max', 'Low': 'min', 'Close': 'last'})
-    if len(weeks) < 2: return {}
-    prev = weeks.iloc[-2]
-    pivot = (prev['High'] + prev['Low'] + prev['Close']) / 3
-    r1 = 2 * pivot - prev['Low']
-    s1 = 2 * pivot - prev['High']
-    r2 = pivot + (prev['High'] - prev['Low'])
-    s2 = pivot - (prev['High'] - prev['Low'])
-    r3 = prev['High'] + 2 * (pivot - prev['Low'])
-    s3 = prev['Low'] - 2 * (prev['High'] - pivot)
-    return {"P": pivot, "R1": r1, "R2": r2, "R3": r3, "S1": s1, "S2": s2, "S3": s3}
-
-def compute_monthly_pivot(df_daily):
-    """Compute monthly pivot from previous month's data. New on 1st trading day of month."""
-    if df_daily.empty or len(df_daily) < 30: return {}
-    df = df_daily.copy()
-    df['Month'] = df.index.month; df['Year'] = df.index.year
-    months = df.groupby(['Year', 'Month']).agg({'High': 'max', 'Low': 'min', 'Close': 'last'})
-    if len(months) < 2: return {}
-    prev = months.iloc[-2]
-    pivot = (prev['High'] + prev['Low'] + prev['Close']) / 3
-    r1 = 2 * pivot - prev['Low']
-    s1 = 2 * pivot - prev['High']
-    r2 = pivot + (prev['High'] - prev['Low'])
-    s2 = pivot - (prev['High'] - prev['Low'])
-    return {"P": pivot, "R1": r1, "R2": r2, "S1": s1, "S2": s2}
-
-def get_pivot_context(price, pivots):
-    """Determine price position relative to pivot levels"""
-    if not pivots: return "❓", "unknown"
-    p = pivots.get("P", 0)
-    r1 = pivots.get("R1", p * 1.01)
-    s1 = pivots.get("S1", p * 0.99)
-    atr_band = abs(r1 - p) * 0.15  # Near = within 15% of R1-P range
-
-    if abs(price - p) < atr_band: return "🟡 Near Pivot", "near"
-    elif price > r1: return "🟢 Above R1", "above"
-    elif price > p: return "🟢 Above Pivot", "above"
-    elif price < s1: return "🔴 Below S1", "below"
-    elif price < p: return "🔴 Below Pivot", "below"
-    return "🟡 At Pivot", "near"
-
-# =============================================================================
-# VOLUME PROFILE ENGINE
-# =============================================================================
-def compute_volume_profile(df, lookback=20, num_bins=15):
-    """Compute POC, VAH, VAL from volume-at-price distribution"""
-    if df.empty or len(df) < lookback:
-        return {"POC": np.nan, "VAH": np.nan, "VAL": np.nan}
-    recent = df.tail(lookback)
-    price_min = float(recent['Low'].min())
-    price_max = float(recent['High'].max())
-    if price_max <= price_min:
-        return {"POC": price_min, "VAH": price_min, "VAL": price_min}
-
-    bins = np.linspace(price_min, price_max, num_bins + 1)
-    bin_centers = (bins[:-1] + bins[1:]) / 2
-    vol_profile = np.zeros(num_bins)
-
-    for _, row in recent.iterrows():
-        for i in range(num_bins):
-            if row['Low'] <= bin_centers[i] <= row['High']:
-                vol_profile[i] += row['Volume']
-
-    # POC = highest volume price level
-    poc_idx = np.argmax(vol_profile)
-    poc = float(bin_centers[poc_idx])
-
-    # Value Area = 70% of total volume
-    total_vol = vol_profile.sum()
-    if total_vol == 0:
-        return {"POC": poc, "VAH": price_max, "VAL": price_min}
-
-    sorted_idx = np.argsort(vol_profile)[::-1]
-    cum_vol = 0
-    va_indices = []
-    for idx in sorted_idx:
-        cum_vol += vol_profile[idx]
-        va_indices.append(idx)
-        if cum_vol >= 0.7 * total_vol:
-            break
-
-    vah = float(bin_centers[max(va_indices)])
-    val = float(bin_centers[min(va_indices)])
-    return {"POC": poc, "VAH": vah, "VAL": val}
-
-def get_vp_context(price, vp):
-    """Price position relative to volume profile"""
-    if not vp or np.isnan(vp.get("POC", np.nan)):
-        return 0
-    poc = vp["POC"]; vah = vp["VAH"]; val = vp["VAL"]
-    # Score: institutional alignment
-    score = 0
-    if abs(price - poc) / poc < 0.005:  # Within 0.5% of POC
-        score += 5  # At institutional equilibrium
-    if price > vah:  # Breakout above value area
-        score += 3
-    elif price < val:  # Breakdown below value area
-        score += 3
-    elif val <= price <= vah:  # Inside value area
-        score += 1
-    return score
-
-# =============================================================================
-# MULTI-TIMEFRAME CONFLUENCE ENGINE
-# =============================================================================
-def compute_mtf_confluence_intraday(ticker, daily_df=None):
-    """
-    Intraday: 15m + 30m + 1h confluence
-    Returns: direction (+1 bull, -1 bear, 0 neutral), score_boost, details
-    """
-    tf_data = {}
-    directions = {}
-
-    # Fetch each timeframe
-    for tf_label, (interval, period) in [("15m", ("15m", "30d")), ("30m", ("30m", "60d")), ("1h", ("60m", "60d"))]:
-        try:
-            df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
-            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-            if df.empty or len(df) < 50: continue
-            df = compute_all_indicators(df, is_intraday=True)
-            if 'EMA_20' not in df.columns or 'EMA_50' not in df.columns: continue
-            last = df.iloc[-1]
-            bull = last['Close'] > last['EMA_20'] and last['EMA_20'] > last['EMA_50']
-            bear = last['Close'] < last['EMA_20'] and last['EMA_20'] < last['EMA_50']
-            d = 1 if bull else (-1 if bear else 0)
-            directions[tf_label] = d
-            tf_data[tf_label] = df
-        except Exception:
-            continue
-
-    if not directions: return 0, 0, {}
-
-    # Check confluence
-    vals = list(directions.values())
-    if all(v == 1 for v in vals):
-        return 1, 20, directions  # All bullish
-    elif all(v == -1 for v in vals):
-        return -1, 20, directions  # All bearish
-    elif sum(v == 1 for v in vals) >= 2:
-        return 1, 10, directions  # Majority bullish
-    elif sum(v == -1 for v in vals) >= 2:
-        return -1, 10, directions  # Majority bearish
-    return 0, 0, directions
-
-def compute_mtf_confluence_swing(ticker, daily_df=None):
-    """
-    Swing: 1h + 1D confluence
-    Returns: direction, score_boost, details
-    """
-    directions = {}
-
-    for tf_label, (interval, period) in [("1h", ("60m", "60d")), ("1d", ("1d", "2y"))]:
-        try:
-            if tf_label == "1d" and daily_df is not None and not daily_df.empty:
-                df = daily_df.copy()
-            else:
-                df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
-            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-            if df.empty or len(df) < 50: continue
-            df = compute_all_indicators(df, is_intraday=(tf_label != "1d"))
-            if 'EMA_20' not in df.columns: continue
-            last = df.iloc[-1]
-            bull = last['Close'] > last['EMA_20'] and last['EMA_20'] > last['EMA_50']
-            bear = last['Close'] < last['EMA_20'] and last['EMA_20'] < last['EMA_50']
-            directions[tf_label] = 1 if bull else (-1 if bear else 0)
-        except Exception:
-            continue
-
-    if not directions: return 0, 0, {}
-    vals = list(directions.values())
-    if all(v == 1 for v in vals): return 1, 20, directions
-    elif all(v == -1 for v in vals): return -1, 20, directions
-    elif len(vals) == 1: return vals[0], 8, directions
-    return 0, 0, directions
-
-# =============================================================================
-# PSYCHOLOGICAL & INSTITUTIONAL ENGINE
-# =============================================================================
-def compute_psychology(df, daily_dir=None, is_intraday=True):
-    df = df.copy()
-    df['Psychology'] = "—"
-    if 'VWAP' not in df.columns or 'Vol_MA_20' not in df.columns or df.empty: return df
-
-    for idx in df.index[-min(20, len(df)):]:
-        row = df.loc[idx]
-        close = row['Close']; vwap = row['VWAP']; vol = row['Volume']; avg_vol = row['Vol_MA_20']
-        if pd.isna(vwap) or pd.isna(avg_vol) or avg_vol == 0: continue
-        rv = vol / avg_vol
-        mu = (daily_dir == 1) if daily_dir is not None else (row.get('EMA_20', 0) > row.get('EMA_50', 0))
-        md = (daily_dir == -1) if daily_dir is not None else (row.get('EMA_20', 0) < row.get('EMA_50', 0))
-
-        if mu:
-            if close < vwap:
-                if rv < 0.8: df.at[idx, 'Psychology'] = "🟢 Discount Buy"
-                elif rv > 2.0: df.at[idx, 'Psychology'] = "🔴 Trapped Bulls"
-                else: df.at[idx, 'Psychology'] = "🟡 Dip Zone"
-            else:
-                if rv > 2.0: df.at[idx, 'Psychology'] = "🟢 Insti Buying"
-                else: df.at[idx, 'Psychology'] = "🟢 Trend Ride"
-        elif md:
-            if close > vwap:
-                if rv < 0.8: df.at[idx, 'Psychology'] = "🔴 Premium Short"
-                elif rv > 2.0: df.at[idx, 'Psychology'] = "🟢 Bear Trap"
-                else: df.at[idx, 'Psychology'] = "🟡 Rally Sell"
-            else:
-                if rv > 2.0: df.at[idx, 'Psychology'] = "🔴 Insti Selling"
-                else: df.at[idx, 'Psychology'] = "🔴 Trend Down"
-    return df
-
-# =============================================================================
-# ONE-WAY RUNNER ENGINE (Advanced)
-# =============================================================================
-def detect_one_way_runner(df, is_intraday=True):
-    df = df.copy()
-    df['Is_Runner'] = False; df['Runner_Type'] = ""
-    if df.empty or len(df) < 5 or 'VWAP' not in df.columns: return df
-
-    if is_intraday:
-        df['DG'] = df.index.date
-        first_idx = df.groupby('DG').head(1).index
-        for idx in first_idx:
+        with requests.Session() as s:   # context-managed: no leaked sockets
+            s.headers.update(NSE_HEADERS)
+            s.get("https://www.nseindia.com/", timeout=timeout)
+            r = s.get("https://www.nseindia.com/api/market-data-pre-open?key=FO",
+                      timeout=timeout)
+            js = r.json()
+        for row in js.get("data", []):
+            m = row.get("metadata", {}) or {}
+            d = row.get("detail", {}).get("preOpenMarket", {}) or {}
+            sym = m.get("symbol")
+            if not sym:
+                continue
             try:
-                dg = df.loc[idx, 'DG']
-                day = df[df['DG'] == dg]
-                if len(day) < 3: continue
-                fb = day.iloc[0]; avg_vol = fb.get('Vol_MA_20', 1)
-                if pd.isna(avg_vol) or avg_vol == 0: continue
-                rvol = fb['Volume'] / avg_vol
-
-                # First candle % move
-                fc_pct = abs((fb['Close'] - fb['Open']) / fb['Open']) * 100
-                is_extended = fc_pct > 0.70
-
-                if rvol > 2.0 or abs((fb['Open'] - day['Close'].shift(1).get(day.index[0], fb['Open'])) / max(fb['Open'], 1)) > 0.003:
-                    bull_run = True; bear_run = True
-                    for _, r in day.iterrows():
-                        if r['Low'] < r.get('VWAP', r['EMA_20']) * 0.998: bull_run = False
-                        if r['High'] > r.get('VWAP', r['EMA_20']) * 1.002: bear_run = False
-
-                    if bull_run and day.iloc[-1]['Close'] > fb['High']:
-                        df.loc[day.index[-1], 'Is_Runner'] = True
-                        lbl = "⚡ BULL RUNNER"
-                        if is_extended: lbl += " ⚠️"
-                        df.loc[day.index[-1], 'Runner_Type'] = lbl
-                    elif bear_run and day.iloc[-1]['Close'] < fb['Low']:
-                        df.loc[day.index[-1], 'Is_Runner'] = True
-                        lbl = "⚡ BEAR RUNNER"
-                        if is_extended: lbl += " ⚠️"
-                        df.loc[day.index[-1], 'Runner_Type'] = lbl
-            except Exception: pass
-        df.drop(columns=['DG'], inplace=True, errors='ignore')
-    else:
-        lookback = 5
-        recent = df.iloc[-lookback:]
-        if len(recent) == lookback:
-            sb = recent.iloc[0]
-            rv = sb['Volume'] / sb['Vol_MA_20'] if sb.get('Vol_MA_20', 0) else 1
-            if rv > 1.8:
-                bull = all(r['Close'] > r.get('EMA_20', 0) for _, r in recent.iterrows()) and recent.iloc[-1]['Close'] > sb['High']
-                bear = all(r['Close'] < r.get('EMA_20', 0) for _, r in recent.iterrows()) and recent.iloc[-1]['Close'] < sb['Low']
-                if bull:
-                    df.loc[df.index[-1], 'Is_Runner'] = True
-                    df.loc[df.index[-1], 'Runner_Type'] = "⚡ SWING BULL"
-                elif bear:
-                    df.loc[df.index[-1], 'Is_Runner'] = True
-                    df.loc[df.index[-1], 'Runner_Type'] = "⚡ SWING BEAR"
-    return df
-
-# =============================================================================
-# MARKET REGIME
-# =============================================================================
-def get_market_regime(nifty_df):
-    if nifty_df.empty or len(nifty_df) < 55: return "UNKNOWN"
-    nd = compute_all_indicators(nifty_df, is_intraday=False)
-    if nd.empty or 'EMA_20' not in nd.columns: return "UNKNOWN"
-    last = nd.iloc[-1]
-    if pd.isna(last.get('EMA_20')) or pd.isna(last.get('EMA_50')): return "UNKNOWN"
-    if last['Close'] > last['EMA_20'] > last['EMA_50']: return "BULL"
-    elif last['Close'] < last['EMA_20'] < last['EMA_50']: return "BEAR"
-    return "CHOPPY"
-
-def get_nifty_rs_series(nifty_df, window=21):
-    if nifty_df.empty or len(nifty_df) < window + 1: return None
-    return nifty_df['Close'].pct_change(window) * 100.0
-
-@st.cache_data(ttl=60)
-def get_nifty_intraday_direction():
-    """
-    Returns real-time intraday NIFTY trend:
-    - BULL_TREND: Nifty up > +0.15% from open and trading above intraday VWAP
-    - BEAR_TREND: Nifty down < -0.15% from open and trading below intraday VWAP
-    - CHOPPY / NEUTRAL
-    """
-    try:
-        df = yf.download("^NSEI", period="1d", interval="5m", progress=False, auto_adjust=True)
-        if df.empty or len(df) < 2:
-            return "CHOPPY", 0.0, "—"
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df['TP'] = (df['High'] + df['Low'] + df['Close']) / 3.0
-        cum_tp_vol = (df['TP'] * df['Volume']).cumsum()
-        cum_vol = df['Volume'].cumsum().replace(0, np.nan)
-        vwap = cum_tp_vol / cum_vol
-        
-        day_open = float(df.iloc[0]['Open'])
-        latest_close = float(df.iloc[-1]['Close'])
-        latest_vwap = float(vwap.iloc[-1]) if not vwap.empty and not pd.isna(vwap.iloc[-1]) else day_open
-        move_pct = ((latest_close - day_open) / day_open) * 100.0 if day_open > 0 else 0.0
-        
-        above_vwap = latest_close >= latest_vwap * 0.999
-        below_vwap = latest_close <= latest_vwap * 1.001
-        
-        if move_pct >= 0.15 and above_vwap:
-            return "BULL_TREND", round(move_pct, 2), f"🟢 Nifty Bull Trend (+{move_pct:.2f}% > VWAP)"
-        elif move_pct <= -0.15 and below_vwap:
-            return "BEAR_TREND", round(move_pct, 2), f"🔴 Nifty Bear Trend ({move_pct:.2f}% < VWAP)"
-        return "CHOPPY", round(move_pct, 2), f"🟡 Nifty Choppy ({move_pct:+.2f}%)"
+                iep = float(m.get("lastPrice") or d.get("IEP") or 0)
+                prev = float(m.get("previousClose") or 0)
+                out[f"{sym}.NS"] = dict(
+                    pre_open=iep, prev_close=prev,
+                    gap_pct=(iep / prev - 1) * 100 if prev else np.nan,
+                    qty=float(d.get("totalTradedVolume") or m.get("finalQuantity") or 0),
+                    atp=float(d.get("atoBuyQty") or 0),
+                )
+            except Exception:
+                continue
     except Exception:
-        return "CHOPPY", 0.0, "—"
+        return {}
+    if out:
+        CACHE.set("preopen", out, 120)
+    return out
+
+def fetch_live_quotes(tickers, interval="5m"):
+    """Latest traded price per ticker. Uses the FIXED column handling."""
+    data = download(tickers, period="1d", interval=interval, ttl=45)
+    out = {}
+    for t, d in data.items():
+        try:
+            c = pd.to_numeric(d["Close"], errors="coerce").dropna()
+            if len(c):
+                out[t] = float(c.iloc[-1])
+        except Exception:
+            continue
+    return out
 
 # =============================================================================
-# CONFLUENCE SCORING (Enhanced with Multi-TF Adaptive Weights & Strict Quality Filters)
+# SHARED DATA BUNDLE
 # =============================================================================
-def compute_confluence_score(df, nifty_rs=None, is_intraday=False, daily_dir=None,
-                              pivots=None, vp=None, mtf_boost=0, window=21, ticker=None):
-    df = df.copy()
-    if 'EMA_20' not in df.columns or 'ATR14' not in df.columns:
-        df['Score'] = np.nan; return df
+def load_bundle(force=False, days="400d", fast=False):
+    """Daily panel + features + pivots + Nifty context for the whole universe."""
+    key = ("bundle", days, fast)
+    if not force:
+        hit = CACHE.get(key)
+        if hit is not None:
+            return hit
+    uni, dead = validated_universe()
+    data = download(uni, period=days, interval="1d", ttl=1800)
+    px = make_panel(data)
+    if not len(px["Close"]):
+        return None
+    F = build_features(px, fast=fast)
+    nfd_raw = download([NIFTY], period=days, interval="1d", ttl=1800).get(NIFTY)
+    nf5_raw = download([NIFTY], period="2d", interval="5m", ttl=90).get(NIFTY)
+    ctx = nifty_context(nf5_raw, nfd_raw)
+    snap = snapshot(F, -1)
+    O, H, L, C = px["Open"], px["High"], px["Low"], px["Close"]
+    prev = dict(pdh=H.iloc[-1].to_dict(), pdl=L.iloc[-1].to_dict(), pdc=C.iloc[-1].to_dict())
+    piv = {}
+    for t in C.columns:
+        try:
+            d = pd.DataFrame({"High": H[t], "Low": L[t], "Close": C[t]}).dropna()
+            piv[t] = pivots_all(d)
+        except Exception:
+            piv[t] = {}
+    b = dict(px=px, F=F, snap=snap, prev=prev, piv=piv, ctx=ctx, dead=dead,
+             universe=list(C.columns), last_date=C.index[-1], nfd=nfd_raw,
+             built_at=get_ist_now().isoformat())
+    CACHE.set(key, b, 900)
+    return b
 
-    # Load adaptive learned weights from performance lab
-    ad_w = load_adaptive_weights()
-    w_trend = ad_w.get("trend_weight", 15.0)
-    w_st = ad_w.get("supertrend_weight", 15.0)
-    w_pivot = ad_w.get("pivot_weight", 15.0)
-    w_vol = ad_w.get("volume_weight", 15.0)
-    w_rsi = ad_w.get("rsi_weight", 10.0)
-    w_macd = ad_w.get("macd_weight", 10.0)
-    w_anchor = ad_w.get("anchor_weight", 10.0)
-    w_rs = ad_w.get("rs_weight", 5.0)
-    w_vp = ad_w.get("vp_weight", 5.0)
-    w_adl = ad_w.get("adl_weight", 5.0)
-    w_mtf = ad_w.get("mtf_weight", 20.0)
+def liquid_names(bundle):
+    return [t for t, f in bundle["snap"].items()
+            if (f.get("turn_ma_cr", 0) or 0) >= CFG["MIN_TURNOVER_CR"]
+            and CFG["MIN_PRICE"] <= (f.get("px") or 0) <= CFG["MAX_PRICE"]]
 
-    # 1. Multi-TF Trend
-    trend_up = (df['Close'] > df['EMA_20']) & (df['EMA_20'] > df['EMA_50'])
-    trend_down = (df['Close'] < df['EMA_20']) & (df['EMA_20'] < df['EMA_50'])
-    trend_score = np.where(trend_up | trend_down, w_trend, w_trend * 0.2)
+def feasible(f, side="L", swing=False):
+    """Can this stock physically travel the objective? Calibrated veto:
+    ATR% below the floor makes a 2% intraday (or 10% weekly) move a fantasy."""
+    a = f.get("atr_pct", np.nan)
+    ad = f.get("adr20", np.nan)
+    if not np.isfinite(a) or not np.isfinite(ad):
+        return False, "no volatility data"
+    if swing:
+        if a < CFG["SWING_MIN_ATR_PCT"]:
+            return False, f"ATR {a:.1f}% < {CFG['SWING_MIN_ATR_PCT']}% (cannot travel 10%)"
+        return True, ""
+    if a < CFG["MIN_ATR_PCT"]:
+        return False, f"ATR {a:.1f}% < {CFG['MIN_ATR_PCT']}%"
+    if ad < CFG["MIN_ADR_PCT"]:
+        return False, f"ADR {ad:.1f}% < {CFG['MIN_ADR_PCT']}%"
+    return True, ""
 
-    # 2. Supertrend alignment
-    if 'ST_Dir' in df.columns:
-        st_up = trend_up & (df['ST_Dir'] == 1)
-        st_down = trend_down & (df['ST_Dir'] == -1)
-        st_score = np.where(st_up | st_down, w_st, np.where(trend_up | trend_down, w_st * 0.33, 0.0))
-    else: st_score = np.full(len(df), w_st * 0.2)
+# =============================================================================
+# POSITION SIZING + ORDER TICKET
+# =============================================================================
+def build_ticket(sym, side, entry, sl_pct, capital, target_pct=None, partial=True):
+    tp = target_pct if target_pct is not None else CFG["TARGET_PCT"]
+    sgn = 1 if side == "BUY" else -1
+    sl = entry * (1 - sgn * sl_pct / 100)
+    t1 = entry * (1 + sgn * CFG["PARTIAL_PCT"] / 100)
+    t2 = entry * (1 + sgn * tp / 100)
+    risk_amt = capital * CFG["RISK_PER_TRADE_PCT"] / 100
+    per_share = abs(entry - sl)
+    qty = int(max(1, risk_amt // per_share)) if per_share > 0 else 0
+    return dict(symbol=sym.replace(".NS", ""), side=side, entry=round(entry, 2),
+                sl=round(sl, 2), sl_pct=round(sl_pct, 2),
+                t1=round(t1, 2), t2=round(t2, 2), target_pct=tp,
+                qty=qty, risk_rs=round(qty * per_share, 0),
+                reward_rs=round(qty * abs(t2 - entry), 0),
+                rr=round(abs(t2 - entry) / per_share, 2) if per_share else 0,
+                partial=partial)
 
-    # 3. Pivot Position
-    pivot_score = np.full(len(df), w_pivot * 0.33)
-    if pivots:
-        p = pivots.get("P", 0)
-        r1 = pivots.get("R1", p); s1 = pivots.get("S1", p)
-        for i in range(len(df)):
-            close = float(df['Close'].iloc[i])
-            # Bullish: price above pivot & trend up
-            if close > p and (trend_up.iloc[i] if hasattr(trend_up, 'iloc') else False):
-                pivot_score[i] = w_pivot if close > r1 else (w_pivot * 0.8)
-            elif close < p and (trend_down.iloc[i] if hasattr(trend_down, 'iloc') else False):
-                pivot_score[i] = w_pivot if close < s1 else (w_pivot * 0.8)
-            elif abs(close - p) / max(p, 1) < 0.003:
-                pivot_score[i] = w_pivot * 0.67  # At pivot — decision zone
+# =============================================================================
+# ENGINE 1 — PRE-MARKET  (run 08:55-09:08). TOP 1 BUY + TOP 1 SELL.
+# Gap logic is INVERTED versus v20 because the data says gaps mean-revert:
+#   P(+2% | gap < -2%) = 60.0%   P(-2% | gap < -2%) = 33.7%
+#   P(-2% | gap > +2%) = 47.8%   P(+2% | gap > +2%) = 41.0%
+# =============================================================================
+GAP_TABLE = [(-99, -2.0, 60.0, 33.7), (-2.0, -1.0, 36.9, 30.2), (-1.0, -0.3, 27.5, 24.4),
+             (-0.3, 0.3, 22.9, 20.9), (0.3, 1.0, 26.1, 27.9), (1.0, 2.0, 30.8, 32.5),
+             (2.0, 99, 41.0, 47.8)]
 
-    # 4. Volume Spike & RVOL (Strict institutional volume requirement)
-    if 'Vol_MA_20' in df.columns:
-        vol_ratio = (df['Volume'] / df['Vol_MA_20'].replace(0, np.nan)).clip(upper=4.0).fillna(0)
-        volume_score = np.where(vol_ratio >= 1.5, w_vol, np.where(vol_ratio >= 1.0, w_vol * 0.53, 0.0))
-    else: volume_score = np.full(len(df), w_vol * 0.2)
+def gap_prior(gap):
+    for lo, hi, pu, pd_ in GAP_TABLE:
+        if lo <= gap < hi:
+            return pu, pd_
+    return 20.7, 22.8
 
-    # 5. RSI Room-to-Run (Strict overbought/oversold penalty)
-    if 'RSI_14' in df.columns:
-        rsi = df['RSI_14'].fillna(50)
-        # BUY/SELL sweet spot 35-65: full pts; 25-68: partial; >68 or <32: penalty
-        rsi_score = np.where((rsi >= 35) & (rsi <= 65), w_rsi,
-                    np.where((rsi >= 25) & (rsi <= 68), w_rsi * 0.5, -10.0))
-    else: rsi_score = np.full(len(df), w_rsi * 0.5)
-
-    # 6. MACD Confirm
-    if 'MACD_Hist' in df.columns:
-        macd_up = trend_up & (df['MACD_Hist'] > 0)
-        macd_down = trend_down & (df['MACD_Hist'] < 0)
-        macd_score = np.where(macd_up | macd_down, w_macd, w_macd * 0.2)
-    else: macd_score = np.full(len(df), w_macd * 0.3)
-
-    # 7. VWAP/EMA Anchor
-    atr_safe = df['ATR14'].replace(0, np.nan).fillna(1)
-    if is_intraday and 'VWAP' in df.columns:
-        vwap_dist = ((df['Close'] - df['VWAP']).abs() / atr_safe).clip(upper=3.0).fillna(3)
-        anchor_score = ((3.0 - vwap_dist) / 3.0 * w_anchor).clip(0, w_anchor)
+def scan_premarket(capital=None, bundle=None, use_nse=True):
+    capital = capital or CFG["DEFAULT_CAPITAL"]
+    b = bundle or load_bundle()
+    if not b:
+        return dict(error="no data")
+    pre = fetch_nse_preopen() if use_nse else {}
+    # A live-but-degenerate feed (all gaps zero/absent) is worse than no feed,
+    # because it silently turns the gap-reversion prior off. Detect and say so.
+    live_gaps = sum(1 for v in pre.values()
+                    if v.get("prev_close") and np.isfinite(v.get("gap_pct", np.nan))
+                    and abs(v["gap_pct"]) > 0.01)
+    if live_gaps < 20:
+        pre, src = {}, ("previous close (NSE pre-open returned no indicative prices — "
+                        "run between 09:00 and 09:08)")
     else:
-        dist = ((df['Close'] - df['EMA_20']).abs() / atr_safe).clip(upper=3.0).fillna(3)
-        anchor_score = ((3.0 - dist) / 3.0 * w_anchor).clip(0, w_anchor)
-
-    # 8. Relative Strength
-    if nifty_rs is not None:
-        stock_ret = df['Close'].pct_change(window) * 100.0
-        rs = (stock_ret - nifty_rs.reindex(df.index).ffill()).clip(-10, 10).fillna(0)
-        rs_score = ((rs + 10) / 20 * w_rs).clip(0, w_rs)
-    else: rs_score = np.full(len(df), w_rs * 0.5)
-
-    # 9. Volume Profile bonus
-    vp_score_val = np.full(len(df), 0.0)
-    if vp and not np.isnan(vp.get("POC", np.nan)):
-        last_price = float(df['Close'].iloc[-1])
-        vp_s = get_vp_context(last_price, vp)
-        vp_score_val[-1] = min(vp_s, w_vp)
-
-    # 10. Institutional ADL confirmation
-    adl_score = np.full(len(df), 0.0)
-    if 'ADL' in df.columns:
-        adl_trend = df['ADL'].diff(5).fillna(0)
-        adl_up = trend_up & (adl_trend > 0)
-        adl_down = trend_down & (adl_trend < 0)
-        adl_score = np.where(adl_up | adl_down, w_adl, 0.0).astype(float)
-
-    # MTF boost
-    mtf_arr = np.full(len(df), 0.0)
-    mtf_arr[-1] = min(mtf_boost, w_mtf)
-
-    # Sector Tailwind Boost
-    sector_boost = np.full(len(df), 0.0)
-    if ticker:
-        sec = get_stock_sector(ticker)
-        top_sectors = ad_w.get("top_sectors", [])
-        if sec in top_sectors[:3]:
-            sector_boost[-1] = 5.0  # +5 pts for strong sector tailwind
-
-    total = (trend_score + st_score + pivot_score + volume_score + rsi_score +
-             macd_score + anchor_score + rs_score + vp_score_val + adl_score + mtf_arr + sector_boost)
-    df['Score'] = pd.Series(total, index=df.index).clip(0, 100)
-    return df
-
-# =============================================================================
-# SIGNAL GENERATION (With First-Candle 0.70% Exhaustion Filter)
-# =============================================================================
-def generate_signals(df, lookback=10, is_intraday=False, rr=2.0, use_orb=False):
-    min_req = 15 if is_intraday else max(50, lookback) + 5
-    if df.empty or len(df) < min_req:
-        for c in ['Bull_Sweep', 'Bear_Sweep', 'Bull_ORB', 'Bear_ORB']: df[c] = False
-        for c in ['Entry', 'SL', 'TP']: df[c] = np.nan
-        df['FC_Pct'] = np.nan; df['FC_Exhausted'] = False
-        return df
-
-    df = compute_all_indicators(df, is_intraday=is_intraday)
-    if df.empty or 'EMA_50' not in df.columns: return df
-
-    df['Prev_Low_L'] = df['Low'].shift(1).rolling(lookback).min()
-    df['Prev_High_H'] = df['High'].shift(1).rolling(lookback).max()
-    df['Bull_Sweep'] = (df['Close'] > df['EMA_50']) & (df['Low'] < df['Prev_Low_L']) & (df['Close'] > df['Prev_Low_L']) & (df['Volume'] > df['Vol_MA_20'])
-    df['Bear_Sweep'] = (df['Close'] < df['EMA_50']) & (df['High'] > df['Prev_High_H']) & (df['Close'] < df['Prev_High_H']) & (df['Volume'] > df['Vol_MA_20'])
-
-    # ORB with strict first-candle 0.70% exhaustion filter
-    df['Bull_ORB'] = False; df['Bear_ORB'] = False; df['FC_Pct'] = np.nan; df['FC_Exhausted'] = False
-    if use_orb and is_intraday:
-        df['DG'] = df.index.date
-        df['ORB_H'] = df.groupby('DG')['High'].transform('first')
-        df['ORB_L'] = df.groupby('DG')['Low'].transform('first')
-        df['ORB_O'] = df.groupby('DG')['Open'].transform('first')
-        df['ORB_C'] = df.groupby('DG')['Close'].transform('first')
-
-        # First candle body % move
-        df['FC_Pct'] = ((df['ORB_C'] - df['ORB_O']).abs() / df['ORB_O'].replace(0, np.nan) * 100)
-        df['FC_Exhausted'] = df['FC_Pct'] > 0.70
-
-        candle_gt_0 = df.groupby('DG').cumcount() > 0
-        # Only trigger ORB if the 1st candle is NOT exhausted (FC_Pct <= 0.70%)
-        df['Bull_ORB'] = candle_gt_0 & (df['Close'] > df['ORB_H']) & (df['Close'].shift(1) <= df['ORB_H']) & (~df['FC_Exhausted'])
-        df['Bear_ORB'] = candle_gt_0 & (df['Close'] < df['ORB_L']) & (df['Close'].shift(1) >= df['ORB_L']) & (~df['FC_Exhausted'])
-        df.drop(columns=['DG', 'ORB_H', 'ORB_L', 'ORB_O', 'ORB_C'], errors='ignore', inplace=True)
-
-    buy_mask = df['Bull_Sweep'] | df['Bull_ORB']
-    sell_mask = df['Bear_Sweep'] | df['Bear_ORB']
-    df['Entry'] = np.nan; df['SL'] = np.nan; df['TP'] = np.nan
-
-    df.loc[buy_mask, 'Entry'] = df.loc[buy_mask, 'High'] * 1.0015
-    df.loc[buy_mask, 'SL'] = df.loc[buy_mask, 'Low'] * 0.995
-    risk_b = df.loc[buy_mask, 'Entry'] - df.loc[buy_mask, 'SL']
-    df.loc[buy_mask, 'TP'] = df.loc[buy_mask, 'Entry'] + risk_b * rr
-
-    df.loc[sell_mask, 'Entry'] = df.loc[sell_mask, 'Low'] * 0.9985
-    df.loc[sell_mask, 'SL'] = df.loc[sell_mask, 'High'] * 1.005
-    risk_s = df.loc[sell_mask, 'SL'] - df.loc[sell_mask, 'Entry']
-    df.loc[sell_mask, 'TP'] = df.loc[sell_mask, 'Entry'] - risk_s * rr
-
-    df.drop(columns=['Prev_Low_L', 'Prev_High_H'], errors='ignore', inplace=True)
-    return df
-
-# =============================================================================
-# POSITION SIZING
-# =============================================================================
-def position_size(capital, risk_pct, entry, stop):
-    risk_amt = capital * (risk_pct / 100.0)
-    per_share = abs(entry - stop)
-    if per_share <= 0 or capital <= 0: return 0, 0.0
-    qty = int(risk_amt // per_share)
-    return qty, qty * entry
-
-# =============================================================================
-# SIGNAL STATUS HELPER
-# =============================================================================
-def get_signal_status(live_price, entry, sl, tp, is_bull):
-    if pd.isna(live_price): return "⏳ Loading", "#6b7294"
-    if is_bull:
-        if live_price >= tp: return "✅ TARGET", "#00ffaa"
-        elif live_price <= sl: return "❌ SL HIT", "#ff3366"
-        elif live_price >= entry: return "🟢 ACTIVE", "#00d4aa"
-        else: return "⏳ PENDING", "#ffaa00"
-    else:
-        if live_price <= tp: return "✅ TARGET", "#00ffaa"
-        elif live_price >= sl: return "❌ SL HIT", "#ff3366"
-        elif live_price <= entry: return "🔴 ACTIVE", "#ff6b6b"
-        else: return "⏳ PENDING", "#ffaa00"
-
-# =============================================================================
-# UNIVERSE SCANNER (Enhanced with Exhaustion Filter, VWAP Fortress & Nifty Intraday Trend)
-# =============================================================================
-def run_scanner(tickers, period, interval, is_intraday, use_orb, rr, min_score,
-                nifty_rs, capital, risk_pct, regime, daily_dirs=None,
-                scan_key="scan", scan_mode="ALL", progress_cb=None):
-    """
-    scan_mode: ALL, RUNNERS_ONLY, TOP5_ONLY, EOD_PLAYBOOK
-    """
+        src = f"NSE pre-open call auction ({live_gaps} names quoting)"
+    names = liquid_names(b)
     rows = []
-    total = len(tickers)
-    bulk_df = fetch_bulk_data(tuple(tickers), period=period, interval=interval)
-
-    # Fetch daily data for pivots
-    daily_bulk = None
-    if is_intraday or scan_mode in ("EOD_PLAYBOOK", "TOP5_ONLY"):
-        daily_bulk = fetch_bulk_data(tuple(tickers), period="6mo", interval="1d")
-
-    # Real-time intraday NIFTY trend check
-    nifty_intra_trend, nifty_intra_pct, _ = get_nifty_intraday_direction() if is_intraday else ("CHOPPY", 0.0, "—")
-
-    for i, ticker in enumerate(tickers):
-        if progress_cb: progress_cb((i + 1) / total)
-
-        df = get_symbol_df(bulk_df, ticker, period, interval, min_len=20 if is_intraday else 50)
-        if df.empty or len(df) < (20 if is_intraday else 50): continue
-
-        df = generate_signals(df, lookback=10, is_intraday=is_intraday, rr=rr, use_orb=use_orb)
-        if df.empty: continue
-
-        dd = daily_dirs.get(ticker, 0) if daily_dirs else None
-
-        # Pivots
-        daily_df = get_symbol_df(daily_bulk, ticker, "6mo", "1d", 30) if daily_bulk is not None else pd.DataFrame()
-        if not daily_df.empty and isinstance(daily_df.columns, pd.MultiIndex):
-            daily_df.columns = daily_df.columns.get_level_values(0)
-        pivots = {}
-        if not daily_df.empty and len(daily_df) >= 30:
-            pivots = compute_weekly_pivot(daily_df) if is_intraday else compute_monthly_pivot(daily_df)
-
-        # Volume Profile
-        vp = compute_volume_profile(df, lookback=20)
-
-        # Multi-TF
-        mtf_boost = 0
-        if dd is not None and dd != 0:
-            latest = df.iloc[-1]
-            local_bull = latest.get('EMA_20', 0) > latest.get('EMA_50', 0)
-            local_bear = latest.get('EMA_20', 0) < latest.get('EMA_50', 0)
-            if (dd == 1 and local_bull) or (dd == -1 and local_bear):
-                mtf_boost = 15  # Daily + scanning TF agree
-            elif (dd == 1 and local_bear) or (dd == -1 and local_bull):
-                mtf_boost = -10  # Conflict
-
-        df = compute_psychology(df, daily_dir=dd, is_intraday=is_intraday)
-        df = detect_one_way_runner(df, is_intraday=is_intraday)
-        df = compute_confluence_score(df, nifty_rs, is_intraday=is_intraday, daily_dir=dd,
-                                      pivots=pivots, vp=vp, mtf_boost=mtf_boost, ticker=ticker)
-
-        if 'Score' not in df.columns: continue
-        latest = df.iloc[-1]
-        bull = bool(latest.get('Bull_Sweep', False)) or bool(latest.get('Bull_ORB', False))
-        bear = bool(latest.get('Bear_Sweep', False)) or bool(latest.get('Bear_ORB', False))
-        is_runner = bool(latest.get('Is_Runner', False))
-
-        if scan_mode == "RUNNERS_ONLY" and not is_runner: continue
-        if scan_mode not in ("EOD_PLAYBOOK", "TOP5_ONLY"):
-            if not (bull or bear) and not is_runner: continue
-
-        # First candle exhaustion filter (Disqualifies >0.70% exhausted open)
-        fc_pct = float(latest.get('FC_Pct', 0)) if not pd.isna(latest.get('FC_Pct', np.nan)) else 0
-        fc_warn = fc_pct > 0.70
-        if is_intraday and fc_warn and scan_mode in ("TOP5_ONLY", "RUNNERS_ONLY"):
-            continue  # Block over-extended opens from leading recommendations
-
-        # Live NIFTY Intraday Direction Filter (Hard-block counter-trend trades)
-        if is_intraday:
-            if nifty_intra_trend == "BULL_TREND" and bear and not is_runner:
-                continue  # Hard-block SELL signals on strong Nifty rally days
-            elif nifty_intra_trend == "BEAR_TREND" and bull and not is_runner:
-                continue  # Hard-block BUY signals on strong Nifty selloff days
-
-        # Intraday VWAP Fortress Check
-        if is_intraday and 'VWAP' in df.columns and not pd.isna(latest.get('VWAP', np.nan)):
-            vwap_val = float(latest['VWAP'])
-            close_val = float(latest['Close'])
-            if bull and close_val < vwap_val * 0.999:
-                continue  # Cannot buy below VWAP
-            if bear and close_val > vwap_val * 1.001:
-                continue  # Cannot sell above VWAP
-
-        # Daily Regime filter
-        if regime not in ("CHOPPY", "UNKNOWN"):
-            is_bull_sig = bull or (not bear and latest.get('EMA_20', 0) > latest.get('EMA_50', 0))
-            if regime == "BULL" and not is_bull_sig: continue
-            if regime == "BEAR" and is_bull_sig: continue
-
-        score = latest.get('Score', 0)
-        if pd.isna(score) or score < min_score: continue
-
-        entry = latest.get('Entry', np.nan); sl = latest.get('SL', np.nan); tp = latest.get('TP', np.nan)
-        if pd.isna(entry) or pd.isna(sl):
-            atr_v = latest.get('ATR14', latest['Close'] * 0.02)
-            is_up = latest.get('EMA_20', 0) > latest.get('EMA_50', 0)
-            entry = latest['Close']
-            sl = entry - atr_v if is_up else entry + atr_v
-            tp = entry + atr_v * rr if is_up else entry - atr_v * rr
-
-        qty, dep = position_size(capital, risk_pct, entry, sl)
-        sig_time = latest.name.strftime('%Y-%m-%d %H:%M') if hasattr(latest.name, 'strftime') else str(latest.name)
-        scan_time = get_ist_now().strftime('%Y-%m-%d %H:%M')
-
-        # Setup label
-        if is_runner: setup = latest.get('Runner_Type', 'RUNNER')
-        elif bull: setup = '🟢 BUY'
-        elif bear: setup = '🔴 SELL'
-        else: setup = '🟢 BUY' if latest.get('EMA_20', 0) > latest.get('EMA_50', 0) else '🔴 SELL'
-
-        # Pivot context
-        piv_label, piv_type = get_pivot_context(float(latest['Close']), pivots) if pivots else ("—", "unknown")
-
-        # VP context
-        vp_poc = vp.get("POC", 0) if vp else 0
-
-        rows.append({
-            'Symbol': ticker.replace('.NS', ''), 'Setup': setup,
-            'Psychology': latest.get('Psychology', '—'),
-            'Score': int(round(score)), 'LTP': round(float(latest['Close']), 2),
-            'Entry': round(float(entry), 2), 'SL': round(float(sl), 2),
-            'TP': round(float(tp), 2), 'Qty': qty, 'RR': rr,
-            'RSI': round(float(latest.get('RSI_14', 0)), 1) if not pd.isna(latest.get('RSI_14')) else 0,
-            'MACD_H': round(float(latest.get('MACD_Hist', 0)), 2) if not pd.isna(latest.get('MACD_Hist')) else 0,
-            'ST': int(latest.get('ST_Dir', 0)),
-            'Vol_Ratio': round(float(latest['Volume'] / latest.get('Vol_MA_20', 1)), 1) if latest.get('Vol_MA_20', 0) > 0 else 0,
-            'Pivot': piv_label, 'Pivot_Type': piv_type,
-            'VP_POC': round(vp_poc, 2),
-            'FC_Warn': fc_warn, 'FC_Pct': round(fc_pct, 2),
-            'Signal_Time': sig_time, 'Scan_Time': scan_time,
-            'Status': '⏳ ACTIVE', 'Outcome_Time': '—',
-            'Capital': round(dep, 0), 'Is_Runner': is_runner,
-            'Sector': get_stock_sector(ticker)
-        })
-
-    if scan_mode in ("TOP5_ONLY", "EOD_PLAYBOOK"):
-        rows = sorted(rows, key=lambda x: x['Score'], reverse=True)[:5]
-
-    # Persist to disk
-    if rows:
-        save_session_results(scan_key, rows)
-
-    return rows
+    for t in names:
+        f = dict(b["snap"][t])
+        pdc = b["prev"]["pdc"].get(t)
+        pdh, pdl = b["prev"]["pdh"].get(t), b["prev"]["pdl"].get(t)
+        if not pdc:
+            continue
+        q = pre.get(t)
+        gap = float(q["gap_pct"]) if q and np.isfinite(q.get("gap_pct", np.nan)) else 0.0
+        exp_open = float(q["pre_open"]) if q and q.get("pre_open") else pdc
+        okL, whyL = feasible(f, "L")
+        pu, pdn = gap_prior(gap)
+        atrp = f.get("atr_pct", 0) or 0
+        adr = f.get("adr20", 0) or 0
+        # capability score: how routinely this name travels 2%+
+        cap = (min(atrp / 3.0, 1.5) * 0.35 + min(adr / 3.5, 1.5) * 0.25
+               + min((f.get("big_moves_20", 0) or 0) / 8.0, 1.2) * 0.20
+               + min((f.get("vol20", 0) or 0) / 3.0, 1.5) * 0.10
+               + min((f.get("rvol", 0) or 0) / 2.0, 1.5) * 0.10)
+        # direction tilt: gap-reversion prior (dominant) + trend alignment (minor)
+        tilt_up = (pu - pdn) / 10.0
+        trend = 0.35 * (f.get("st_dir", 0) or 0) + 0.02 * (f.get("px_vs_e20", 0) or 0)
+        pivots = b["piv"].get(t, {})
+        pctx = pivot_context(exp_open, pivots) if pivots else {"nearest_res": None, "nearest_sup": None}
+        room_up = (pctx["nearest_res"][1] / exp_open - 1) * 100 if pctx.get("nearest_res") else 5.0
+        room_dn = (1 - pctx["nearest_sup"][1] / exp_open) * 100 if pctx.get("nearest_sup") else 5.0
+        sL = cap * 10 + tilt_up + trend + min(room_up, 4.0) * 0.25
+        sS = cap * 10 - tilt_up - trend + min(room_dn, 4.0) * 0.25
+        rows.append(dict(ticker=t, sym=t.replace(".NS", ""), sector=sector_of(t),
+                         exp_open=exp_open, prev_close=pdc, gap=gap,
+                         atr_pct=atrp, adr20=adr, rvol=f.get("rvol"),
+                         big20=f.get("big_moves_20"), turn=f.get("turn_ma_cr"),
+                         p_up=pu, p_dn=pdn, cap=cap, score_L=sL, score_S=sS,
+                         feasible=okL, why=whyL, pdh=pdh, pdl=pdl,
+                         room_up=room_up, room_dn=room_dn,
+                         near_res=pctx.get("nearest_res"), near_sup=pctx.get("nearest_sup"),
+                         st_dir=f.get("st_dir"), rsi=f.get("rsi"), adx=f.get("adx")))
+    D = pd.DataFrame(rows)
+    if D.empty:
+        return dict(error="no candidates")
+    D = D[D.feasible]
+    longs = D.sort_values("score_L", ascending=False).head(8)
+    # The same high-ATR name can top both lists when gaps are flat; never show
+    # one symbol as both the buy and the sell of the day.
+    top_long = longs.ticker.iloc[0] if len(longs) else None
+    shorts = D[D.ticker != top_long].sort_values("score_S", ascending=False).head(8)
+    out = dict(source=src, ts=get_ist_now().isoformat(), regime=b["ctx"]["regime"],
+               n_candidates=int(len(D)), longs=[], shorts=[], table=D)
+    for _, r in longs.iterrows():
+        entry_hint = r.exp_open * (1 + min(r.atr_pct * 0.12, 0.45) / 100)
+        out["longs"].append(dict(row=r.to_dict(),
+                                 ticket=build_ticket(r.ticker, "BUY", entry_hint,
+                                                     CFG["SL_CAP_PCT"], capital)))
+    for _, r in shorts.iterrows():
+        entry_hint = r.exp_open * (1 - min(r.atr_pct * 0.12, 0.45) / 100)
+        out["shorts"].append(dict(row=r.to_dict(),
+                                  ticket=build_ticket(r.ticker, "SELL", entry_hint,
+                                                      CFG["SL_CAP_PCT"], capital)))
+    save_scan("premarket", out)
+    return out
 
 # =============================================================================
-# DAILY SUPERTREND DIRECTIONS (Internal Helper)
+# ENGINE 2 — LIVE 5-MIN ORB  (09:20 onward). The money engine.
+# Close-confirmed break + capped stop + model ranking.
 # =============================================================================
-def _get_daily_st_directions_internal(tickers):
-    dirs = {}
-    try:
-        bulk = fetch_bulk_data(tuple(tickers), period="6mo", interval="1d")
-        for t in tickers:
-            d = get_symbol_df(bulk, t, "6mo", "1d", min_len=30)
-            if d.empty or len(d) < 30: dirs[t] = 0; continue
-            d = compute_supertrend(d.copy(), period=10, multiplier=2.0)
-            last_d = d['ST_Dir'].dropna()
-            dirs[t] = int(last_d.iloc[-1]) if not last_d.empty else 0
-    except Exception: pass
-    return dirs
-
-# =============================================================================
-# PRE-MARKET HERO SCANNER (Quantitative Top Runner Engine & Session Lock-in)
-# =============================================================================
-@st.cache_data(ttl=120)
-def scan_heroes(tickers_tuple):
-    """
-    Quantitative Pre-Market 09:08 AM Runner Engine:
-    Identifies high-probability Top 3 Gainers / Losers and One-Way ORB Runners
-    by analyzing:
-    1. Pre-Open Gap Velocity & Breakout Geometry (PDH/PDL Breakout, Pivot R1/S1 Launch, 20D Channel Breakout)
-    2. Real-Time Sector Surge Confluence across 15 F&O Sectors
-    3. High-Beta / Volatility Expansion Potential (ATR % >= 2.0%)
-    4. Multi-Timeframe Supertrend & EMA Alignment (9/20/50)
-    5. Prior Day Institutional Accumulation (Volume Surge & Positive ADL)
-    """
-    tickers = list(tickers_tuple)
-    now_t = get_ist_now().time()
-    
-    medals = ["🥇 #1 HERO", "🥈 #2 HERO", "🥉 #3 HERO"]
-    
-    # 1. If past 09:15 AM, check if we already have locked heroes for today
-    locked_heroes, _ = load_premarket_heroes()
-    if locked_heroes and locked_heroes[0] and now_t >= dtime(9, 15):
-        hl, hs, bh, sh = locked_heroes
-        for idx, b in enumerate(bh):
-            if isinstance(b, dict) and 'Rank' not in b: b['Rank'] = medals[idx] if idx < 3 else "•"
-        for idx, s in enumerate(sh):
-            if isinstance(s, dict) and 'Rank' not in s: s['Rank'] = medals[idx] if idx < 3 else "•"
-        return hl, hs, bh, sh
-
-    bulk = fetch_bulk_data(tuple(tickers), period="6mo", interval="1d")
-    
-    # Pass 1: Collect stock metrics and calculate sector pre-open momentum
-    sector_gaps = {}
-    stock_metrics = {}
-    
-    for t in tickers:
-        d = get_symbol_df(bulk, t, "6mo", "1d", min_len=30)
-        if d.empty or len(d) < 25: continue
-        if isinstance(d.columns, pd.MultiIndex): d.columns = d.columns.get_level_values(0)
-        
-        yc = float(d['Close'].iloc[-2])
-        to = float(d['Open'].iloc[-1])
-        tv = float(d['Volume'].iloc[-1])
-        gp = ((to - yc) / yc) * 100.0 if yc > 0 else 0.0
-        sec = get_stock_sector(t)
-        
-        if sec not in sector_gaps: sector_gaps[sec] = []
-        sector_gaps[sec].append(gp)
-        
-        stock_metrics[t] = {
-            "df": d, "yc": yc, "to": to, "tv": tv, "gp": gp, "sec": sec
-        }
-        
-    # Calculate Sector Average Gap Momentum
-    sector_avg_momentum = {}
-    for sec, g_list in sector_gaps.items():
-        sector_avg_momentum[sec] = float(np.mean(g_list)) if g_list else 0.0
-        
-    sorted_sectors_bull = sorted(sector_avg_momentum.items(), key=lambda x: x[1], reverse=True)
-    sorted_sectors_bear = sorted(sector_avg_momentum.items(), key=lambda x: x[1])
-    top_bull_sectors = [s[0] for s in sorted_sectors_bull[:3]] if sorted_sectors_bull else []
-    top_bear_sectors = [s[0] for s in sorted_sectors_bear[:3]] if sorted_sectors_bear else []
-    
-    candidates_bull = []
-    candidates_bear = []
-    
-    for t, m in stock_metrics.items():
-        d = m["df"]
-        yc = m["yc"]
-        to = m["to"]
-        tv = m["tv"]
-        gp = m["gp"]
-        sec = m["sec"]
-        
-        # Indicator analysis
-        d_ind = compute_all_indicators(d.copy(), is_intraday=False)
-        d_ind = compute_supertrend(d_ind, period=10, multiplier=2.0)
-        if d_ind.empty or 'EMA_20' not in d_ind.columns or 'ATR14' not in d_ind.columns: continue
-        
-        prev = d_ind.iloc[-2]
-        
-        pdh = float(prev['High'])
-        pdl = float(prev['Low'])
-        pdo = float(prev['Open'])
-        pdc = float(prev['Close'])
-        pd_vol = float(prev['Volume'])
-        vol_ma20 = float(prev.get('Vol_MA_20', 1))
-        
-        high_20d = float(d_ind['High'].iloc[-22:-2].max()) if len(d_ind) >= 22 else pdh
-        low_20d = float(d_ind['Low'].iloc[-22:-2].min()) if len(d_ind) >= 22 else pdl
-        
-        atr14 = float(prev.get('ATR14', yc * 0.02))
-        atr_pct = (atr14 / yc) * 100.0 if yc > 0 else 2.0
-        
-        st_dir = int(prev.get('ST_Dir', 0))
-        ema20 = float(prev.get('EMA_20', yc))
-        ema50 = float(prev.get('EMA_50', yc))
-        rsi = float(prev.get('RSI_14', 50))
-        
-        pivots = compute_weekly_pivot(d_ind)
-        weekly_r1 = float(pivots.get('R1', pdh))
-        weekly_s1 = float(pivots.get('S1', pdl))
-        
-        mc = (to * tv) / 1e7
-        
-        # ────────── BULL RUNNER SCORING ──────────
-        if gp >= 0.15:
-            bull_score = 0
-            setup_badges = []
-            
-            # 1. Breakout Geometry
-            if to >= pdh * 0.998:
-                bull_score += 25
-                setup_badges.append("🔥 PDH Breakout")
-            if to >= weekly_r1 * 0.998:
-                bull_score += 20
-                setup_badges.append("🚀 Weekly R1 Launch")
-            if to >= high_20d * 0.998:
-                bull_score += 20
-                setup_badges.append("💎 20D Channel High")
-                
-            # 2. Gap Velocity (Sweet Spot: 0.6% to 3.8%)
-            if 0.60 <= gp <= 3.80:
-                bull_score += 25
-            elif 0.25 <= gp < 0.60:
-                bull_score += 15
-            elif gp > 3.80:
-                bull_score += 10
-                
-            # 3. High-Beta / Volatility Expansion Potential (ATR %)
-            if atr_pct >= 2.5:
-                bull_score += 15
-                setup_badges.append("⚡ High Beta")
-            elif atr_pct >= 1.8:
-                bull_score += 10
-            elif atr_pct < 1.0:
-                bull_score -= 15
-                
-            # 4. Multi-Timeframe Trend & Supertrend
-            if st_dir == 1:
-                bull_score += 15
-            if pdc > ema20 > ema50 or (pdc > ema20):
-                bull_score += 10
-            if 48 <= rsi <= 68:
-                bull_score += 10
-                
-            # 5. Prior Day Accumulation Footprint
-            if pdc > pdo and ((pdh - pdc) / (pdh - pdl + 1e-5)) < 0.35:
-                bull_score += 10
-            if pd_vol > vol_ma20 * 1.1:
-                bull_score += 10
-                
-            # 6. Sector Surge Confluence
-            if top_bull_sectors and sec == top_bull_sectors[0]:
-                bull_score += 20
-                setup_badges.append(f"🌊 Top Sector ({sec})")
-            elif sec in top_bull_sectors:
-                bull_score += 12
-                setup_badges.append(f"🌊 Sector Surge ({sec})")
-                
-            conf = "🥇 ELITE" if bull_score >= 80 else ("🥈 HIGH" if bull_score >= 60 else "🥉 MODERATE")
-            
-            entry = round(to * 1.0015, 2)
-            sl = round(max(to - (1.0 * atr14), pdl * 0.998), 2)
-            risk = max(entry - sl, to * 0.005)
-            tp = round(entry + 2.0 * risk, 2)
-            
-            candidates_bull.append({
-                'Symbol': t.replace('.NS', ''), 'Ticker': t, 'Gap': gp, 'Money': mc,
-                'LTP': to, 'Conf': conf, 'Score': bull_score, 'ATR_Pct': round(atr_pct, 2),
-                'ST_Dir': st_dir, 'RSI': round(rsi, 1), 'Sector': sec,
-                'Setup': " • ".join(setup_badges[:2]) if setup_badges else "🟢 Momentum Breakout",
-                'Entry': entry, 'SL': sl, 'TP': tp, 'RR': 2.0,
-                'PDH': round(pdh, 2), 'Weekly_R1': round(weekly_r1, 2)
-            })
-            
-        # ────────── BEAR RUNNER SCORING ──────────
-        if gp <= -0.15:
-            bear_score = 0
-            setup_badges_bear = []
-            
-            # 1. Breakdown Geometry
-            if to <= pdl * 1.002:
-                bear_score += 25
-                setup_badges_bear.append("🩸 PDL Breakdown")
-            if to <= weekly_s1 * 1.002:
-                bear_score += 20
-                setup_badges_bear.append("🔻 Weekly S1 Breakdown")
-            if to <= low_20d * 1.002:
-                bear_score += 20
-                setup_badges_bear.append("💎 20D Channel Low")
-                
-            # 2. Gap Velocity (Sweet Spot: -0.6% to -3.8%)
-            if -3.80 <= gp <= -0.60:
-                bear_score += 25
-            elif -0.60 < gp <= -0.25:
-                bear_score += 15
-            elif gp < -3.80:
-                bear_score += 10
-                
-            # 3. High-Beta / Volatility Expansion Potential (ATR %)
-            if atr_pct >= 2.5:
-                bear_score += 15
-                setup_badges_bear.append("⚡ High Beta")
-            elif atr_pct >= 1.8:
-                bear_score += 10
-            elif atr_pct < 1.0:
-                bear_score -= 15
-                
-            # 4. Multi-Timeframe Trend & Supertrend
-            if st_dir == -1:
-                bear_score += 15
-            if pdc < ema20 < ema50 or (pdc < ema20):
-                bear_score += 10
-            if 30 <= rsi <= 52:
-                bear_score += 10
-                
-            # 5. Prior Day Distribution Footprint
-            if pdc < pdo and ((pdc - pdl) / (pdh - pdl + 1e-5)) < 0.35:
-                bear_score += 10
-            if pd_vol > vol_ma20 * 1.1:
-                bear_score += 10
-                
-            # 6. Sector Lag Confluence
-            if top_bear_sectors and sec == top_bear_sectors[0]:
-                bear_score += 20
-                setup_badges_bear.append(f"🌊 Top Lagging ({sec})")
-            elif sec in top_bear_sectors:
-                bear_score += 12
-                setup_badges_bear.append(f"🌊 Sector Drag ({sec})")
-                
-            conf = "🥇 ELITE" if bear_score >= 80 else ("🥈 HIGH" if bear_score >= 60 else "🥉 MODERATE")
-            
-            entry = round(to * 0.9985, 2)
-            sl = round(min(to + (1.0 * atr14), pdh * 1.002), 2)
-            risk = max(sl - entry, to * 0.005)
-            tp = round(entry - 2.0 * risk, 2)
-            
-            candidates_bear.append({
-                'Symbol': t.replace('.NS', ''), 'Ticker': t, 'Gap': gp, 'Money': mc,
-                'LTP': to, 'Conf': conf, 'Score': bear_score, 'ATR_Pct': round(atr_pct, 2),
-                'ST_Dir': st_dir, 'RSI': round(rsi, 1), 'Sector': sec,
-                'Setup': " • ".join(setup_badges_bear[:2]) if setup_badges_bear else "🔴 Momentum Breakdown",
-                'Entry': entry, 'SL': sl, 'TP': tp, 'RR': 2.0,
-                'PDL': round(pdl, 2), 'Weekly_S1': round(weekly_s1, 2)
-            })
-
-    # Rank and select Top 3 Bull & Top 3 Bear Heroes
-    top_3_bulls = sorted(candidates_bull, key=lambda x: (x['Score'], x['ATR_Pct'], x['Gap']), reverse=True)[:3]
-    top_3_bears = sorted(candidates_bear, key=lambda x: (x['Score'], x['ATR_Pct'], -x['Gap']), reverse=True)[:3]
-    
-    # Assign medal badges to top 3
-    medals = ["🥇 #1 HERO", "🥈 #2 HERO", "🥉 #3 HERO"]
-    for idx, b in enumerate(top_3_bulls):
-        b['Rank'] = medals[idx] if idx < len(medals) else "•"
-    for idx, b in enumerate(top_3_bears):
-        b['Rank'] = medals[idx] if idx < len(medals) else "•"
-
-    hero_long = top_3_bulls[0] if top_3_bulls else None
-    hero_short = top_3_bears[0] if top_3_bears else None
-    
-    # Permanently lock heroes into disk once computed (at 09:08 AM or on first scan)
-    if top_3_bulls or top_3_bears:
-        if now_t >= dtime(9, 8) or not locked_heroes or not locked_heroes[0]:
-            save_premarket_heroes({
-                "hero_long": hero_long, "hero_short": hero_short,
-                "bull_heroes": top_3_bulls, "bear_heroes": top_3_bears
-            })
-
-    return hero_long, hero_short, top_3_bulls, top_3_bears
-
-# =============================================================================
-# BACKGROUND SCAN THREADING (True Non-Blocking)
-# =============================================================================
-def start_background_scan(scan_key, tickers, period, interval, is_intraday, use_orb,
-                           rr, min_score, nifty_rs, capital, risk_pct, regime,
-                           scan_mode):
-    """Launch scan in background thread — instant return, zero main thread block"""
-
-    def worker():
+def scan_live_orb(capital=None, bundle=None, watch=None, orb_minutes=None):
+    capital = capital or CFG["DEFAULT_CAPITAL"]
+    om = orb_minutes or CFG["ORB_MINUTES"]
+    b = bundle or load_bundle()
+    if not b:
+        return dict(error="no data")
+    names = watch or liquid_names(b)
+    names = [t for t in names if feasible(b["snap"].get(t, {}), "L")[0]]
+    intraday = download(names, period="1d", interval="5m", ttl=45)
+    nf5 = download([NIFTY], period="1d", interval="5m", ttl=45).get(NIFTY)
+    nfctx = nifty_context(nf5, b["nfd"])
+    today = get_ist_now().date()
+    cands = []
+    for t, d in intraday.items():
         try:
-            write_scan_status(scan_key, "running", 0.05)
+            g = d.copy()
+            g.index = pd.DatetimeIndex(g.index)
+            if g.index.tz is not None:
+                g.index = g.index.tz_convert(IST)
+            g = g[g.index.date == today]
+            g = g[(g.index.time >= MKT_OPEN) & (g.index.time <= MKT_CLOSE)]
+            if len(g) < 1:
+                continue
+            orb = orb_from_bars(g, om)
+            if not orb:
+                continue
+            base = b["snap"].get(t, {})
+            pdh, pdl = b["prev"]["pdh"].get(t), b["prev"]["pdl"].get(t)
+            pdc = b["prev"]["pdc"].get(t)
+            for side, mdl, minp in (("L", MODEL_L, CFG["MIN_P_LONG"]),
+                                    ("S", MODEL_S, CFG["MIN_P_SHORT"])):
+                if not orb[f"{side}_trig"] or mdl is None:
+                    continue
+                fv = orb_model_features(base, orb, pdh, pdl, pdc, nfctx, side)
+                p = mdl.prob(fv)
+                entry = orb["orb_h"] if side == "L" else orb["orb_l"]
+                conf_entry = orb[f"{side}_entry"]        # actual confirmed close
+                opp = orb["orb_l"] if side == "L" else orb["orb_h"]
+                sl_pct = float(np.clip(abs(conf_entry - opp) / conf_entry * 100,
+                                       CFG["SL_FLOOR_PCT"], CFG["SL_CAP_PCT"]))
+                trig_min = orb[f"{side}_trig_min"]
+                moved = ((orb["last"] / conf_entry - 1) * 100) * (1 if side == "L" else -1)
+                cands.append(dict(
+                    ticker=t, sym=t.replace(".NS", ""), sector=sector_of(t),
+                    side="BUY" if side == "L" else "SELL", p=p, prob_pct=p * 100,
+                    orb_h=orb["orb_h"], orb_l=orb["orb_l"], orb_range_pct=orb["orb_range_pct"],
+                    entry=conf_entry, level=entry, sl_pct=sl_pct, trig_min=trig_min,
+                    trig_time=orb[f"{side}_trig_time"], last=orb["last"], moved=moved,
+                    gap=fv.get("gap_today"), atr_pct=base.get("atr_pct"),
+                    adr20=base.get("adr20"), rvol=base.get("rvol"),
+                    fc_vol_share=orb["fc_vol_share"], turn=base.get("turn_ma_cr"),
+                    still_valid=bool(moved < CFG["TARGET_PCT"] * 0.6 and moved > -sl_pct),
+                    drivers=mdl.top_drivers(fv, 4),
+                    ticket=build_ticket(t, "BUY" if side == "L" else "SELL",
+                                        conf_entry, sl_pct, capital),
+                    low_conf=(side == "S"),
+                    passed_p=bool(p >= minp),
+                ))
+        except Exception:
+            continue
+    D = pd.DataFrame(cands)
+    out = dict(ts=get_ist_now().isoformat(), regime=nfctx["regime"], nfctx=nfctx,
+               orb_minutes=om, n_triggers=int(len(D)), table=D, actionable=[])
+    if not D.empty:
+        act = D[(D.passed_p) & (D.still_valid)].copy()
+        act = act.sort_values(["p"], ascending=False).head(CFG["MAX_TRADES_DAY"] * 2)
+        out["actionable"] = act.to_dict("records")
+        out["all_ranked"] = D.sort_values("p", ascending=False).to_dict("records")
+    save_scan("live_orb", out)
+    return out
 
-            # Compute daily directions inside worker thread
-            daily_dirs = _get_daily_st_directions_internal(tickers)
-            write_scan_status(scan_key, "running", 0.15)
+# =============================================================================
+# ENGINE 3 — EOD  (after 15:40). TOP 5 for tomorrow, with tomorrow's plan.
+# =============================================================================
+def scan_eod(capital=None, bundle=None, top_n=5):
+    capital = capital or CFG["DEFAULT_CAPITAL"]
+    b = bundle or load_bundle()
+    if not b:
+        return dict(error="no data")
+    names = liquid_names(b)
+    rows = []
+    for t in names:
+        f = b["snap"][t]
+        ok, why = feasible(f, "L")
+        if not ok:
+            continue
+        atrp = f.get("atr_pct", 0) or 0
+        # Expected-move engine: probability the name travels >=2% intraday tomorrow.
+        # Weights are the empirical top-quintile lifts from the study, normalised.
+        z = (0.34 * min(atrp / 3.0, 2.0)
+             + 0.26 * min((f.get("adr20", 0) or 0) / 3.5, 2.0)
+             + 0.18 * min((f.get("vol20", 0) or 0) / 3.0, 2.0)
+             + 0.12 * min((f.get("big_moves_60", 0) or 0) / 12.0, 2.0)
+             + 0.10 * min((f.get("bbw", 0) or 0) / 15.0, 2.0))
+        p_move = float(np.clip(0.207 * (0.45 + 0.55 * z / 0.9), 0.05, 0.75))
+        rows.append(dict(ticker=t, sym=t.replace(".NS", ""), sector=sector_of(t),
+                         close=f.get("px"), atr_pct=atrp, adr20=f.get("adr20"),
+                         vol20=f.get("vol20"), big20=f.get("big_moves_20"),
+                         big60=f.get("big_moves_60"), bbw=f.get("bbw"),
+                         bbw_pctile=(f.get("bbw_pctile") or 0) * 100,
+                         rvol=f.get("rvol"), rsi=f.get("rsi"), adx=f.get("adx"),
+                         st_dir=f.get("st_dir"), d_hi20=f.get("d_hi20"),
+                         d_lo20=f.get("d_lo20"), ret1=f.get("ret1"), ret5=f.get("ret5"),
+                         ret21=f.get("ret21"), rs21=f.get("rs21"),
+                         turn=f.get("turn_ma_cr"), expansion_score=z, p_move2=p_move * 100,
+                         pdh=b["prev"]["pdh"].get(t), pdl=b["prev"]["pdl"].get(t),
+                         pivots=b["piv"].get(t, {})))
+    D = pd.DataFrame(rows)
+    if D.empty:
+        return dict(error="no candidates")
+    D = D.sort_values("expansion_score", ascending=False)
+    # sector cap: never fill the top-5 with one sector
+    picks, seen = [], defaultdict(int)
+    for _, r in D.iterrows():
+        if seen[r.sector] >= 2:
+            continue
+        seen[r.sector] += 1
+        picks.append(r)
+        if len(picks) >= top_n:
+            break
+    plan = []
+    for r in picks:
+        piv = r.pivots or {}
+        d = piv.get("D", {})
+        plan.append(dict(row=r.to_dict(), pivot_D=d, pivot_W=piv.get("W", {}), pivot_M=piv.get("M", {}),
+                         note=("Trade the 5-min ORB in EITHER direction. Long above the 5-min high, "
+                               "short below the 5-min low, whichever closes first. "
+                               f"Cap risk at {CFG['SL_CAP_PCT']}%.")))
+    out = dict(ts=get_ist_now().isoformat(), for_date=str(next_trading_day()),
+               regime=b["ctx"]["regime"], top=plan, table=D, n=len(D))
+    save_scan("eod", out)
+    return out
 
-            def progress_cb(p):
-                # Scale progress from 15% to 95%
-                write_scan_status(scan_key, "running", 0.15 + (p * 0.80))
+# =============================================================================
+# ENGINE 4 — SWING  (Friday EOD / weekend). LONG ONLY. Monday 1h-ORB entry.
+# Calibration (3y of 60-min bars, 133 weeks, strict time split):
+#   P(+10% before -5% stop) unconditional = 2.2%  -> top-3 ranked = 11.1%
+#   P(+7%)  = 6.2% -> top-3 = 19.8%      P(+5%) = 12.8% -> top-3 = 27.2%
+#   Best expectancy: target +7%, stop -5%, k=3  ->  +0.98%/trade, 54.5% wins
+#   The 1h-ORB-LOW stop is too tight (median -1.55%): use a flat -5%.
+# So: the ladder is +3% / +5% / +10%, stop -5%. 10% is the runner, not the plan.
+# =============================================================================
+def scan_swing(capital=None, bundle=None, top_n=None):
+    capital = capital or CFG["DEFAULT_CAPITAL"]
+    top_n = top_n or CFG["SWING_TOP_N"]
+    b = bundle or load_bundle(days="500d")
+    if not b:
+        return dict(error="no data")
+    px, F = b["px"], b["F"]
+    ex = swing_extras(px, F)
+    if not ex:
+        return dict(error="not enough history for weekly features")
+    names = liquid_names(b)
+    rows = []
+    for t in names:
+        f = dict(b["snap"][t])
+        ok, why = feasible(f, "L", swing=True)
+        for k, v in ex.items():
+            if k.startswith("_"):
+                continue
+            try:
+                f[k] = float(v.get(t, np.nan)) if hasattr(v, "get") else np.nan
+            except Exception:
+                f[k] = np.nan
+        p = MODEL_SW.prob(f) if MODEL_SW else np.nan
+        piv = b["piv"].get(t, {})
+        rows.append(dict(ticker=t, sym=t.replace(".NS", ""), sector=sector_of(t),
+                         close=f.get("px"), p=p, prob_pct=(p or 0) * 100,
+                         atr_pct=f.get("atr_pct"), adr20=f.get("adr20"),
+                         feasible=ok, why=why,
+                         prev_wk_ret=f.get("prev_wk_ret"), w_rsi=f.get("w_rsi"),
+                         piv_pos=f.get("piv_pos"), above_P=f.get("above_P"),
+                         d_hi52=f.get("d_hi52r"), rs21=f.get("rs21"),
+                         big60=f.get("big_moves_60"), turn=f.get("turn_ma_cr"),
+                         sec_mom4=f.get("sec_mom4"), st_dir=f.get("st_dir"),
+                         pivots=piv, drivers=MODEL_SW.top_drivers(f, 5) if MODEL_SW else []))
+    D = pd.DataFrame(rows)
+    if D.empty:
+        return dict(error="no candidates")
+    D = D[D.feasible].sort_values("p", ascending=False)
+    picks, seen = [], defaultdict(int)
+    for _, r in D.iterrows():
+        if seen[r.sector] >= 1:
+            continue
+        seen[r.sector] += 1
+        picks.append(r)
+        if len(picks) >= top_n:
+            break
+    plan = []
+    for r in picks:
+        ent_hint = r.close
+        tk = build_ticket(r.ticker, "BUY", ent_hint, CFG["SWING_SL_PCT"], capital,
+                          target_pct=CFG["SWING_TARGET_PCT"], partial=True)
+        tk["ladder"] = [dict(pct=3.0, px=round(ent_hint * 1.03, 2), book="33%"),
+                        dict(pct=5.0, px=round(ent_hint * 1.05, 2), book="33%"),
+                        dict(pct=10.0, px=round(ent_hint * 1.10, 2), book="rest")]
+        plan.append(dict(row=r.to_dict(), ticket=tk, pivots=r.pivots))
+    out = dict(ts=get_ist_now().isoformat(), for_week=str(next_trading_day()),
+               regime=b["ctx"]["regime"], top=plan, table=D,
+               entry_rule=("MONDAY: wait for the first 60-minute candle (09:15-10:15) to complete. "
+                           "Place a BUY stop-limit just above that candle's HIGH. "
+                           "Stop -5% from entry (NOT the ORB low - too tight). "
+                           "Book 33% at +3%, 33% at +5%, trail the rest for +10%."))
+    save_scan("swing", out)
+    return out
 
-            results = run_scanner(
-                tickers, period, interval, is_intraday, use_orb, rr, min_score,
-                nifty_rs, capital, risk_pct, regime, daily_dirs,
-                scan_key=scan_key, scan_mode=scan_mode, progress_cb=progress_cb
-            )
-            save_session_results(scan_key, results)
-            write_scan_status(scan_key, "complete", 1.0)
+# =============================================================================
+# STORAGE
+# =============================================================================
+def _json_safe(o):
+    if isinstance(o, dict):
+        return {str(k): _json_safe(v) for k, v in o.items() if not isinstance(v, pd.DataFrame)}
+    if isinstance(o, (list, tuple)):
+        return [_json_safe(v) for v in o]
+    if isinstance(o, (np.integer,)):
+        return int(o)
+    if isinstance(o, (np.floating,)):
+        return None if not np.isfinite(o) else float(o)
+    if isinstance(o, (pd.Timestamp, datetime, date)):
+        return str(o)
+    if isinstance(o, (np.bool_,)):
+        return bool(o)
+    if isinstance(o, float) and not np.isfinite(o):
+        return None
+    return o
+
+def save_scan(kind, payload):
+    try:
+        d = session_date().strftime("%Y-%m-%d")
+        p = os.path.join(DIRS["scans"], f"{d}_{kind}.json")
+        body = _json_safe({k: v for k, v in payload.items() if k != "table"})
+        json.dump(body, open(p, "w"), indent=1, default=str)
+        tbl = payload.get("table")
+        if isinstance(tbl, pd.DataFrame) and len(tbl):
+            tbl.drop(columns=[c for c in ("pivots", "drivers", "near_res", "near_sup")
+                              if c in tbl.columns], errors="ignore") \
+               .to_csv(os.path.join(DIRS["scans"], f"{d}_{kind}.csv"), index=False)
+    except Exception:
+        pass
+
+def load_scan(kind, d=None):
+    d = d or session_date().strftime("%Y-%m-%d")
+    p = os.path.join(DIRS["scans"], f"{d}_{kind}.json")
+    if os.path.exists(p):
+        try:
+            return json.load(open(p))
+        except Exception:
+            return None
+    return None
+
+# =============================================================================
+# LEARNING LOOP  —  real supervised learning, not weight nudging.
+# 1. record_outcomes(): every evening, replay the day's 5m bars, label every ORB
+#    trigger with "did it reach +2% before the capped stop", append to a CSV.
+# 2. refit(): retrain the logistic model on the accumulated store (calibration
+#    history + everything recorded live) and overwrite data/models/*.json.
+# Because features/labels are computed the same way as in calibration, the
+# store simply grows and the model improves as the sample grows.
+# =============================================================================
+def record_outcomes(for_date=None, bundle=None):
+    d = for_date or session_date()
+    b = bundle or load_bundle()
+    if not b:
+        return 0
+    names = liquid_names(b)
+    data = download(names, period="5d", interval="5m", ttl=600)
+    nf5 = download([NIFTY], period="5d", interval="5m", ttl=600).get(NIFTY)
+    nfctx = nifty_context(nf5, b["nfd"])
+    recs = []
+    for t, raw in data.items():
+        try:
+            g = raw.copy()
+            g.index = pd.DatetimeIndex(g.index)
+            if g.index.tz is not None:
+                g.index = g.index.tz_convert(IST)
+            g = g[g.index.date == d]
+            g = g[(g.index.time >= MKT_OPEN) & (g.index.time <= MKT_CLOSE)]
+            if len(g) < 30:
+                continue
+            orb = orb_from_bars(g, CFG["ORB_MINUTES"])
+            if not orb:
+                continue
+            base = b["snap"].get(t, {})
+            pdh, pdl, pdc = (b["prev"]["pdh"].get(t), b["prev"]["pdl"].get(t),
+                             b["prev"]["pdc"].get(t))
+            rest = g.iloc[1:]
+            Hh, Ll, Cc = rest.High.to_numpy(float), rest.Low.to_numpy(float), rest.Close.to_numpy(float)
+            for side in ("L", "S"):
+                if not orb[f"{side}_trig"]:
+                    continue
+                e = orb[f"{side}_entry"]
+                i0 = int(np.argmax((Cc > orb["orb_h"]) if side == "L" else (Cc < orb["orb_l"])))
+                opp = orb["orb_l"] if side == "L" else orb["orb_h"]
+                slp = float(np.clip(abs(e - opp) / e * 100, CFG["SL_FLOOR_PCT"], CFG["SL_CAP_PCT"]))
+                sgn = 1 if side == "L" else -1
+                sl = e * (1 - sgn * slp / 100)
+                tg = e * (1 + sgn * CFG["TARGET_PCT"] / 100)
+                fh, fl = Hh[i0:], Ll[i0:]
+                if side == "L":
+                    ht = np.argmax(fh >= tg) if (fh >= tg).any() else 10 ** 6
+                    hs = np.argmax(fl <= sl) if (fl <= sl).any() else 10 ** 6
+                    mfe = (fh.max() - e) / e * 100
+                else:
+                    ht = np.argmax(fl <= tg) if (fl <= tg).any() else 10 ** 6
+                    hs = np.argmax(fh >= sl) if (fh >= sl).any() else 10 ** 6
+                    mfe = (e - fl.min()) / e * 100
+                fv = orb_model_features(base, orb, pdh, pdl, pdc, nfctx, side)
+                fv.update(date=str(d), ticker=t, side=side, win=int(ht < hs),
+                          mfe=mfe, sl_pct=slp, entry=e)
+                recs.append(fv)
+        except Exception:
+            continue
+    if not recs:
+        return 0
+    df = pd.DataFrame(recs)
+    # Idempotent: running the recorder twice for the same session must not
+    # duplicate rows, otherwise the refit sample gets silently double-weighted.
+    if os.path.exists(F_TRAIN_INTRA):
+        try:
+            old = pd.read_csv(F_TRAIN_INTRA)
+            df = pd.concat([old, df], ignore_index=True)
+        except Exception:
+            pass
+    df["date"] = df["date"].astype(str)
+    df = df.drop_duplicates(subset=["date", "ticker", "side"], keep="last")
+    df.to_csv(F_TRAIN_INTRA, index=False)
+    return len(recs)
+
+def refit_models(min_rows=1500):
+    """Retrain long/short intraday models on the accumulated store."""
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.preprocessing import StandardScaler
+    except Exception:
+        return "scikit-learn not installed — cannot refit"
+    if not os.path.exists(F_TRAIN_INTRA):
+        return "no training data recorded yet"
+    df = pd.read_csv(F_TRAIN_INTRA)
+    msg = []
+    for side, path, mdl in (("L", F_MODEL_LONG, MODEL_L), ("S", F_MODEL_SHORT, MODEL_S)):
+        sub = df[df.side == side]
+        feats = mdl.features if mdl else None
+        if feats is None or len(sub) < min_rows:
+            msg.append(f"{side}: {len(sub)} rows (<{min_rows}) — kept calibrated model")
+            continue
+        d = sub[[c for c in feats if c in sub.columns] + ["win"]] \
+            .replace([np.inf, -np.inf], np.nan).dropna()
+        if len(d) < min_rows or d.win.nunique() < 2:
+            msg.append(f"{side}: insufficient clean rows")
+            continue
+        fl = [c for c in feats if c in d.columns]
+        sc = StandardScaler().fit(d[fl])
+        m = LogisticRegression(max_iter=4000, C=0.15).fit(sc.transform(d[fl]), d.win.astype(int))
+        spec = dict(features=fl, coef=m.coef_[0].tolist(), intercept=float(m.intercept_[0]),
+                    mean=sc.mean_.tolist(), scale=sc.scale_.tolist(), n=int(len(d)),
+                    trained_at=get_ist_now().isoformat())
+        json.dump(spec, open(path, "w"), indent=1)
+        msg.append(f"{side}: refitted on {len(d)} rows, base win {100*d.win.mean():.1f}%")
+    CACHE.clear()
+    return " | ".join(msg)
+
+# =============================================================================
+# BACKGROUND AUTOMATION  (plain threads + TTLCache, no Streamlit calls inside)
+# =============================================================================
+AUTOSTATE = dict(running=False, last=None, log=[])
+_AUTO_LOCK = threading.Lock()
+
+def _auto_loop():
+    while AUTOSTATE["running"]:
+        try:
+            ph = market_phase()
+            now = get_ist_now()
+            b = load_bundle()
+            if ph == "OPEN_AUCTION" and now.time() <= dtime(9, 10):
+                scan_premarket(bundle=b)
+                _log("pre-market scan stored")
+            elif ph in ("LIVE",) and now.time() <= CFG["LAST_ENTRY_TIME"]:
+                scan_live_orb(bundle=b)
+                _log("live ORB refresh")
+            elif ph == "POST" and dtime(15, 45) <= now.time() <= dtime(16, 30):
+                scan_eod(bundle=b)
+                n = record_outcomes(bundle=b)
+                _log(f"EOD scan + {n} outcomes recorded")
+                if now.weekday() == 4:
+                    scan_swing(bundle=b)
+                    _log("weekly swing plan stored")
+                if now.weekday() == 5 or now.day >= 28:
+                    _log(refit_models())
+            AUTOSTATE["last"] = now.isoformat()
         except Exception as e:
-            write_scan_status(scan_key, "error", 0, str(e))
+            _log(f"error: {e}")
+        for _ in range(60):
+            if not AUTOSTATE["running"]:
+                break
+            time.sleep(5)
 
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
+def _log(m):
+    with _AUTO_LOCK:
+        AUTOSTATE["log"].insert(0, f"{get_ist_now().strftime('%H:%M:%S')}  {m}")
+        del AUTOSTATE["log"][80:]
+
+def start_auto():
+    if AUTOSTATE["running"]:
+        return
+    AUTOSTATE["running"] = True
+    threading.Thread(target=_auto_loop, daemon=True, name="qe21-auto").start()
+    _log("automation started")
+
+def stop_auto():
+    AUTOSTATE["running"] = False
+    _log("automation stopped")
+
 
 # =============================================================================
-# PERFORMANCE LAB — AUTO-DISCOVERY ENGINE
+# UI HELPERS
 # =============================================================================
-def _capture_technical_snapshot(ticker, daily_df, is_intraday=True):
-    """Capture comprehensive technical snapshot of a stock at a given point"""
-    snap = {"ticker": ticker, "symbol": ticker.replace('.NS', '')}
-    snap["sector"] = get_stock_sector(ticker)
+def chip(txt, kind="neutral"):
+    colors = dict(bull="#0ecb81", bear="#f6465d", neutral="#8f96b3",
+                  warn="#f0b90b", info="#4f8cff")
+    c = colors.get(kind, colors["neutral"])
+    return (f"<span style='background:{c}22;border:1px solid {c}66;color:{c};"
+            f"padding:2px 9px;border-radius:20px;font-size:11px;font-weight:700;"
+            f"letter-spacing:.4px'>{txt}</span>")
+
+def money(x):
     try:
-        if daily_df.empty or len(daily_df) < 30:
-            return snap
-        df = daily_df.copy()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df = compute_all_indicators(df, is_intraday=False)
-        df = compute_supertrend(df, period=10, multiplier=2.0)
-        last = df.iloc[-1]
-        prev = df.iloc[-2] if len(df) >= 2 else last
-
-        # Core indicators at start of move
-        snap["daily_st_dir"] = int(last.get('ST_Dir', 0))
-        snap["rsi_14"] = round(float(last.get('RSI_14', 50)), 1) if not pd.isna(last.get('RSI_14')) else 50
-        snap["macd_hist"] = round(float(last.get('MACD_Hist', 0)), 3) if not pd.isna(last.get('MACD_Hist')) else 0
-        snap["macd_dir"] = "bullish" if snap["macd_hist"] > 0 else "bearish"
-        snap["ema9"] = round(float(last.get('EMA_9', 0)), 2)
-        snap["ema20"] = round(float(last.get('EMA_20', 0)), 2)
-        snap["ema50"] = round(float(last.get('EMA_50', 0)), 2)
-        snap["close"] = round(float(last['Close']), 2)
-        snap["ema_alignment"] = "bullish" if snap["close"] > snap["ema20"] > snap["ema50"] else (
-            "bearish" if snap["close"] < snap["ema20"] < snap["ema50"] else "neutral")
-
-        # Volume
-        vol_ma = last.get('Vol_MA_20', 0)
-        snap["vol_ratio"] = round(float(last['Volume'] / vol_ma), 1) if vol_ma and vol_ma > 0 else 0
-
-        # Gap from previous close
-        prev_close = float(prev['Close'])
-        today_open = float(last.get('Open', last['Close']))
-        snap["gap_pct"] = round(((today_open - prev_close) / prev_close) * 100, 2) if prev_close > 0 else 0
-
-        # ADL trend
-        if 'ADL' in df.columns:
-            adl_recent = df['ADL'].tail(5)
-            snap["adl_trend"] = "accumulation" if adl_recent.iloc[-1] > adl_recent.iloc[0] else "distribution"
-        else:
-            snap["adl_trend"] = "unknown"
-
-        # Prev close vs VWAP proxy (EMA20)
-        snap["prev_close_vs_vwap"] = "above" if prev_close > snap["ema20"] else "below"
-
-        # Pivots
-        pivots = compute_weekly_pivot(df) if is_intraday else compute_monthly_pivot(df)
-        if pivots:
-            p = pivots.get("P", 0)
-            r1 = pivots.get("R1", p)
-            s1 = pivots.get("S1", p)
-            snap["pivot_pos"] = "above_r1" if snap["close"] > r1 else (
-                "above_p" if snap["close"] > p else (
-                    "below_s1" if snap["close"] < s1 else "below_p"))
-            snap["pivot_p"] = round(p, 2)
-        else:
-            snap["pivot_pos"] = "unknown"
-
-        # Volume Profile
-        vp = compute_volume_profile(df, lookback=20)
-        if vp and not np.isnan(vp.get("POC", np.nan)):
-            snap["vp_poc"] = round(vp["POC"], 2)
-            snap["vp_pos"] = "above_vah" if snap["close"] > vp["VAH"] else (
-                "below_val" if snap["close"] < vp["VAL"] else "inside_va")
-        else:
-            snap["vp_pos"] = "unknown"
-
+        return f"₹{float(x):,.2f}"
     except Exception:
-        pass
-    return snap
+        return "—"
 
-def _find_historical_similar_setups(ticker, snapshot, daily_df, lookback=252):
-    """Find past dates where this stock had a similar technical setup"""
-    similar = []
+def pct(x, d=2):
     try:
-        if daily_df.empty or len(daily_df) < lookback:
-            return similar
-        df = daily_df.copy()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df = compute_all_indicators(df, is_intraday=False)
-        df = compute_supertrend(df, period=10, multiplier=2.0)
-
-        target_st = snapshot.get("daily_st_dir", 0)
-        target_rsi_low = max(30, snapshot.get("rsi_14", 50) - 10)
-        target_rsi_high = min(70, snapshot.get("rsi_14", 50) + 10)
-        target_ema = snapshot.get("ema_alignment", "neutral")
-
-        for i in range(max(50, len(df) - lookback), len(df) - 5):
-            row = df.iloc[i]
-            rsi_val = row.get('RSI_14', 50)
-            if pd.isna(rsi_val):
-                continue
-            st_dir = int(row.get('ST_Dir', 0))
-            close = float(row['Close'])
-            ema20 = float(row.get('EMA_20', 0))
-            ema50 = float(row.get('EMA_50', 0))
-
-            local_ema = "bullish" if close > ema20 > ema50 else (
-                "bearish" if close < ema20 < ema50 else "neutral")
-
-            if st_dir == target_st and target_rsi_low <= rsi_val <= target_rsi_high and local_ema == target_ema:
-                # Check what happened in next 5 days
-                future = df.iloc[i+1:i+6]
-                if future.empty:
-                    continue
-                max_up = ((future['High'].max() - close) / close) * 100
-                max_down = ((close - future['Low'].min()) / close) * 100
-                fwd_return = ((float(future.iloc[-1]['Close']) - close) / close) * 100
-
-                similar.append({
-                    "date": str(row.name.date()) if hasattr(row.name, 'date') else str(row.name),
-                    "close": round(close, 2),
-                    "rsi": round(float(rsi_val), 1),
-                    "st_dir": st_dir,
-                    "max_up_5d": round(max_up, 2),
-                    "max_down_5d": round(max_down, 2),
-                    "fwd_return_5d": round(fwd_return, 2),
-                })
-        # Keep top 10 most recent
-        similar = similar[-10:]
+        v = float(x)
+        if not np.isfinite(v):
+            return "—"
+        return f"{v:+.{d}f}%"
     except Exception:
-        pass
-    return similar
+        return "—"
 
-def discover_intraday_winners(target_date=None):
-    """
-    Find stocks that moved ≥2% from the 1st 5-min candle edge in one direction.
-    Captures full technical snapshot + historical similarity analysis.
-    Runs after market close (3:35 PM+).
-    """
-    if target_date is None:
-        target_date = get_ist_now().strftime('%Y-%m-%d')
-
-    filepath = os.path.join(INTRADAY_WINNERS_DIR, f"{target_date}.json")
-    existing = load_perf_winners(filepath)
-    if existing and existing.get("winners"):
-        return existing  # Already discovered for this date
-
-    winners = []
-    total = len(FO_UNIVERSE)
-
-    # Fetch 5-min data for all tickers (last 5 days to get today)
-    for i, ticker in enumerate(FO_UNIVERSE):
-        try:
-            write_scan_status("perf_intraday_discovery", "running", (i + 1) / total)
-            df5m = yf.download(ticker, period="5d", interval="5m", progress=False, auto_adjust=True)
-            if isinstance(df5m.columns, pd.MultiIndex):
-                df5m.columns = df5m.columns.get_level_values(0)
-            if df5m.empty or len(df5m) < 10:
-                continue
-
-            # Filter for the target date
-            df5m.index = pd.to_datetime(df5m.index)
-            day_data = df5m[df5m.index.strftime('%Y-%m-%d') == target_date]
-            if day_data.empty or len(day_data) < 3:
-                continue
-
-            # First 5-min candle
-            first_candle = day_data.iloc[0]
-            fc_high = float(first_candle['High'])
-            fc_low = float(first_candle['Low'])
-            fc_open = float(first_candle['Open'])
-            fc_close = float(first_candle['Close'])
-            fc_vol = float(first_candle['Volume'])
-
-            # Day stats
-            day_high = float(day_data['High'].max())
-            day_low = float(day_data['Low'].min())
-            day_close = float(day_data.iloc[-1]['Close'])
-
-            # Calculate max move from ORB edge
-            max_up_from_orb = ((day_high - fc_high) / fc_high) * 100 if fc_high > 0 else 0
-            max_down_from_orb = ((fc_low - day_low) / fc_low) * 100 if fc_low > 0 else 0
-
-            is_winner = False
-            direction = ""
-            move_pct = 0
-
-            if max_up_from_orb >= 2.0:
-                is_winner = True
-                direction = "BUY"
-                move_pct = round(max_up_from_orb, 2)
-            elif max_down_from_orb >= 2.0:
-                is_winner = True
-                direction = "SELL"
-                move_pct = round(max_down_from_orb, 2)
-
-            if not is_winner:
-                continue
-
-            # Fetch daily data for snapshot
-            daily_df = yf.download(ticker, period="1y", interval="1d", progress=False, auto_adjust=True)
-            if isinstance(daily_df.columns, pd.MultiIndex):
-                daily_df.columns = daily_df.columns.get_level_values(0)
-
-            snapshot = _capture_technical_snapshot(ticker, daily_df, is_intraday=True)
-            historical_similar = _find_historical_similar_setups(ticker, snapshot, daily_df)
-
-            # First candle body %
-            fc_body_pct = abs(fc_close - fc_open) / fc_open * 100 if fc_open > 0 else 0
-
-            # Volume ratio for 1st candle (vs day average)
-            avg_vol_5m = day_data['Volume'].mean()
-            fc_vol_ratio = fc_vol / avg_vol_5m if avg_vol_5m > 0 else 0
-
-            winner = {
-                "symbol": ticker.replace('.NS', ''),
-                "ticker": ticker,
-                "date": target_date,
-                "direction": direction,
-                "move_pct": move_pct,
-                "fc_high": round(fc_high, 2),
-                "fc_low": round(fc_low, 2),
-                "fc_open": round(fc_open, 2),
-                "fc_close": round(fc_close, 2),
-                "fc_body_pct": round(fc_body_pct, 2),
-                "fc_vol_ratio": round(fc_vol_ratio, 1),
-                "day_high": round(day_high, 2),
-                "day_low": round(day_low, 2),
-                "day_close": round(day_close, 2),
-                "snapshot": snapshot,
-                "historical_similar": historical_similar,
-            }
-            winners.append(winner)
-
-        except Exception:
-            continue
-
-    result = {
-        "date": target_date,
-        "discovered_at": get_ist_now().strftime('%Y-%m-%d %H:%M:%S'),
-        "total_scanned": total,
-        "winners_found": len(winners),
-        "winners": winners
-    }
-    save_perf_winners(filepath, result)
-    write_scan_status("perf_intraday_discovery", "complete", 1.0)
-    return result
-
-def discover_swing_winners(week_end_date=None):
-    """
-    Find stocks that moved ≥7% from Monday's 1st 1-hour candle edge during the week.
-    Runs every Friday after close.
-    """
-    now = get_ist_now()
-    if week_end_date is None:
-        days_since_friday = (now.weekday() - 4) % 7
-        friday = now - timedelta(days=days_since_friday)
-        week_end_date = friday.strftime('%Y-%m-%d')
-
-    dt = datetime.strptime(week_end_date, '%Y-%m-%d')
-    iso_year, iso_week, _ = dt.isocalendar()
-    week_key = f"{iso_year}-W{iso_week:02d}"
-
-    filepath = os.path.join(SWING_WINNERS_DIR, f"{week_key}.json")
-    existing = load_perf_winners(filepath)
-    if existing and existing.get("winners"):
-        return existing
-
-    monday = dt - timedelta(days=dt.weekday())
-    monday_str = monday.strftime('%Y-%m-%d')
-
-    winners = []
-    total = len(FO_UNIVERSE)
-
-    for i, ticker in enumerate(FO_UNIVERSE):
-        try:
-            write_scan_status("perf_swing_discovery", "running", (i + 1) / total)
-
-            # Get hourly data for the week
-            df1h = yf.download(ticker, start=monday_str,
-                               end=(dt + timedelta(days=1)).strftime('%Y-%m-%d'),
-                               interval="60m", progress=False, auto_adjust=True)
-            if isinstance(df1h.columns, pd.MultiIndex):
-                df1h.columns = df1h.columns.get_level_values(0)
-            if df1h.empty or len(df1h) < 5:
-                continue
-
-            # Monday's first 1-hour candle
-            df1h.index = pd.to_datetime(df1h.index)
-            monday_data = df1h[df1h.index.strftime('%Y-%m-%d') == monday_str]
-            if monday_data.empty:
-                continue
-
-            first_hour = monday_data.iloc[0]
-            fh_high = float(first_hour['High'])
-            fh_low = float(first_hour['Low'])
-
-            # Week stats
-            week_high = float(df1h['High'].max())
-            week_low = float(df1h['Low'].min())
-            week_close = float(df1h.iloc[-1]['Close'])
-
-            max_up = ((week_high - fh_high) / fh_high) * 100 if fh_high > 0 else 0
-            max_down = ((fh_low - week_low) / fh_low) * 100 if fh_low > 0 else 0
-
-            is_winner = False
-            direction = ""
-            move_pct = 0
-
-            if max_up >= 7.0:
-                is_winner = True
-                direction = "BUY"
-                move_pct = round(max_up, 2)
-            elif max_down >= 7.0:
-                is_winner = True
-                direction = "SELL"
-                move_pct = round(max_down, 2)
-
-            if not is_winner:
-                continue
-
-            daily_df = yf.download(ticker, period="2y", interval="1d", progress=False, auto_adjust=True)
-            if isinstance(daily_df.columns, pd.MultiIndex):
-                daily_df.columns = daily_df.columns.get_level_values(0)
-
-            snapshot = _capture_technical_snapshot(ticker, daily_df, is_intraday=False)
-            historical_similar = _find_historical_similar_setups(ticker, snapshot, daily_df, lookback=504)
-
-            winner = {
-                "symbol": ticker.replace('.NS', ''),
-                "ticker": ticker,
-                "week": week_key,
-                "week_start": monday_str,
-                "week_end": week_end_date,
-                "direction": direction,
-                "move_pct": move_pct,
-                "fh_high": round(fh_high, 2),
-                "fh_low": round(fh_low, 2),
-                "week_high": round(week_high, 2),
-                "week_low": round(week_low, 2),
-                "week_close": round(week_close, 2),
-                "snapshot": snapshot,
-                "historical_similar": historical_similar,
-            }
-            winners.append(winner)
-
-        except Exception:
-            continue
-
-    result = {
-        "week": week_key,
-        "week_start": monday_str,
-        "week_end": week_end_date,
-        "discovered_at": get_ist_now().strftime('%Y-%m-%d %H:%M:%S'),
-        "total_scanned": total,
-        "winners_found": len(winners),
-        "winners": winners
-    }
-    save_perf_winners(filepath, result)
-    write_scan_status("perf_swing_discovery", "complete", 1.0)
-    return result
-
-# =============================================================================
-# PERFORMANCE LAB — MULTI-TIMEFRAME ADAPTIVE PATTERN ANALYSIS & LEARNING ENGINE
-# =============================================================================
-def analyze_winner_patterns():
-    """
-    Reads all saved winners across multiple timeframes (5m, 15m, 1h, 1D, 1W):
-    1. Auto-Discovered Intraday & Swing Winners
-    2. Manual Stock Logger (User's logged gainers and losers)
-    3. Historical Top 3 Gainers & Losers (up to 180+ days / 104 weeks)
-    Computes statistical significance of technical attributes and calibrates adaptive screener weights.
-    """
-    all_snapshots_intraday = []
-    all_snapshots_swing = []
-
-    # 1. Auto-discovered intraday winners
-    for fname in os.listdir(INTRADAY_WINNERS_DIR):
-        data = load_perf_winners(os.path.join(INTRADAY_WINNERS_DIR, fname))
-        if data and data.get("winners"):
-            for w in data["winners"]:
-                snap = w.get("snapshot", {})
-                snap["symbol"] = w.get("symbol", "")
-                snap["ticker"] = w.get("ticker", f"{w.get('symbol','')}.NS")
-                snap["direction"] = w.get("direction", "")
-                snap["move_pct"] = w.get("move_pct", 0)
-                snap["fc_body_pct"] = w.get("fc_body_pct", 0)
-                snap["fc_vol_ratio"] = w.get("fc_vol_ratio", 0)
-                snap["sector"] = get_stock_sector(w.get("ticker", w.get("symbol", "")))
-                all_snapshots_intraday.append(snap)
-
-    # 2. Auto-discovered swing winners
-    for fname in os.listdir(SWING_WINNERS_DIR):
-        data = load_perf_winners(os.path.join(SWING_WINNERS_DIR, fname))
-        if data and data.get("winners"):
-            for w in data["winners"]:
-                snap = w.get("snapshot", {})
-                snap["symbol"] = w.get("symbol", "")
-                snap["ticker"] = w.get("ticker", f"{w.get('symbol','')}.NS")
-                snap["direction"] = w.get("direction", "")
-                snap["move_pct"] = w.get("move_pct", 0)
-                snap["sector"] = get_stock_sector(w.get("ticker", w.get("symbol", "")))
-                all_snapshots_swing.append(snap)
-
-    # 3. Manual Log Entries (Ingest user-entered gainers and losers)
-    manual = load_manual_log()
-    for entry in manual:
-        snap = entry.get("snapshot", {})
-        if not snap:
-            snap = {"ticker": entry.get("ticker", f"{entry.get('symbol','')}.NS"), "symbol": entry.get("symbol", "")}
-        snap["direction"] = entry.get("direction", "")
-        snap["symbol"] = entry.get("symbol", "")
-        snap["sector"] = get_stock_sector(entry.get("ticker", entry.get("symbol", "")))
-        if entry.get("trade_type") == "Intraday":
-            all_snapshots_intraday.append(snap)
-        else:
-            all_snapshots_swing.append(snap)
-
-    # 4. Historical Top 3 Gainers & Losers Datasets (180+ Days / 104 Weeks)
-    hist_intra = load_hist_intraday()
-    for day_rec in hist_intra:
-        for g in day_rec.get("gainers", []):
-            sym = g.get("symbol", "")
-            all_snapshots_intraday.append({
-                "symbol": sym,
-                "ticker": g.get("ticker", f"{sym}.NS"),
-                "direction": "BUY",
-                "move_pct": g.get("change_pct", 0),
-                "fc_body_pct": 0.40,
-                "vol_ratio": 2.2,
-                "daily_st_dir": 1,
-                "ema_alignment": "bullish",
-                "rsi_14": 56.0,
-                "macd_dir": "bullish",
-                "gap_pct": g.get("intra_move_pct", 0.35),
-                "adl_trend": "accumulation",
-                "pivot_pos": "above_p",
-                "prev_close_vs_vwap": "above",
-                "sector": get_stock_sector(g.get("ticker", sym)),
-            })
-        for l in day_rec.get("losers", []):
-            sym = l.get("symbol", "")
-            all_snapshots_intraday.append({
-                "symbol": sym,
-                "ticker": l.get("ticker", f"{sym}.NS"),
-                "direction": "SELL",
-                "move_pct": abs(l.get("change_pct", 0)),
-                "fc_body_pct": 0.40,
-                "vol_ratio": 2.0,
-                "daily_st_dir": -1,
-                "ema_alignment": "bearish",
-                "rsi_14": 42.0,
-                "macd_dir": "bearish",
-                "gap_pct": -abs(l.get("intra_move_pct", 0.35)),
-                "adl_trend": "distribution",
-                "pivot_pos": "below_p",
-                "prev_close_vs_vwap": "below",
-                "sector": get_stock_sector(l.get("ticker", sym)),
-            })
-
-    hist_sw = load_hist_swing()
-    for wk_rec in hist_sw:
-        for g in wk_rec.get("gainers", []):
-            sym = g.get("symbol", "")
-            all_snapshots_swing.append({
-                "symbol": sym,
-                "ticker": g.get("ticker", f"{sym}.NS"),
-                "direction": "BUY",
-                "move_pct": g.get("weekly_return_pct", 0),
-                "vol_ratio": 2.1,
-                "daily_st_dir": 1,
-                "ema_alignment": "bullish",
-                "rsi_14": 58.0,
-                "macd_dir": "bullish",
-                "pivot_pos": "above_p",
-                "prev_close_vs_vwap": "above",
-                "sector": get_stock_sector(g.get("ticker", sym)),
-            })
-        for l in wk_rec.get("losers", []):
-            sym = l.get("symbol", "")
-            all_snapshots_swing.append({
-                "symbol": sym,
-                "ticker": l.get("ticker", f"{sym}.NS"),
-                "direction": "SELL",
-                "move_pct": abs(l.get("weekly_return_pct", 0)),
-                "vol_ratio": 1.9,
-                "daily_st_dir": -1,
-                "ema_alignment": "bearish",
-                "rsi_14": 38.0,
-                "macd_dir": "bearish",
-                "pivot_pos": "below_p",
-                "prev_close_vs_vwap": "below",
-                "sector": get_stock_sector(l.get("ticker", sym)),
-            })
-
-    def _compute_frequencies(snapshots):
-        if not snapshots:
-            return {}
-        n = len(snapshots)
-        rules = {}
-
-        buy_snaps = [s for s in snapshots if s.get("direction") == "BUY"]
-        sell_snaps = [s for s in snapshots if s.get("direction") == "SELL"]
-
-        st_aligned = sum(1 for s in buy_snaps if s.get("daily_st_dir") == 1) + \
-                     sum(1 for s in sell_snaps if s.get("daily_st_dir") == -1)
-        rules["Supertrend aligned with direction"] = round(st_aligned / max(n, 1) * 100, 1)
-
-        ema_aligned = sum(1 for s in buy_snaps if s.get("ema_alignment") == "bullish") + \
-                      sum(1 for s in sell_snaps if s.get("ema_alignment") == "bearish")
-        rules["EMA 9/20/50 aligned with direction"] = round(ema_aligned / max(n, 1) * 100, 1)
-
-        rsi_sweet = sum(1 for s in snapshots if 35 <= s.get("rsi_14", 50) <= 65)
-        rules["RSI between 35-65 (room to run)"] = round(rsi_sweet / max(n, 1) * 100, 1)
-
-        vol_high = sum(1 for s in snapshots if s.get("vol_ratio", 0) > 1.5)
-        rules["Volume > 1.5x average (Institutional Footprint)"] = round(vol_high / max(n, 1) * 100, 1)
-
-        macd_aligned = sum(1 for s in buy_snaps if s.get("macd_dir") == "bullish") + \
-                       sum(1 for s in sell_snaps if s.get("macd_dir") == "bearish")
-        rules["MACD histogram aligned"] = round(macd_aligned / max(n, 1) * 100, 1)
-
-        gap_aligned = sum(1 for s in buy_snaps if s.get("gap_pct", 0) > 0) + \
-                      sum(1 for s in sell_snaps if s.get("gap_pct", 0) < 0)
-        rules["Gap direction aligned"] = round(gap_aligned / max(n, 1) * 100, 1)
-
-        adl_ok = sum(1 for s in buy_snaps if s.get("adl_trend") == "accumulation") + \
-                 sum(1 for s in sell_snaps if s.get("adl_trend") == "distribution")
-        rules["ADL trend confirming"] = round(adl_ok / max(n, 1) * 100, 1)
-
-        piv_ok = sum(1 for s in buy_snaps if str(s.get("pivot_pos", "")).startswith("above")) + \
-                 sum(1 for s in sell_snaps if str(s.get("pivot_pos", "")).startswith("below"))
-        rules["Pivot position confirming"] = round(piv_ok / max(n, 1) * 100, 1)
-
-        vwap_ok = sum(1 for s in buy_snaps if s.get("prev_close_vs_vwap") == "above") + \
-                  sum(1 for s in sell_snaps if s.get("prev_close_vs_vwap") == "below")
-        rules["Close vs VWAP confirming"] = round(vwap_ok / max(n, 1) * 100, 1)
-
-        fc_snaps = [s for s in snapshots if s.get("fc_body_pct", 0) > 0]
-        if fc_snaps:
-            fc_sweet = sum(1 for s in fc_snaps if 0.15 <= s.get("fc_body_pct", 0) <= 0.70)
-            rules["1st candle body 0.15-0.70% (No Exhaustion)"] = round(fc_sweet / max(len(fc_snaps), 1) * 100, 1)
-
-        sector_counts = {}
-        for s in snapshots:
-            sec = s.get("sector", "Other")
-            sector_counts[sec] = sector_counts.get(sec, 0) + 1
-        rules["_sector_distribution"] = sector_counts
-        rules["_total_winners"] = n
-
-        return rules
-
-    intraday_patterns = _compute_frequencies(all_snapshots_intraday)
-    swing_patterns = _compute_frequencies(all_snapshots_swing)
-
-    patterns = {
-        "intraday": intraday_patterns,
-        "swing": swing_patterns,
-        "analyzed_at": get_ist_now().strftime('%Y-%m-%d %H:%M:%S'),
-        "intraday_sample_size": len(all_snapshots_intraday),
-        "swing_sample_size": len(all_snapshots_swing),
-    }
-    save_pattern_analysis(patterns)
-    learn_adaptive_screener_weights(patterns)
-    return patterns
-
-def learn_adaptive_screener_weights(patterns=None):
-    """
-    Computes calibrated scoring weights across multiple timeframes (5m, 15m, 1h, 1D, 1W)
-    based on empirical frequency among verified winners.
-    """
-    if patterns is None:
-        patterns = load_pattern_analysis()
-    
-    intra_rules = patterns.get("intraday", {})
-    swing_rules = patterns.get("swing", {})
-    
-    def get_freq(r, key, default=50.0):
-        v = r.get(key, default)
-        return float(v) if isinstance(v, (int, float)) else default
-
-    # Blend intraday & swing frequencies for robust multi-timeframe weights
-    st_freq = (get_freq(intra_rules, "Supertrend aligned with direction", 80.0) + get_freq(swing_rules, "Supertrend aligned with direction", 80.0)) / 2.0
-    ema_freq = (get_freq(intra_rules, "EMA 9/20/50 aligned with direction", 75.0) + get_freq(swing_rules, "EMA 9/20/50 aligned with direction", 75.0)) / 2.0
-    rsi_freq = (get_freq(intra_rules, "RSI between 35-65 (room to run)", 70.0) + get_freq(swing_rules, "RSI between 35-65 (room to run)", 70.0)) / 2.0
-    vol_freq = (get_freq(intra_rules, "Volume > 1.5x average (Institutional Footprint)", 70.0) + get_freq(swing_rules, "Volume > 1.5x average (Institutional Footprint)", 70.0)) / 2.0
-    piv_freq = (get_freq(intra_rules, "Pivot position confirming", 65.0) + get_freq(swing_rules, "Pivot position confirming", 65.0)) / 2.0
-    vwap_freq = (get_freq(intra_rules, "Close vs VWAP confirming", 65.0) + get_freq(swing_rules, "Close vs VWAP confirming", 65.0)) / 2.0
-
-    # Calibrate adaptive weights (clamped to realistic point bands)
-    adaptive_weights = {
-        "trend_weight": round(float(np.clip(15.0 * (ema_freq / 70.0), 10.0, 20.0)), 1),
-        "supertrend_weight": round(float(np.clip(15.0 * (st_freq / 70.0), 10.0, 20.0)), 1),
-        "pivot_weight": round(float(np.clip(15.0 * (piv_freq / 65.0), 10.0, 20.0)), 1),
-        "volume_weight": round(float(np.clip(15.0 * (vol_freq / 65.0), 10.0, 20.0)), 1),
-        "rsi_weight": round(float(np.clip(10.0 * (rsi_freq / 65.0), 6.0, 15.0)), 1),
-        "macd_weight": 10.0,
-        "anchor_weight": round(float(np.clip(10.0 * (vwap_freq / 65.0), 6.0, 15.0)), 1),
-        "rs_weight": 5.0,
-        "vp_weight": 5.0,
-        "adl_weight": 5.0,
-        "mtf_weight": 20.0,
-        "calibrated_at": get_ist_now().strftime('%Y-%m-%d %H:%M:%S'),
-    }
-
-    # Extract top sectors
-    sector_dist = intra_rules.get("_sector_distribution", {})
-    if sector_dist:
-        sorted_sec = [k for k, v in sorted(sector_dist.items(), key=lambda x: x[1], reverse=True) if k != "Other"]
-        adaptive_weights["top_sectors"] = sorted_sec[:5]
-    else:
-        adaptive_weights["top_sectors"] = []
-
-    save_adaptive_weights(adaptive_weights)
-    return adaptive_weights
-
-def compute_pattern_match_score(snapshot, patterns, trade_type="intraday"):
-    """Score a stock snapshot against discovered winner patterns (0-10 bonus points)"""
-    rules = patterns.get(trade_type, {})
-    if not rules or rules.get("_total_winners", 0) < 5:
-        return 0
-
-    strong_rules = {k: v for k, v in rules.items() if isinstance(v, (int, float)) and not k.startswith("_") and v >= 60}
-    if not strong_rules:
-        return 0
-
-    direction = "BUY" if snapshot.get("daily_st_dir", 0) == 1 else "SELL"
-    matches = 0
-    total_rules = len(strong_rules)
-
-    for rule_name, _ in strong_rules.items():
-        if "Supertrend" in rule_name:
-            if (direction == "BUY" and snapshot.get("daily_st_dir") == 1) or \
-               (direction == "SELL" and snapshot.get("daily_st_dir") == -1):
-                matches += 1
-        elif "EMA" in rule_name:
-            if (direction == "BUY" and snapshot.get("ema_alignment") == "bullish") or \
-               (direction == "SELL" and snapshot.get("ema_alignment") == "bearish"):
-                matches += 1
-        elif "RSI" in rule_name:
-            if 35 <= snapshot.get("rsi_14", 50) <= 65:
-                matches += 1
-        elif "Volume" in rule_name:
-            if snapshot.get("vol_ratio", 0) > 1.5:
-                matches += 1
-        elif "MACD" in rule_name:
-            if (direction == "BUY" and snapshot.get("macd_dir") == "bullish") or \
-               (direction == "SELL" and snapshot.get("macd_dir") == "bearish"):
-                matches += 1
-        elif "Gap" in rule_name:
-            if (direction == "BUY" and snapshot.get("gap_pct", 0) > 0) or \
-               (direction == "SELL" and snapshot.get("gap_pct", 0) < 0):
-                matches += 1
-        elif "ADL" in rule_name:
-            if (direction == "BUY" and snapshot.get("adl_trend") == "accumulation") or \
-               (direction == "SELL" and snapshot.get("adl_trend") == "distribution"):
-                matches += 1
-        elif "Pivot" in rule_name:
-            if (direction == "BUY" and str(snapshot.get("pivot_pos", "")).startswith("above")) or \
-               (direction == "SELL" and str(snapshot.get("pivot_pos", "")).startswith("below")):
-                matches += 1
-        elif "VWAP" in rule_name:
-            if (direction == "BUY" and snapshot.get("prev_close_vs_vwap") == "above") or \
-               (direction == "SELL" and snapshot.get("prev_close_vs_vwap") == "below"):
-                matches += 1
-
-    return round((matches / max(total_rules, 1)) * 10, 1)
-
-# =============================================================================
-# PERFORMANCE LAB — STRATEGY SCREENER HIT-RATE BACKTEST ENGINE (Multi-TF + Manual Logger)
-# =============================================================================
-def backtest_intraday_strategy(lookback_days=60):
-    """
-    True Mathematical Strategy Screener Backtest:
-    Evaluates whether the Screener Strategy (Multi-TF Confluence Score, Trend, Supertrend, RVOL, Pivots)
-    accurately caught confirmed winners & losers across:
-    1. Historical Intraday Top 3 Gainers & Losers (up to 180+ days)
-    2. Auto-Discovered ORB >= 2% Winners
-    3. Manual Winner Logger (User's logged gainers and losers)
-    """
-    results = []
-    hist_intra = load_hist_intraday()
-    manual_entries = [e for e in load_manual_log() if e.get("trade_type") == "Intraday"]
-    ad_w = load_adaptive_weights()
-    min_score_thresh = 55
-
-    # Group historical dates up to lookback_days
-    evaluated_dates = set()
-    daily_candidates = {}
-
-    # Ingest Historical Top 3
-    for r in hist_intra[:lookback_days]:
-        dt = r.get("date", "")
-        if not dt: continue
-        evaluated_dates.add(dt)
-        daily_candidates.setdefault(dt, [])
-        for g in r.get("gainers", []):
-            daily_candidates[dt].append({
-                "symbol": g.get("symbol", ""), "ticker": g.get("ticker", f"{g.get('symbol','')}.NS"),
-                "direction": "BUY", "category": "Historical Top 3 Gainer", "move_pct": g.get("change_pct", 0),
-                "sector": get_stock_sector(g.get("ticker", g.get("symbol", "")))
-            })
-        for l in r.get("losers", []):
-            daily_candidates[dt].append({
-                "symbol": l.get("symbol", ""), "ticker": l.get("ticker", f"{l.get('symbol','')}.NS"),
-                "direction": "SELL", "category": "Historical Top 3 Loser", "move_pct": l.get("change_pct", 0),
-                "sector": get_stock_sector(l.get("ticker", l.get("symbol", "")))
-            })
-
-    # Ingest Auto-discovered winners
-    for fname in os.listdir(INTRADAY_WINNERS_DIR):
-        dt = fname.replace('.json', '')
-        if len(evaluated_dates) >= lookback_days and dt not in evaluated_dates:
-            continue
-        data = load_perf_winners(os.path.join(INTRADAY_WINNERS_DIR, fname))
-        if data and data.get("winners"):
-            evaluated_dates.add(dt)
-            daily_candidates.setdefault(dt, [])
-            for w in data["winners"]:
-                daily_candidates[dt].append({
-                    "symbol": w.get("symbol", ""), "ticker": w.get("ticker", f"{w.get('symbol','')}.NS"),
-                    "direction": w.get("direction", "BUY"), "category": "Auto ORB Winner (≥2%)",
-                    "move_pct": w.get("move_pct", 0), "sector": get_stock_sector(w.get("ticker", w.get("symbol", "")))
-                })
-
-    # Ingest Manual Logger entries
-    for m in manual_entries:
-        dt = m.get("date", "")
-        if dt:
-            daily_candidates.setdefault(dt, [])
-            daily_candidates[dt].append({
-                "symbol": m.get("symbol", ""), "ticker": m.get("ticker", f"{m.get('symbol','')}.NS"),
-                "direction": m.get("direction", "BUY"), "category": "Manual Winner Logger",
-                "move_pct": 2.5, "sector": get_stock_sector(m.get("ticker", m.get("symbol", "")))
-            })
-
-    total_tested = 0
-    total_hits = 0
-    sector_perf = {}
-
-    sorted_dates = sorted(daily_candidates.keys(), reverse=True)[:lookback_days]
-    for dt_str in sorted_dates:
-        cands = daily_candidates[dt_str]
-        # Remove duplicate symbols for the same day
-        seen_syms = set()
-        unique_cands = []
-        for c in cands:
-            if c["symbol"] not in seen_syms:
-                seen_syms.add(c["symbol"])
-                unique_cands.append(c)
-
-        day_tested = len(unique_cands)
-        day_hits = 0
-        day_winner_symbols = []
-        screener_hit_symbols = []
-
-        for cand in unique_cands:
-            total_tested += 1
-            sym = cand["symbol"]
-            is_buy = cand["direction"] == "BUY"
-            sec = cand["sector"]
-            day_winner_symbols.append(sym)
-
-            # Evaluate screener confluence score for this setup
-            # Synthetic evaluation model: ST alignment (30) + EMA trend (20) + Volume (20) + Pivot (15) + RSI (15)
-            score = 65  # Base score for verified momentum candidate
-            if sec in ad_w.get("top_sectors", []): score += 10
-            if is_buy:
-                screener_signal = "BUY" if score >= min_score_thresh else "PASS"
-            else:
-                screener_signal = "SELL" if score >= min_score_thresh else "PASS"
-
-            is_hit = (is_buy and screener_signal == "BUY") or (not is_buy and screener_signal == "SELL")
-            if is_hit:
-                day_hits += 1
-                total_hits += 1
-                screener_hit_symbols.append(sym)
-
-            sector_perf[sec] = sector_perf.get(sec, {"hits": 0, "total": 0})
-            sector_perf[sec]["total"] += 1
-            if is_hit:
-                sector_perf[sec]["hits"] += 1
-
-        hit_rate = round((day_hits / max(day_tested, 1)) * 100, 1) if day_tested > 0 else 0
-        results.append({
-            "date": dt_str,
-            "total_winners": day_tested,
-            "screener_found": day_hits,
-            "hit_rate": hit_rate,
-            "missed": day_tested - day_hits,
-            "winner_symbols": day_winner_symbols,
-            "screener_symbols": screener_hit_symbols
-        })
-
-    overall_hit_rate = round((total_hits / max(total_tested, 1)) * 100, 1) if total_tested > 0 else 0
-    backtest_out = {
-        "type": "intraday",
-        "lookback_days": lookback_days,
-        "daily_results": results,
-        "avg_hit_rate": overall_hit_rate,
-        "total_winners_found": total_tested,
-        "total_screener_hits": total_hits,
-        "sector_breakdown": {k: round((v["hits"] / max(v["total"], 1)) * 100, 1) for k, v in sector_perf.items()},
-        "run_at": get_ist_now().strftime('%Y-%m-%d %H:%M:%S'),
-    }
-    save_backtest_results(backtest_out)
-    return backtest_out
-
-def backtest_swing_strategy(lookback_weeks=12):
-    """
-    True Mathematical Swing Strategy Screener Backtest:
-    Evaluates multi-timeframe swing strategy across:
-    1. Historical Swing Top 3 Gainers & Losers (up to 104 weeks)
-    2. Auto-Discovered Swing Winners (≥7%)
-    3. Manual Swing Log entries
-    """
-    results = []
-    hist_swing = load_hist_swing()
-    manual_entries = [e for e in load_manual_log() if e.get("trade_type") == "Swing"]
-    ad_w = load_adaptive_weights()
-    min_score_thresh = 60
-
-    weekly_candidates = {}
-    for r in hist_swing[:lookback_weeks]:
-        wk = r.get("week_key", "")
-        if not wk: continue
-        weekly_candidates.setdefault(wk, [])
-        for g in r.get("gainers", []):
-            weekly_candidates[wk].append({
-                "symbol": g.get("symbol", ""), "ticker": g.get("ticker", f"{g.get('symbol','')}.NS"),
-                "direction": "BUY", "category": "Historical Swing Top 3 Gainer", "move_pct": g.get("weekly_return_pct", 0),
-                "sector": get_stock_sector(g.get("ticker", g.get("symbol", "")))
-            })
-        for l in r.get("losers", []):
-            weekly_candidates[wk].append({
-                "symbol": l.get("symbol", ""), "ticker": l.get("ticker", f"{l.get('symbol','')}.NS"),
-                "direction": "SELL", "category": "Historical Swing Top 3 Loser", "move_pct": l.get("weekly_return_pct", 0),
-                "sector": get_stock_sector(l.get("ticker", l.get("symbol", "")))
-            })
-
-    for fname in os.listdir(SWING_WINNERS_DIR):
-        wk = fname.replace('.json', '')
-        if wk in weekly_candidates:
-            data = load_perf_winners(os.path.join(SWING_WINNERS_DIR, fname))
-            if data and data.get("winners"):
-                for w in data["winners"]:
-                    weekly_candidates[wk].append({
-                        "symbol": w.get("symbol", ""), "ticker": w.get("ticker", f"{w.get('symbol','')}.NS"),
-                        "direction": w.get("direction", "BUY"), "category": "Auto Swing Winner (≥7%)",
-                        "move_pct": w.get("move_pct", 0), "sector": get_stock_sector(w.get("ticker", w.get("symbol", "")))
-                    })
-
-    for m in manual_entries:
-        wk = "Manual-Swing"
-        weekly_candidates.setdefault(wk, [])
-        weekly_candidates[wk].append({
-            "symbol": m.get("symbol", ""), "ticker": m.get("ticker", f"{m.get('symbol','')}.NS"),
-            "direction": m.get("direction", "BUY"), "category": "Manual Swing Winner",
-            "move_pct": 8.0, "sector": get_stock_sector(m.get("ticker", m.get("symbol", "")))
-        })
-
-    total_tested = 0
-    total_hits = 0
-    for wk_key, cands in list(weekly_candidates.items())[:lookback_weeks]:
-        seen_syms = set()
-        unique_cands = []
-        for c in cands:
-            if c["symbol"] not in seen_syms:
-                seen_syms.add(c["symbol"])
-                unique_cands.append(c)
-
-        wk_tested = len(unique_cands)
-        wk_hits = 0
-        wk_winner_symbols = []
-
-        for cand in unique_cands:
-            total_tested += 1
-            sym = cand["symbol"]
-            is_buy = cand["direction"] == "BUY"
-            sec = cand["sector"]
-            wk_winner_symbols.append(sym)
-
-            score = 68
-            if sec in ad_w.get("top_sectors", []): score += 10
-            is_hit = score >= min_score_thresh
-            if is_hit:
-                wk_hits += 1
-                total_hits += 1
-
-        hit_rate = round((wk_hits / max(wk_tested, 1)) * 100, 1) if wk_tested > 0 else 0
-        results.append({
-            "week": wk_key,
-            "total_winners": wk_tested,
-            "screener_found": wk_hits,
-            "hit_rate": hit_rate,
-            "missed": wk_tested - wk_hits,
-            "winner_symbols": wk_winner_symbols
-        })
-
-    overall_hit_rate = round((total_hits / max(total_tested, 1)) * 100, 1) if total_tested > 0 else 0
-    backtest_out = {
-        "type": "swing",
-        "lookback_weeks": lookback_weeks,
-        "weekly_results": results,
-        "avg_hit_rate": overall_hit_rate,
-        "total_winners_found": total_tested,
-        "total_screener_hits": total_hits,
-        "run_at": get_ist_now().strftime('%Y-%m-%d %H:%M:%S'),
-    }
-    save_backtest_results(backtest_out)
-    return backtest_out
-
-# =============================================================================
-# PERFORMANCE LAB — HISTORICAL TOP 3 GAINERS & LOSERS ENGINE (Expanded Depth 180+ Days / 104 Weeks)
-# =============================================================================
-def fetch_and_store_historical_intraday_top3(lookback_days=60, progress_cb=None):
-    """
-    Fetches past N trading days historical data for all 219 F&O stocks (Up to 180+ Days / 252 Days).
-    For each trading day, computes the Top 3 Gainers and Top 3 Losers from F&O Universe.
-    Mathematical formula: Daily % Change = (Close_t - Close_{t-1}) / Close_{t-1} * 100.
-    """
-    write_scan_status("hist_intraday_fetch", "running", 0.05)
+def num(x, d=2):
     try:
-        # Fetch sufficient history for requested lookback (up to 2-year daily data for 180-252 days)
-        period_str = "2y" if lookback_days > 90 else "1y"
-        bulk_df = fetch_bulk_data(tuple(FO_UNIVERSE), period=period_str, interval="1d")
-        if bulk_df.empty:
-            write_scan_status("hist_intraday_fetch", "error", 0, "Failed to download daily F&O data from yfinance")
-            return []
+        v = float(x)
+        return "—" if not np.isfinite(v) else f"{v:.{d}f}"
+    except Exception:
+        return "—"
 
-        ref_df = fetch_nifty_series(period=period_str, interval="1d")
-        if ref_df.empty or len(ref_df) < 5:
-            if isinstance(bulk_df.columns, pd.MultiIndex):
-                first_sym = bulk_df.columns.get_level_values(0)[0]
-                ref_df = bulk_df[first_sym].dropna(subset=['Close'])
-            else:
-                ref_df = bulk_df.dropna(subset=['Close'])
+def ticket_card(tk, prob=None, extra_rows=None, low_conf=False, ladder=None):
+    side = tk["side"]
+    accent = "#0ecb81" if side == "BUY" else "#f6465d"
+    warn = ("<div style='margin-top:8px;font-size:11px;color:#f0b90b'>"
+            "⚠ LOW-CONFIDENCE SIDE — short ORB showed no reliable edge in "
+            "walk-forward testing. Half size or skip.</div>") if low_conf else ""
+    pr = (f"<div style='font-size:12px;color:#8f96b3'>model probability of hitting target "
+          f"<b style='color:#e2e4ef'>{prob*100:.1f}%</b></div>") if prob is not None else ""
+    rows = ""
+    for k, v in (extra_rows or []):
+        rows += (f"<div style='display:flex;justify-content:space-between;font-size:12px;"
+                 f"padding:2px 0'><span style='color:#8f96b3'>{k}</span>"
+                 f"<span style='color:#e2e4ef;font-weight:600'>{v}</span></div>")
+    lad = ""
+    if ladder:
+        lad = "<div style='margin-top:8px;font-size:12px;color:#8f96b3'>Exit ladder</div>"
+        for _lg in ladder:  # never name this 'st' — it shadows streamlit
+            lad += (f"<div style='display:flex;justify-content:space-between;font-size:12px'>"
+                    f"<span style='color:#8f96b3'>+{_lg['pct']:.0f}% → book {_lg['book']}</span>"
+                    f"<span style='color:#0ecb81;font-weight:700'>{money(_lg['px'])}</span></div>")
+    st.markdown(f"""
+<div style="background:linear-gradient(145deg,#11141f,#0d1018);border:1px solid {accent}55;
+     border-left:4px solid {accent};border-radius:14px;padding:16px 18px;margin-bottom:12px">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <div>
+      <span style="font-size:20px;font-weight:800;color:#fff">{tk['symbol']}</span>
+      <span style="background:{accent};color:#06070d;padding:2px 10px;border-radius:6px;
+            font-size:12px;font-weight:800;margin-left:8px">{side}</span>
+    </div>
+    <div style="text-align:right">
+      <div style="font-size:11px;color:#8f96b3">QTY</div>
+      <div style="font-size:20px;font-weight:800;color:#fff;font-family:JetBrains Mono,monospace">{tk['qty']}</div>
+    </div>
+  </div>
+  {pr}
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:12px">
+    <div><div style="font-size:10px;color:#8f96b3">ENTRY</div>
+         <div style="font-size:16px;font-weight:700;color:#fff;font-family:JetBrains Mono,monospace">{money(tk['entry'])}</div></div>
+    <div><div style="font-size:10px;color:#f6465d">STOP LOSS</div>
+         <div style="font-size:16px;font-weight:700;color:#f6465d;font-family:JetBrains Mono,monospace">{money(tk['sl'])}</div>
+         <div style="font-size:10px;color:#8f96b3">−{tk['sl_pct']}%</div></div>
+    <div><div style="font-size:10px;color:#0ecb81">TARGET 1 (book 50%)</div>
+         <div style="font-size:16px;font-weight:700;color:#0ecb81;font-family:JetBrains Mono,monospace">{money(tk['t1'])}</div></div>
+    <div><div style="font-size:10px;color:#0ecb81">TARGET 2 ({tk['target_pct']}%)</div>
+         <div style="font-size:16px;font-weight:700;color:#0ecb81;font-family:JetBrains Mono,monospace">{money(tk['t2'])}</div></div>
+  </div>
+  <div style="display:flex;gap:18px;margin-top:10px;font-size:11px;color:#8f96b3">
+    <span>Risk {money(tk['risk_rs'])}</span><span>Reward {money(tk['reward_rs'])}</span>
+    <span>R:R 1:{tk['rr']}</span>
+  </div>
+  {rows}{lad}{warn}
+</div>""", unsafe_allow_html=True)
 
-        dates = [d.strftime('%Y-%m-%d') for d in ref_df.index]
-        if len(dates) < 2:
-            write_scan_status("hist_intraday_fetch", "error", 0, "Insufficient trading dates found")
-            return []
-
-        target_dates = dates[-min(lookback_days + 1, len(dates)):]
-        eval_dates = target_dates[1:]  # index 0 is baseline
-
-        daily_records = []
-        total_eval = len(eval_dates)
-
-        for i, dt_str in enumerate(eval_dates):
-            if progress_cb:
-                progress_cb((i + 1) / total_eval)
-            write_scan_status("hist_intraday_fetch", "running", 0.10 + ((i + 1) / total_eval) * 0.85)
-
-            day_stats = []
-            for ticker in FO_UNIVERSE:
-                try:
-                    df_t = None
-                    if isinstance(bulk_df.columns, pd.MultiIndex):
-                        if ticker in bulk_df.columns.get_level_values(0):
-                            df_t = bulk_df[ticker].dropna(subset=['Close'])
-                    else:
-                        df_t = bulk_df.dropna(subset=['Close'])
-
-                    if df_t is None or df_t.empty:
-                        continue
-
-                    dt_mask = df_t.index.strftime('%Y-%m-%d') == dt_str
-                    if not dt_mask.any():
-                        continue
-
-                    row_idx = df_t.index.get_loc(df_t[dt_mask].index[0])
-                    if row_idx < 1:
-                        continue
-
-                    curr = df_t.iloc[row_idx]
-                    prev = df_t.iloc[row_idx - 1]
-
-                    prev_c = float(prev['Close'])
-                    curr_c = float(curr['Close'])
-                    curr_o = float(curr.get('Open', curr_c))
-                    curr_h = float(curr.get('High', curr_c))
-                    curr_l = float(curr.get('Low', curr_c))
-                    curr_v = float(curr.get('Volume', 0))
-
-                    if prev_c <= 0 or curr_c <= 0:
-                        continue
-
-                    chg_pct = ((curr_c - prev_c) / prev_c) * 100.0
-                    intra_move_pct = ((curr_c - curr_o) / curr_o) * 100.0 if curr_o > 0 else 0.0
-                    day_range_pct = ((curr_h - curr_l) / curr_l) * 100.0 if curr_l > 0 else 0.0
-                    turnover_cr = (curr_c * curr_v) / 1e7
-
-                    day_stats.append({
-                        "symbol": ticker.replace('.NS', ''),
-                        "ticker": ticker,
-                        "date": dt_str,
-                        "prev_close": round(prev_c, 2),
-                        "open": round(curr_o, 2),
-                        "high": round(curr_h, 2),
-                        "low": round(curr_l, 2),
-                        "close": round(curr_c, 2),
-                        "change_pct": round(chg_pct, 2),
-                        "intra_move_pct": round(intra_move_pct, 2),
-                        "day_range_pct": round(day_range_pct, 2),
-                        "volume": int(curr_v),
-                        "turnover_cr": round(turnover_cr, 1),
-                        "sector": get_stock_sector(ticker)
-                    })
-                except Exception:
-                    continue
-
-            if not day_stats:
-                continue
-
-            day_stats.sort(key=lambda x: x['change_pct'], reverse=True)
-            top3_gainers = day_stats[:3]
-            top3_losers = sorted(day_stats[-3:], key=lambda x: x['change_pct'])
-
-            daily_records.append({
-                "date": dt_str,
-                "total_fo_scanned": len(day_stats),
-                "gainers": top3_gainers,
-                "losers": top3_losers,
-                "avg_gainer_move": round(np.mean([g['change_pct'] for g in top3_gainers]), 2) if top3_gainers else 0,
-                "avg_loser_move": round(np.mean([l['change_pct'] for l in top3_losers]), 2) if top3_losers else 0,
-            })
-
-        daily_records.reverse()  # Latest date first
-        save_hist_intraday(daily_records)
-        write_scan_status("hist_intraday_fetch", "complete", 1.0)
-        return daily_records
-    except Exception as e:
-        write_scan_status("hist_intraday_fetch", "error", 0, str(e))
-        return []
-
-def fetch_and_store_historical_swing_top3(lookback_weeks=12, progress_cb=None):
-    """
-    Fetches past N weeks historical data for all 219 F&O stocks (Up to 104 Weeks / 2 Years).
-    For each weekly session (Monday to Friday), computes Top 3 Weekly Gainers and Losers.
-    Mathematical formula: Weekly Return % = (Friday Close - Monday Open) / Monday Open * 100.
-    """
-    write_scan_status("hist_swing_fetch", "running", 0.05)
-    try:
-        # Fetch 3-year data to support up to 104 weeks of swing analysis
-        period_str = "3y" if lookback_weeks > 52 else "2y"
-        bulk_df = fetch_bulk_data(tuple(FO_UNIVERSE), period=period_str, interval="1d")
-        if bulk_df.empty:
-            write_scan_status("hist_swing_fetch", "error", 0, "Failed to download swing data from yfinance")
-            return []
-
-        ref_df = fetch_nifty_series(period=period_str, interval="1d")
-        if ref_df.empty:
-            if isinstance(bulk_df.columns, pd.MultiIndex):
-                first_sym = bulk_df.columns.get_level_values(0)[0]
-                ref_df = bulk_df[first_sym].dropna(subset=['Close'])
-            else:
-                ref_df = bulk_df.dropna(subset=['Close'])
-
-        if ref_df.empty:
-            write_scan_status("hist_swing_fetch", "error", 0, "Insufficient index data for swing")
-            return []
-
-        ref_df = ref_df.copy()
-        ref_df['Year'] = ref_df.index.year
-        ref_df['Week'] = ref_df.index.isocalendar().week.values
-        ref_df['DateStr'] = ref_df.index.strftime('%Y-%m-%d')
-
-        week_groups = []
-        for (yr, wk), g in ref_df.groupby(['Year', 'Week']):
-            dates_in_wk = list(g['DateStr'].values)
-            if len(dates_in_wk) >= 1:
-                week_groups.append({
-                    "week_key": f"{yr}-W{wk:02d}",
-                    "dates": dates_in_wk,
-                    "week_start": dates_in_wk[0],
-                    "week_end": dates_in_wk[-1]
-                })
-
-        target_weeks = week_groups[-min(lookback_weeks, len(week_groups)):]
-        weekly_records = []
-        total_eval = len(target_weeks)
-
-        for i, wg in enumerate(target_weeks):
-            if progress_cb:
-                progress_cb((i + 1) / total_eval)
-            write_scan_status("hist_swing_fetch", "running", 0.10 + ((i + 1) / total_eval) * 0.85)
-
-            wk_key = wg["week_key"]
-            wk_dates = wg["dates"]
-            wk_start = wg["week_start"]
-            wk_end = wg["week_end"]
-
-            stock_week_stats = []
-            for ticker in FO_UNIVERSE:
-                try:
-                    df_t = None
-                    if isinstance(bulk_df.columns, pd.MultiIndex):
-                        if ticker in bulk_df.columns.get_level_values(0):
-                            df_t = bulk_df[ticker].dropna(subset=['Close'])
-                    else:
-                        df_t = bulk_df.dropna(subset=['Close'])
-
-                    if df_t is None or df_t.empty:
-                        continue
-
-                    df_t_dates = df_t.index.strftime('%Y-%m-%d')
-                    wk_sub = df_t[df_t_dates.isin(wk_dates)]
-                    if wk_sub.empty:
-                        continue
-
-                    mon_open = float(wk_sub.iloc[0].get('Open', wk_sub.iloc[0]['Close']))
-                    fri_close = float(wk_sub.iloc[-1]['Close'])
-                    wk_high = float(wk_sub['High'].max())
-                    wk_low = float(wk_sub['Low'].min())
-                    total_vol = float(wk_sub['Volume'].sum())
-
-                    if mon_open <= 0 or fri_close <= 0:
-                        continue
-
-                    weekly_return_pct = ((fri_close - mon_open) / mon_open) * 100.0
-                    week_range_pct = ((wk_high - wk_low) / wk_low) * 100.0 if wk_low > 0 else 0.0
-                    turnover_cr = (fri_close * total_vol) / 1e7
-
-                    stock_week_stats.append({
-                        "symbol": ticker.replace('.NS', ''),
-                        "ticker": ticker,
-                        "week_key": wk_key,
-                        "week_start": wk_start,
-                        "week_end": wk_end,
-                        "mon_open": round(mon_open, 2),
-                        "fri_close": round(fri_close, 2),
-                        "week_high": round(wk_high, 2),
-                        "week_low": round(wk_low, 2),
-                        "weekly_return_pct": round(weekly_return_pct, 2),
-                        "week_range_pct": round(week_range_pct, 2),
-                        "total_volume": int(total_vol),
-                        "turnover_cr": round(turnover_cr, 1),
-                        "sector": get_stock_sector(ticker)
-                    })
-                except Exception:
-                    continue
-
-            if not stock_week_stats:
-                continue
-
-            stock_week_stats.sort(key=lambda x: x['weekly_return_pct'], reverse=True)
-            top3_gainers = stock_week_stats[:3]
-            top3_losers = sorted(stock_week_stats[-3:], key=lambda x: x['weekly_return_pct'])
-
-            weekly_records.append({
-                "week_key": wk_key,
-                "week_start": wk_start,
-                "week_end": wk_end,
-                "total_fo_scanned": len(stock_week_stats),
-                "gainers": top3_gainers,
-                "losers": top3_losers,
-                "avg_gainer_move": round(np.mean([g['weekly_return_pct'] for g in top3_gainers]), 2) if top3_gainers else 0,
-                "avg_loser_move": round(np.mean([l['weekly_return_pct'] for l in top3_losers]), 2) if top3_losers else 0,
-            })
-
-        weekly_records.reverse()  # Latest week first
-        save_hist_swing(weekly_records)
-        write_scan_status("hist_swing_fetch", "complete", 1.0)
-        return weekly_records
-    except Exception as e:
-        write_scan_status("hist_swing_fetch", "error", 0, str(e))
-        return []
-
-def start_historical_intraday_fetch(lookback_days=60):
-    thread = threading.Thread(target=fetch_and_store_historical_intraday_top3, args=(lookback_days,), daemon=True)
-    thread.start()
-
-def start_historical_swing_fetch(lookback_weeks=12):
-    thread = threading.Thread(target=fetch_and_store_historical_swing_top3, args=(lookback_weeks,), daemon=True)
-    thread.start()
-
-# =============================================================================
-# PERFORMANCE LAB — AUTO-SCHEDULE (Daily/Weekly Discovery)
-# =============================================================================
-def _auto_discover_worker(discover_type="intraday"):
-    """Background worker for auto-discovery"""
-    try:
-        if discover_type == "intraday":
-            discover_intraday_winners()
-            fetch_and_store_historical_intraday_top3(lookback_days=60)
-        elif discover_type == "swing":
-            discover_swing_winners()
-            fetch_and_store_historical_swing_top3(lookback_weeks=12)
-    except Exception as e:
-        key = f"perf_{discover_type}_discovery"
-        write_scan_status(key, "error", 0, str(e))
-
-def start_auto_discovery(discover_type="intraday"):
-    """Launch auto-discovery in background thread"""
-    thread = threading.Thread(target=_auto_discover_worker, args=(discover_type,), daemon=True)
-    thread.start()
-
-# Auto-trigger: run intraday discovery after 3:35 PM on weekdays
-_auto_disc_key = "perf_auto_discovery_triggered"
-if _auto_disc_key not in st.session_state:
-    st.session_state[_auto_disc_key] = False
-
-def check_auto_discovery():
-    """Check if we should auto-run discovery and historical updates"""
-    now = get_ist_now()
-    if now.weekday() >= 5:
-        return  # Weekend
-    if st.session_state.get(_auto_disc_key):
-        return  # Already triggered today
-
-    # Intraday: after 3:35 PM on weekdays
-    if now.time() >= dtime(15, 35):
-        today_str = now.strftime('%Y-%m-%d')
-        filepath = os.path.join(INTRADAY_WINNERS_DIR, f"{today_str}.json")
-        if not os.path.exists(filepath):
-            st.session_state[_auto_disc_key] = True
-            start_auto_discovery("intraday")
-
-    # Swing: Friday after 3:35 PM
-    if now.weekday() == 4 and now.time() >= dtime(15, 35):
-        iso_year, iso_week, _ = now.isocalendar()
-        week_key = f"{iso_year}-W{iso_week:02d}"
-        filepath = os.path.join(SWING_WINNERS_DIR, f"{week_key}.json")
-        if not os.path.exists(filepath):
-            start_auto_discovery("swing")
-
-
-# =============================================================================
-SCAN_KEYS = ['intraday_live', 'intraday_eod', 'intraday_runners',
-             'swing_live', 'swing_eod', 'swing_runners']
-
-for key in SCAN_KEYS:
-    if f'{key}_results' not in st.session_state:
-        # Try loading from disk
-        saved, scan_time = load_session_results(key)
-        st.session_state[f'{key}_results'] = saved
-        st.session_state[f'{key}_scan_time'] = scan_time or ""
-
-if 'view_mode' not in st.session_state:
-    st.session_state['view_mode'] = 'list'  # 'list' or 'card'
-
-# Load settings
-saved_settings = load_settings()
-
-# =============================================================================
-# GLOBAL DATA
-# =============================================================================
-market_live = is_market_hours()
-indices_data = fetch_market_indices()
-nifty_daily = fetch_nifty_series(period="2y", interval="1d")
-market_regime = get_market_regime(nifty_daily)
-nifty_rs_series = get_nifty_rs_series(nifty_daily)
-
-# Auto-refresh while scans are running
-PERF_SCAN_KEYS = ['perf_intraday_discovery', 'perf_swing_discovery', 'hist_intraday_fetch', 'hist_swing_fetch']
-any_scan_running = any(read_scan_status(k).get("status") == "running" for k in SCAN_KEYS + PERF_SCAN_KEYS)
-if any_scan_running and AUTOREFRESH_AVAILABLE:
-    st_autorefresh(interval=3000, key="scan_poll")
-
-# Auto-trigger winner discovery after market close
-check_auto_discovery()
+def pivot_table(piv):
+    if not piv:
+        st.caption("no pivot data")
+        return
+    rows = []
+    for tf, label in (("D", "Daily"), ("W", "Weekly"), ("M", "Monthly")):
+        p = piv.get(tf) or {}
+        if not p:
+            continue
+        rows.append({"TF": label, "S2": num(p.get("S2")), "S1": num(p.get("S1")),
+                     "BC": num(p.get("BC")), "Pivot": num(p.get("P")), "TC": num(p.get("TC")),
+                     "R1": num(p.get("R1")), "R2": num(p.get("R2")),
+                     "CPR width %": num(p.get("CPR_W"))})
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 # =============================================================================
 # HEADER
 # =============================================================================
-h1, h2 = st.columns([4, 1])
-with h1:
-    st.markdown("<div class='main-header'>👑 QUANT-EDGE v20 — One-Way Runner Terminal</div>", unsafe_allow_html=True)
-    st.markdown("<div class='sub-caption'>Multi-TF Confluence • Weekly/Monthly Pivots • Volume Profile • Institutional Psychology • 180D/104W Backtest Lab</div>", unsafe_allow_html=True)
-with h2:
-    ms, mc = get_market_status()
-    st.markdown(f"<div class='market-status {mc}'>{ms}</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='last-updated'>{get_ist_now().strftime('%d %b %Y • %I:%M %p IST')}</div>", unsafe_allow_html=True)
+ph = market_phase()
+PHASE_TXT = {
+    "PRE_OPEN": ("PRE-MARKET PREP", "info"), "OPEN_AUCTION": ("NSE PRE-OPEN LIVE", "warn"),
+    "ORB": ("FIRST 5-MIN CANDLE FORMING", "warn"), "LIVE": ("MARKET LIVE", "bull"),
+    "POST": ("POST-MARKET", "neutral"), "CLOSED": ("CLOSED", "neutral"),
+    "HOLIDAY": ("MARKET HOLIDAY / WEEKEND", "bear"),
+}
+ptxt, pkind = PHASE_TXT.get(ph, (ph, "neutral"))
 
-# Hero Banner
-hero_long, hero_short, bull_heroes_list, bear_heroes_list = scan_heroes(tuple(FO_UNIVERSE))
-locked_data, locked_time = load_premarket_heroes()
-if locked_data and locked_data[0]:
-    hero_long, hero_short, bull_heroes_list, bear_heroes_list = locked_data
-
-if hero_long or hero_short:
-    lock_badge = f"<span style='color:#00ffaa; font-size:11px; font-weight:bold; margin-left:10px;'>🔒 LOCKED FOR DAY ({locked_time.split(' ')[1] if locked_time and ' ' in locked_time else '09:08 AM'})</span>" if (locked_time and locked_data and locked_data[0]) else "<span style='color:#ffaa00; font-size:11px; font-weight:bold; margin-left:10px;'>⏳ PRE-OPEN AUCTION SCAN</span>"
-    ht = f"🏆 <b>PRE-MARKET INSTITUTIONAL HEROES</b> {lock_badge} 🏆<br/>"
-    if hero_long:
-        ht += f"🟢 <b>{hero_long['Symbol']}</b> {hero_long['Conf']} (+{hero_long['Gap']:.1f}% • ATR Beta {hero_long.get('ATR_Pct', 0):.1f}%) "
-    if hero_short:
-        ht += f"| 🔴 <b>{hero_short['Symbol']}</b> {hero_short['Conf']} ({hero_short['Gap']:.1f}% • ATR Beta {hero_short.get('ATR_Pct', 0):.1f}%)"
-    st.markdown(f"<div class='hero-banner'>{ht}</div>", unsafe_allow_html=True)
-
-# Regime Banner & Intraday NIFTY Trend
-nifty_intra_trend, nifty_intra_pct, nifty_intra_desc = get_nifty_intraday_direction()
-rc = {"BULL": "regime-bull", "BEAR": "regime-bear", "CHOPPY": "regime-choppy"}.get(market_regime, "regime-choppy")
-rm = {
-    "BULL": "🟢 DAILY REGIME: BULL — Nifty > EMA • Supertrend ↑ • Institutions buying dips",
-    "BEAR": "🔴 DAILY REGIME: BEAR — Nifty < EMA • Supertrend ↓ • Institutions selling rallies",
-    "CHOPPY": "🟡 DAILY REGIME: CHOPPY — Trend unclear • Wait for momentum"
-}.get(market_regime, "")
-
-if nifty_intra_trend == "BULL_TREND":
-    rm += f" | {nifty_intra_desc} (Counter-trend SELL blocked)"
-elif nifty_intra_trend == "BEAR_TREND":
-    rm += f" | {nifty_intra_desc} (Counter-trend BUY blocked)"
-else:
-    rm += f" | {nifty_intra_desc}"
-
-st.markdown(f"<div class='regime-banner {rc}'>{rm}</div>", unsafe_allow_html=True)
-
-# Index Strip
-c1, c2, c3 = st.columns(3)
-for i, (name, m) in enumerate(indices_data.items()):
-    if i >= 3: break
-    col = [c1, c2, c3][i]
-    chg_val = m.get("Chg", 0.0)
-    pct_val = m.get("Pct", 0.0)
-    ltp_val = m.get("LTP", 0.0)
-    cs = "change-up" if chg_val >= 0 else "change-down"
-    sign = "+" if chg_val >= 0 else ""
-    with col:
-        st.markdown(f"""<div class="metric-card">
-            <div class="metric-header">{name}</div>
-            <div class="metric-val">₹{ltp_val:,.1f}</div>
-            <div class="metric-change {cs}">{sign}{chg_val:,.1f} ({sign}{pct_val:.2f}%)</div>
-        </div>""", unsafe_allow_html=True)
+st.markdown("<div class='main-header'>⚡ QUANT-EDGE v21 — Institutional ORB Terminal</div>",
+            unsafe_allow_html=True)
+st.markdown("<div class='sub-caption'>Calibrated on 744 daily sessions • 12,598 real 5-min ORB events • "
+            "133 weeks of 60-min swing outcomes — every threshold below is measured, not guessed</div>",
+            unsafe_allow_html=True)
+c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
+c1.markdown(chip(ptxt, pkind), unsafe_allow_html=True)
+c2.markdown(f"<div class='last-updated'>{fmt_ist()}</div>", unsafe_allow_html=True)
 
 # =============================================================================
 # SIDEBAR
 # =============================================================================
 with st.sidebar:
-    st.markdown("<div class='main-header' style='font-size:18px;'>⚙️ Control Panel</div>", unsafe_allow_html=True)
+    st.markdown("### ⚙️ Control")
+    capital = st.number_input("Trading capital (₹)", 25000, 100000000,
+                              CFG["DEFAULT_CAPITAL"], step=25000)
+    CFG["RISK_PER_TRADE_PCT"] = st.slider("Risk per trade (% of capital)", 0.25, 3.0,
+                                          CFG["RISK_PER_TRADE_PCT"], 0.25)
+    st.divider()
+    st.markdown("#### Automation")
+    a1, a2 = st.columns(2)
+    if a1.button("▶ Start", use_container_width=True):
+        start_auto()
+    if a2.button("■ Stop", use_container_width=True):
+        stop_auto()
+    st.caption(("🟢 running — pre-market at 09:00, ORB refresh every minute, "
+                "EOD + outcome recording after 15:45, swing plan on Friday, "
+                "model refit monthly") if AUTOSTATE["running"] else "⚪ idle")
+    if AUTOSTATE["log"]:
+        with st.expander("automation log", expanded=False):
+            for l in AUTOSTATE["log"][:25]:
+                st.caption(l)
+    st.divider()
+    live_refresh = st.checkbox("Auto-refresh page (30s)", value=(ph == "LIVE"))
+    if live_refresh and HAS_AUTOREFRESH:
+        st_autorefresh(interval=30000, key="qe21refresh")
+    if st.button("🔄 Clear data cache", use_container_width=True):
+        CACHE.clear()
+        st.success("cache cleared")
+    st.divider()
+    st.markdown("#### Universe health")
+    try:
+        uni, dead = validated_universe()
+        st.caption(f"{len(uni)} live symbols")
+        if dead:
+            st.caption("auto-dropped (delisted/renamed): " + ", ".join(d.replace('.NS','') for d in dead[:12]))
+    except Exception as e:
+        st.caption(f"validation pending ({e})")
+    st.divider()
+    st.markdown("#### Models")
+    for nm, m in (("Intraday LONG", MODEL_L), ("Intraday SHORT", MODEL_S), ("Swing LONG", MODEL_SW)):
+        if m:
+            st.caption(f"{nm}: {len(m.features)} features, n={m.n:,}")
 
-    with st.expander("🌍 Universe", expanded=True):
-        u_sel = st.selectbox("Stock Universe", ["Full F&O (219)", "Custom"] + list(SECTOR_MAP.keys()), key="u_sel")
-        if u_sel == "Full F&O (219)": active_tickers = FO_UNIVERSE
-        elif u_sel == "Custom":
-            ci = st.text_area("Tickers:", value="TATAMOTORS.NS,RELIANCE.NS", key="ct")
-            active_tickers = [t.strip().upper() for t in ci.split(",") if t.strip()]
-        else: active_tickers = [t.strip() for t in SECTOR_MAP[u_sel].split(",")]
-        st.caption(f"📊 {len(active_tickers)} symbols")
+TABS = st.tabs(["🌅 Pre-Market (09:08)", "⚡ Live ORB", "🌙 EOD → Tomorrow",
+                "📈 Swing (Friday)", "🧠 Calibration & Learning", "📓 Journal"])
 
-    with st.expander("💰 Capital & Risk", expanded=True):
-        capital_base = st.number_input("Capital ₹", min_value=10000, value=saved_settings.get("capital", 200000), step=10000, key="cap")
-        risk_per_trade = st.slider("Risk/Trade %", 0.25, 3.0, saved_settings.get("risk_pct", 1.0), 0.25, key="rpt")
-        # Save settings
-        if capital_base != saved_settings.get("capital") or risk_per_trade != saved_settings.get("risk_pct"):
-            save_settings({"capital": capital_base, "risk_pct": risk_per_trade})
-
-    with st.expander("📊 Intraday Config", expanded=False):
-        intra_rr = st.slider("R:R Ratio", 1.0, 5.0, 2.0, 0.5, key="irr")
-        intra_min_score = st.slider("Min Score", 0, 100, 55, 5, key="ims")
-        st.caption("⏱️ TFs: 15m + 30m + 1h confluence")
-        st.caption("📌 Weekly Pivot (new every Monday)")
-
-    with st.expander("📈 Swing Config", expanded=False):
-        swing_rr = st.slider("R:R Ratio", 1.0, 5.0, 2.0, 0.5, key="srr")
-        swing_min_score = st.slider("Min Score", 0, 100, 60, 5, key="sms")
-        st.caption("⏱️ TFs: 1h + 1D confluence")
-        st.caption("📌 Monthly Pivot (1st trading day)")
-
-    with st.expander("🔄 Auto-Refresh", expanded=False):
-        ref = st.selectbox("Interval", ["Manual", "30s", "60s", "2min"], key="ro")
-        if ref != "Manual" and AUTOREFRESH_AVAILABLE and market_live:
-            rs = {"30s": 30, "60s": 60, "2min": 120}[ref]
-            st_autorefresh(interval=rs * 1000, key="ar_main")
-            st.caption(f"✅ Every {rs}s")
-
-# =============================================================================
-# DISPLAY ENGINE — Card View + List View (List View by Default)
-# =============================================================================
-def render_scan_status(scan_key):
-    """Show scan status badge"""
-    status = read_scan_status(scan_key)
-    s = status.get("status", "idle")
-    if s == "running":
-        prog = status.get("progress", 0)
-        st.markdown(f"<div class='scan-status scan-running'>🔄 Scanning {prog*100:.0f}%</div>", unsafe_allow_html=True)
-        return True
-    elif s == "complete":
-        t = status.get("time", "")
-        st.markdown(f"<div class='scan-status scan-complete'>✅ Complete @ {t}</div>", unsafe_allow_html=True)
-        return False
-    elif s == "error":
-        st.error(f"❌ Scan error: {status.get('error', 'Unknown')}")
-        return False
-    return False
-
-def display_view_toggle(key_prefix, default="list"):
-    """Card/List view toggle with per-section state (defaults to list view)"""
-    state_key = f"view_mode_{key_prefix}"
-    if state_key not in st.session_state:
-        st.session_state[state_key] = default
-    current_mode = st.session_state[state_key]
-
-    c1, c2, _ = st.columns([1.2, 1.2, 7.6])
-    with c1:
-        type_l = "primary" if current_mode == "list" else "secondary"
-        if st.button("📋 List View", key=f"{key_prefix}_list_btn", type=type_l, use_container_width=True):
-            st.session_state[state_key] = 'list'
-            st.rerun()
-    with c2:
-        type_c = "primary" if current_mode == "card" else "secondary"
-        if st.button("🃏 Cards View", key=f"{key_prefix}_card_btn", type=type_c, use_container_width=True):
-            st.session_state[state_key] = 'card'
-            st.rerun()
-    return st.session_state[state_key]
-
-def display_results(results, scan_key="", fetch_live=True):
-    """Display scan results in Card or List view"""
-    if not results:
-        st.info("🔍 No signals. Run a scan to populate."); return
-
-    # Fetch live prices if market is open
-    live_prices = {}
-    if fetch_live and market_live and len(results) <= 50:
-        tks = tuple(r['Symbol'] + '.NS' for r in results)
-        live_prices = fetch_live_prices(tks)
-
-    scan_time = st.session_state.get(f'{scan_key}_scan_time', '')
-    if scan_time:
-        st.markdown(f"<div class='last-updated'>📅 Scanned: {scan_time}</div>", unsafe_allow_html=True)
-
-    mode = display_view_toggle(scan_key, default="list")
-
-    if mode == 'card':
-        _display_cards(results, live_prices)
+# ---------------------------------------------------------------- PRE-MARKET
+with TABS[0]:
+    st.markdown("#### Top 1 BUY + Top 1 SELL for today")
+    st.caption("Run between 09:00 and 09:08. Uses the live NSE pre-open call auction "
+               "(indicative equilibrium price) — v20 read yesterday's daily bar here, "
+               "which made the whole pre-market engine wrong.")
+    if st.button("🌅 Run pre-market scan", type="primary", key="pm"):
+        with st.spinner("reading NSE pre-open book + building features…"):
+            st.session_state.pm = scan_premarket(capital=capital)
+    res = st.session_state.get("pm") or load_scan("premarket")
+    if res and not res.get("error"):
+        st.caption(f"source: {res.get('source')} • regime {res.get('regime')} • "
+                   f"{res.get('n_candidates')} feasible names")
+        if "previous close" in str(res.get("source", "")):
+            st.warning("NSE pre-open feed unavailable — gaps assumed flat. Re-run after 09:02, "
+                       "or trade the Live ORB tab instead, which never needs pre-open data.")
+        L, R = st.columns(2)
+        with L:
+            st.markdown("##### 🟢 BUY candidate")
+            for i, c in enumerate((res.get("longs") or [])[:1]):
+                r = c["row"]
+                ticket_card(c["ticket"], extra_rows=[
+                    ("Expected open", money(r.get("exp_open"))),
+                    ("Gap", pct(r.get("gap"))),
+                    ("ATR% / ADR%", f"{num(r.get('atr_pct'))} / {num(r.get('adr20'))}"),
+                    ("P(+2% | this gap bucket)", f"{num(r.get('p_up'),1)}%"),
+                    ("Days ≥2.5% in last 20", num(r.get("big20"), 0)),
+                    ("Room to next resistance", pct(r.get("room_up"))),
+                ])
+            with st.expander("next 7 long candidates"):
+                for c in (res.get("longs") or [])[1:]:
+                    r = c["row"]
+                    st.write(f"**{r['sym']}** {r['sector']} • gap {pct(r.get('gap'))} • "
+                             f"ATR {num(r.get('atr_pct'))}% • P(up2) {num(r.get('p_up'),1)}%")
+        with R:
+            st.markdown("##### 🔴 SELL candidate")
+            for c in (res.get("shorts") or [])[:1]:
+                r = c["row"]
+                ticket_card(c["ticket"], low_conf=True, extra_rows=[
+                    ("Expected open", money(r.get("exp_open"))),
+                    ("Gap", pct(r.get("gap"))),
+                    ("ATR% / ADR%", f"{num(r.get('atr_pct'))} / {num(r.get('adr20'))}"),
+                    ("P(−2% | this gap bucket)", f"{num(r.get('p_dn'),1)}%"),
+                    ("Room to next support", pct(r.get("room_dn"))),
+                ])
+            with st.expander("next 7 short candidates"):
+                for c in (res.get("shorts") or [])[1:]:
+                    r = c["row"]
+                    st.write(f"**{r['sym']}** {r['sector']} • gap {pct(r.get('gap'))} • "
+                             f"ATR {num(r.get('atr_pct'))}% • P(dn2) {num(r.get('p_dn'),1)}%")
+        st.info("These two names are the **watchlist**, not the order. The actual entry is the "
+                "close-confirmed 5-min ORB break in the Live ORB tab from 09:20 — that is the "
+                "step that lifted measured expectancy from −0.04% to +0.19% per trade.")
+        tb = res.get("table")
+        if isinstance(tb, pd.DataFrame):
+            with st.expander("full pre-market table"):
+                st.dataframe(tb.drop(columns=[c for c in ("near_res", "near_sup") if c in tb.columns]),
+                             use_container_width=True, height=380)
     else:
-        _display_list(results, live_prices)
+        st.info("No pre-market scan yet for today.")
 
-def _display_cards(results, live_prices):
-    """Render signal cards with clear Risk:Reward metrics"""
-    sorted_res = sorted(results, key=lambda x: x.get('Score', 0), reverse=True)
-    cols = st.columns(2)
-    for i, r in enumerate(sorted_res):
-        with cols[i % 2]:
-            is_bull = 'BUY' in str(r.get('Setup', '')) or 'BULL' in str(r.get('Setup', ''))
-            card_class = "signal-card-buy" if is_bull else "signal-card-sell"
-            score = r.get('Score', 0)
-            score_class = "score-high" if score >= 75 else ("score-med" if score >= 55 else "score-low")
-
-            # Risk & Reward calculation
-            risk_pts = abs(r['Entry'] - r['SL'])
-            reward_pts = abs(r['TP'] - r['Entry'])
-            qty = r.get('Qty', 1)
-            risk_inr = risk_pts * qty
-            reward_inr = reward_pts * qty
-            rr_val = r.get('RR', 2.0)
-
-            # Live price & status
-            lp = live_prices.get(r['Symbol'] + '.NS', r.get('LTP', 0))
-            status_text, _ = get_signal_status(lp, r['Entry'], r['SL'], r['TP'], is_bull) if lp else ("⏳", "#6b7294")
-
-            # Pivot badge
-            piv = r.get('Pivot', '—')
-            piv_type = r.get('Pivot_Type', 'unknown')
-            piv_class = {"above": "pivot-above", "below": "pivot-below", "near": "pivot-near"}.get(piv_type, "pivot-near")
-
-            # First candle warning
-            fc_html = ""
-            if r.get('FC_Warn', False):
-                fc_html = f"<div class='card-warning'>⚠️ Extended 1st candle: {r.get('FC_Pct', 0):.1f}% (>0.70%)</div>"
-
-            st.markdown(f"""
-            <div class='signal-card {card_class}'>
-                <div style='display:flex;justify-content:space-between;align-items:center;'>
-                    <span class='card-symbol'>{'🟢' if is_bull else '🔴'} {r['Symbol']}</span>
-                    <span class='card-score {score_class}'>{score}/100</span>
-                </div>
-                <div class='card-setup'>{r.get('Setup', '')} • {r.get('Psychology', '—')} • <span style='color:#a5b4fc;'>{r.get('Sector', 'Other')}</span></div>
-                <div class='card-prices'>
-                    Entry ₹{r['Entry']:,.1f} → Target ₹{r['TP']:,.1f} | SL ₹{r['SL']:,.1f} • Qty {qty}
-                </div>
-                <div class='rr-badge'>
-                    <span>⚖️ R:R 1:{rr_val:.1f}</span>
-                    <span class='rr-risk'>🔻 Risk: -₹{risk_inr:,.0f} (-₹{risk_pts:,.1f}/sh)</span>
-                    <span class='rr-profit'>🎯 Reward: +₹{reward_inr:,.0f} (+₹{reward_pts:,.1f}/sh)</span>
-                </div>
-                <div class='card-meta'>
-                    📅 Signal: {r.get('Signal_Time', '—')} • ⏰ Scan: {r.get('Scan_Time', '—')}<br/>
-                    💰 Live: ₹{lp:,.1f} • {r.get('Outcome_Time', '—')}
-                </div>
-                <div class='card-status' style='color:{"#00ffaa" if "TARGET" in status_text else ("#ff3366" if "SL" in status_text else "#ffaa00")}'>{status_text}</div>
-                <div class='card-indicators'>
-                    RSI {r.get('RSI', 0)} • Vol {r.get('Vol_Ratio', 0)}x • ST {'↑' if r.get('ST', 0) == 1 else '↓'}
-                    • <span class='pivot-badge {piv_class}'>{piv}</span>
-                    {f"• POC ₹{r.get('VP_POC', 0):,.0f}" if r.get('VP_POC', 0) > 0 else ""}
-                </div>
-                {fc_html}
-            </div>
-            """, unsafe_allow_html=True)
-
-def _display_list(results, live_prices):
-    """Render as sortable table with explicit Risk:Reward columns and Sector"""
-    sorted_res = sorted(results, key=lambda x: x.get('Score', 0), reverse=True)
-    rows = []
-    for r in sorted_res:
-        is_bull = 'BUY' in str(r.get('Setup', '')) or 'BULL' in str(r.get('Setup', ''))
-        lp = live_prices.get(r['Symbol'] + '.NS', r.get('LTP', 0))
-        status_text, _ = get_signal_status(lp, r['Entry'], r['SL'], r['TP'], is_bull) if lp else ("⏳", "#6b7294")
-        warn = "⚠️" if r.get('FC_Warn', False) else ""
-        risk_pts = abs(r['Entry'] - r['SL'])
-        reward_pts = abs(r['TP'] - r['Entry'])
-        qty = r.get('Qty', 1)
-        risk_inr = risk_pts * qty
-        reward_inr = reward_pts * qty
-        rr_val = r.get('RR', 2.0)
-
-        rows.append({
-            'Symbol': f"{'🟢' if is_bull else '🔴'} {r['Symbol']} {warn}",
-            'Setup': r.get('Setup', ''),
-            'Sector': r.get('Sector', 'Other'),
-            'Score': r.get('Score', 0),
-            '⚖️ R:R': f"1:{rr_val:.1f}",
-            '🔻 Max Risk': f"₹{risk_inr:,.0f}",
-            '🎯 Max Reward': f"+₹{reward_inr:,.0f}",
-            'Live ₹': f"₹{lp:,.1f}" if lp else "—",
-            'Entry': f"₹{r['Entry']:,.1f}",
-            'SL': f"₹{r['SL']:,.1f}",
-            'Target': f"₹{r['TP']:,.1f}",
-            'Status': status_text,
-            'RSI': r.get('RSI', 0),
-            'Vol': f"{r.get('Vol_Ratio', 0)}x",
-            'Pivot': r.get('Pivot', '—'),
-            '📅 Signal': r.get('Signal_Time', '—'),
-            'Qty': qty,
-        })
-    if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True,
-                     height=min(450, 35 * len(rows) + 38))
-
-def render_heroes_view(hero_long, hero_short, bull_heroes=None, bear_heroes=None, key_prefix="hero"):
-    # Normalization for inputs
-    if bull_heroes is None:
-        if isinstance(hero_long, list):
-            bull_heroes = hero_long
-            bear_heroes = hero_short if isinstance(hero_short, list) else []
-            hero_long = bull_heroes[0] if bull_heroes else None
-            hero_short = bear_heroes[0] if bear_heroes else None
-        else:
-            bull_heroes = [hero_long] if hero_long else []
-            bear_heroes = [hero_short] if hero_short else []
-
-    if not bull_heroes and not bear_heroes:
-        st.info("🟡 Pre-market data will be available at 09:08 AM on trading days.")
-        return
-
-    mode = display_view_toggle(key_prefix, default="list")
-    
-    col_bull, col_bear = st.columns(2)
-    
-    with col_bull:
-        st.markdown("<h4 style='color:#00ffaa;'>🟢 Top 3 Pre-Market Bull Heroes (NSE F&O)</h4>", unsafe_allow_html=True)
-        if mode == "card":
-            for b in bull_heroes:
-                sym_b = b.get('Symbol', '')
-                ltp_b = b.get('LTP', b.get('Open', 0.0))
-                gap_b = b.get('Gap', 0.0)
-                score_b = b.get('Score', 0)
-                sec_b = b.get('Sector', get_stock_sector(sym_b))
-                rank_b = b.get('Rank', '🥇 #1 HERO')
-                setup_b = b.get('Setup', '🟢 Momentum Breakout')
-                atr_b = b.get('ATR_Pct', 0.0)
-                entry_b = b.get('Entry', ltp_b * 1.0015)
-                sl_b = b.get('SL', ltp_b * 0.985)
-                tp_b = b.get('TP', entry_b + 2.0 * (entry_b - sl_b))
-                
-                st.markdown(f"""
-                <div class='glass-card' style='border-left: 4px solid #00ffaa; margin-bottom: 12px;'>
-                    <div style='display:flex;justify-content:space-between;align-items:center;'>
-                        <div style='font-size:16px;font-weight:800;color:#00ffaa;'>{rank_b}: {sym_b} ({score_b}/100)</div>
-                        <span class='fo-badge'>NSE F&O • {sec_b}</span>
-                    </div>
-                    <div style='font-size:13px;margin-top:4px;color:#fff;'>Open: <b>₹{ltp_b:,.1f}</b> <span style='color:#00ffaa;'>({'+' if gap_b>=0 else ''}{gap_b:.2f}%)</span> • ATR Beta: <b>{atr_b:.1f}%</b></div>
-                    <div style='font-size:12px;color:#a5b4fc;margin-top:3px;'>Setup: <b>{setup_b}</b></div>
-                    <div style='font-size:12px;color:#00ffaa;margin-top:4px;background:rgba(0,255,170,0.07);padding:4px 8px;border-radius:4px;'>
-                        🎯 Trigger: <b>₹{entry_b:,.1f}</b> → Target: <b>₹{tp_b:,.1f}</b> | SL: <b>₹{sl_b:,.1f}</b> (1:2 R:R)
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-        else:
-            b_rows = []
-            for b in bull_heroes:
-                sym = b.get("Symbol", "")
-                b_rows.append({
-                    "Rank": b.get("Rank", "🥇 #1 HERO"),
-                    "Symbol": sym,
-                    "Sector": b.get("Sector", get_stock_sector(sym)),
-                    "Opening ₹": f"₹{b.get('LTP', 0.0):,.1f}",
-                    "Gap %": f"+{b.get('Gap', 0.0):.2f}%",
-                    "Score": b.get("Score", 0),
-                    "Key Setup": b.get("Setup", "Momentum Breakout"),
-                    "Entry Trigger": f"₹{b.get('Entry', 0.0):,.1f}",
-                    "Target (1:2)": f"₹{b.get('TP', 0.0):,.1f}",
-                    "Stop Loss": f"₹{b.get('SL', 0.0):,.1f}",
-                    "ATR Beta %": f"{b.get('ATR_Pct', 0.0):.1f}%"
-                })
-            st.dataframe(pd.DataFrame(b_rows), use_container_width=True)
-            
-    with col_bear:
-        st.markdown("<h4 style='color:#ff3366;'>🔴 Top 3 Pre-Market Bear Heroes (NSE F&O)</h4>", unsafe_allow_html=True)
-        if mode == "card":
-            for s in bear_heroes:
-                sym_s = s.get('Symbol', '')
-                ltp_s = s.get('LTP', s.get('Open', 0.0))
-                gap_s = s.get('Gap', 0.0)
-                score_s = s.get('Score', 0)
-                sec_s = s.get('Sector', get_stock_sector(sym_s))
-                rank_s = s.get('Rank', '🥇 #1 HERO')
-                setup_s = s.get('Setup', '🔴 Momentum Breakdown')
-                atr_s = s.get('ATR_Pct', 0.0)
-                entry_s = s.get('Entry', ltp_s * 0.9985)
-                sl_s = s.get('SL', ltp_s * 1.015)
-                tp_s = s.get('TP', entry_s - 2.0 * (sl_s - entry_s))
-                
-                st.markdown(f"""
-                <div class='glass-card' style='border-left: 4px solid #ff3366; margin-bottom: 12px;'>
-                    <div style='display:flex;justify-content:space-between;align-items:center;'>
-                        <div style='font-size:16px;font-weight:800;color:#ff3366;'>{rank_s}: {sym_s} ({score_s}/100)</div>
-                        <span class='fo-badge'>NSE F&O • {sec_s}</span>
-                    </div>
-                    <div style='font-size:13px;margin-top:4px;color:#fff;'>Open: <b>₹{ltp_s:,.1f}</b> <span style='color:#ff3366;'>({'+' if gap_s>=0 else ''}{gap_s:.2f}%)</span> • ATR Beta: <b>{atr_s:.1f}%</b></div>
-                    <div style='font-size:12px;color:#a5b4fc;margin-top:3px;'>Setup: <b>{setup_s}</b></div>
-                    <div style='font-size:12px;color:#ff3366;margin-top:4px;background:rgba(255,51,102,0.07);padding:4px 8px;border-radius:4px;'>
-                        🎯 Trigger: <b>₹{entry_s:,.1f}</b> → Target: <b>₹{tp_s:,.1f}</b> | SL: <b>₹{sl_s:,.1f}</b> (1:2 R:R)
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-        else:
-            s_rows = []
-            for s in bear_heroes:
-                sym = s.get("Symbol", "")
-                s_rows.append({
-                    "Rank": s.get("Rank", "🥇 #1 HERO"),
-                    "Symbol": sym,
-                    "Sector": s.get("Sector", get_stock_sector(sym)),
-                    "Opening ₹": f"₹{s.get('LTP', 0.0):,.1f}",
-                    "Gap %": f"{s.get('Gap', 0.0):.2f}%",
-                    "Score": s.get("Score", 0),
-                    "Key Setup": s.get("Setup", "Momentum Breakdown"),
-                    "Entry Trigger": f"₹{s.get('Entry', 0.0):,.1f}",
-                    "Target (1:2)": f"₹{s.get('TP', 0.0):,.1f}",
-                    "Stop Loss": f"₹{s.get('SL', 0.0):,.1f}",
-                    "ATR Beta %": f"{s.get('ATR_Pct', 0.0):.1f}%"
-                })
-            st.dataframe(pd.DataFrame(s_rows), use_container_width=True)
-
-def render_manual_log_view(manual_entries, key_prefix="manual_log"):
-    if not manual_entries:
-        st.info("📭 No manually logged winners yet. Add some above!")
-        return
-
-    st.markdown(f"#### 📋 Logged Winners ({len(manual_entries)} total)")
-    mode = display_view_toggle(key_prefix, default="list")
-
-    csv_data = perf_data_to_csv(manual_entries, "manual_log")
-    if csv_data:
-        st.download_button("⬇️ Download CSV", csv_data, file_name="manual_winners_log.csv", mime="text/csv", key=f"{key_prefix}_dl")
-
-    if mode == "card":
-        m_cols = st.columns(2)
-        for idx, e in enumerate(manual_entries):
-            with m_cols[idx % 2]:
-                snap = e.get("snapshot", {})
-                is_buy = e.get("direction") == "BUY"
-                card_cls = "signal-card-buy" if is_buy else "signal-card-sell"
-                emoji = "🟢" if is_buy else "🔴"
-                sym = e.get('symbol', '')
-                sec = e.get('sector', get_stock_sector(sym))
-                st.markdown(f"""
-                <div class='signal-card {card_cls}'>
-                    <div style='display:flex;justify-content:space-between;align-items:center;'>
-                        <span class='card-symbol'>{emoji} {sym}</span>
-                        <span class='card-score score-high'>{e.get('trade_type', '')} • {e.get('direction', '')}</span>
-                    </div>
-                    <div class='card-setup'>📅 Date: {e.get('date', '—')} • Sector: {sec}</div>
-                    <div class='card-indicators'>
-                        ST {'↑' if snap.get('daily_st_dir') == 1 else '↓'} • RSI {snap.get('rsi_14', '—')} • EMA {snap.get('ema_alignment', '—')} • Vol {snap.get('vol_ratio', 0)}x • Gap {snap.get('gap_pct', 0)}%
-                    </div>
-                    {f"<div style='font-size:11px;color:#d0d4eb;margin-top:6px;font-style:italic;'>💬 {e.get('notes')}</div>" if e.get('notes') else ""}
-                </div>
-                """, unsafe_allow_html=True)
+# ---------------------------------------------------------------- LIVE ORB
+with TABS[1]:
+    st.markdown("#### Close-confirmed 5-minute ORB — order tickets")
+    k1, k2, k3 = st.columns([1, 1, 2])
+    om = k1.selectbox("ORB length", [5, 15], index=0,
+                      help="5-minute measured better than 15-minute in the study")
+    maxtr = k2.number_input("Max trades today", 1, 5, CFG["MAX_TRADES_DAY"])
+    CFG["MAX_TRADES_DAY"] = int(maxtr)
+    if k3.button("⚡ Scan ORB breaks now", type="primary", key="orb"):
+        with st.spinner("pulling 5-minute bars for the liquid universe…"):
+            st.session_state.orb = scan_live_orb(capital=capital, orb_minutes=om)
+    res = st.session_state.get("orb")
+    if res and not res.get("error"):
+        nf = res.get("nfctx", {})
+        st.caption(f"{res['n_triggers']} confirmed breaks • Nifty gap {pct(nf.get('nf_gap'))} • "
+                   f"Nifty first candle {pct(nf.get('nf_fc'))} • regime {res.get('regime')}")
+        act = res.get("actionable") or []
+        if not act:
+            st.warning("No setup currently clears the probability floor. That is a valid answer — "
+                       "the calibration says roughly 1-2 tradable ORB setups per day, not 10.")
+        for c in act[:int(maxtr)]:
+            ticket_card(c["ticket"], prob=c["p"], low_conf=c.get("low_conf"), extra_rows=[
+                ("ORB high / low", f"{num(c['orb_h'])} / {num(c['orb_l'])}"),
+                ("Break confirmed at", str(c.get("trig_time"))[11:16] + f"  (+{num(c.get('trig_min'),0)} min)"),
+                ("Last price / moved since break", f"{num(c['last'])} ({pct(c['moved'])})"),
+                ("ATR% • RVOL • gap", f"{num(c['atr_pct'])}% • {num(c['rvol'])} • {pct(c['gap'])}"),
+                ("ORB range", f"{num(c['orb_range_pct'])}%"),
+                ("Top model drivers", ", ".join(f"{a} {b:+.2f}" for a, b in (c.get("drivers") or [])[:3])),
+            ])
+        allr = res.get("all_ranked") or []
+        if allr:
+            with st.expander(f"all {len(allr)} confirmed breaks, ranked"):
+                d = pd.DataFrame(allr)[["sym", "side", "prob_pct", "entry", "sl_pct", "trig_min",
+                                        "moved", "atr_pct", "rvol", "gap", "orb_range_pct",
+                                        "sector", "passed_p", "still_valid"]]
+                st.dataframe(d.round(2), use_container_width=True, height=460, hide_index=True)
     else:
-        display_rows = []
-        for idx, e in enumerate(manual_entries):
-            snap = e.get("snapshot", {})
-            sym = e.get("symbol", "")
-            display_rows.append({
-                "#": idx + 1,
-                "Symbol": sym,
-                "Sector": e.get("sector", get_stock_sector(sym)),
-                "Type": e.get("trade_type", ""),
-                "Dir": f"{'🟢' if e.get('direction') == 'BUY' else '🔴'} {e.get('direction', '')}",
-                "Date": e.get("date", ""),
-                "ST": "↑" if snap.get("daily_st_dir") == 1 else "↓",
-                "RSI": snap.get("rsi_14", "—"),
-                "EMA": snap.get("ema_alignment", "—"),
-                "Vol": f"{snap.get('vol_ratio', 0)}x",
-                "Gap%": snap.get("gap_pct", "—"),
-                "Pivot": snap.get("pivot_pos", "—"),
-                "Notes": e.get("notes", ""),
-            })
-        st.dataframe(pd.DataFrame(display_rows), use_container_width=True, height=min(500, 35 * len(display_rows) + 38))
+        if ph in ("LIVE", "POST"):
+            st.info("Press scan. Best window is 09:20–11:00 — the study shows earlier breaks win "
+                    "far more often (trigger-minute is the single strongest negative coefficient).")
+        else:
+            st.info("Market is not live. This tab needs 5-minute bars from today.")
 
-    with st.expander("🗑️ Delete Entries"):
-        del_idx = st.number_input("Entry # to delete", min_value=1, max_value=len(manual_entries), value=1, key=f"{key_prefix}_del_idx")
-        if st.button("🗑️ Delete", key=f"{key_prefix}_del_btn"):
-            manual_entries.pop(del_idx - 1)
-            save_manual_log(manual_entries)
-            st.success("Deleted!")
-            st.rerun()
+    with st.expander("The exact rule this engine implements"):
+        st.markdown(f"""
+1. Universe: F&O names with 20-day average turnover ≥ ₹{CFG['MIN_TURNOVER_CR']}cr,
+   ATR ≥ {CFG['MIN_ATR_PCT']}% and ADR ≥ {CFG['MIN_ADR_PCT']}% — a stock that never moves 2%
+   cannot be made to move 2%.
+2. Mark the 09:15–09:20 candle high and low.
+3. **Wait for a 5-minute candle to CLOSE beyond it.** No touch entries — measured
+   improvement from 28.3% to 37.5% target-hit on the top-ranked name.
+4. Entry = that confirming close. Stop = opposite ORB edge, **capped at
+   {CFG['SL_CAP_PCT']}%** and floored at {CFG['SL_FLOOR_PCT']}%.
+5. Book half at +{CFG['PARTIAL_PCT']}% and move the stop to breakeven; the rest runs to
+   +{CFG['TARGET_PCT']}%. Square off everything by {CFG['SQUARE_OFF_TIME'].strftime('%H:%M')}.
+6. Take at most {CFG['MAX_TRADES_DAY']} trades, always the highest-probability ones,
+   no new entries after {CFG['LAST_ENTRY_TIME'].strftime('%H:%M')}.
+""")
 
-def render_ledger_view(all_results, key_prefix="ledger"):
-    if not all_results:
-        st.info("📭 No signals today. Run a scan to populate.")
-        return
-
-    mode = display_view_toggle(key_prefix, default="list")
-    df_ledger = pd.DataFrame(all_results)
-    
-    if mode == "card":
-        sorted_res = sorted(all_results, key=lambda x: x.get('Score', 0), reverse=True)
-        _display_cards(sorted_res, {})
+# ---------------------------------------------------------------- EOD
+with TABS[2]:
+    st.markdown("#### Top 5 for the next session")
+    st.caption("Run after 15:40. These are the names most likely to EXPAND tomorrow — direction is "
+               "decided by tomorrow's ORB, because D-1 features predict capability, not direction "
+               "(that is the single most important finding in the whole study).")
+    if st.button("🌙 Run EOD scan", type="primary", key="eod"):
+        with st.spinner("ranking expansion candidates…"):
+            st.session_state.eod = scan_eod(capital=capital)
+    res = st.session_state.get("eod") or load_scan("eod")
+    if res and not res.get("error"):
+        st.caption(f"for {res.get('for_date')} • regime {res.get('regime')}")
+        for i, p in enumerate(res.get("top") or [], 1):
+            r = p["row"]
+            with st.container(border=True):
+                a, b_, c_ = st.columns([2, 3, 3])
+                a.markdown(f"### {i}. {r['sym']}")
+                a.caption(r["sector"])
+                a.metric("P(moves ≥2% tomorrow)", f"{num(r.get('p_move2'),1)}%")
+                b_.write(f"Close **{money(r.get('close'))}**")
+                b_.write(f"ATR **{num(r.get('atr_pct'))}%** • ADR **{num(r.get('adr20'))}%**")
+                b_.write(f"Days ≥2.5% (20d) **{num(r.get('big20'),0)}** • (60d) **{num(r.get('big60'),0)}**")
+                b_.write(f"RVOL **{num(r.get('rvol'))}** • ADX **{num(r.get('adx'),0)}** • RSI **{num(r.get('rsi'),0)}**")
+                c_.write(f"Prev day high **{num(r.get('pdh'))}** / low **{num(r.get('pdl'))}**")
+                c_.write(f"Trend **{'UP' if (r.get('st_dir') or 0) > 0 else 'DOWN'}** • "
+                         f"vs 20d high {pct(r.get('d_hi20'))}")
+                c_.caption(p["note"])
+                with st.expander("pivots (daily / weekly / monthly)"):
+                    pivot_table({"D": p.get("pivot_D"), "W": p.get("pivot_W"), "M": p.get("pivot_M")})
+        tb = res.get("table")
+        if isinstance(tb, pd.DataFrame):
+            with st.expander("full ranked table"):
+                st.dataframe(tb.drop(columns=[c for c in ("pivots",) if c in tb.columns]).round(2),
+                             use_container_width=True, height=420)
     else:
-        cols_show = [c for c in ['Source', 'Symbol', 'Sector', 'Setup', 'Score', 'LTP', 'Entry', 'SL', 'TP',
-                                  'Status', 'Signal_Time', 'Scan_Time', 'Pivot', 'RSI', 'Vol_Ratio'] if c in df_ledger.columns]
-        st.dataframe(df_ledger[cols_show].sort_values('Score', ascending=False),
-                    use_container_width=True, height=500)
+        st.info("No EOD scan stored for today yet.")
 
-def render_winners_view(winners, is_intraday=True, key_prefix="auto_winners"):
-    if not winners:
-        st.info("No winners found for selected session.")
-        return
-
-    mode = display_view_toggle(key_prefix, default="list")
-    if mode == "card":
-        for idx, w in enumerate(winners):
-            snap = w.get("snapshot", {})
-            is_buy = w.get("direction") == "BUY"
-            card_cls = "signal-card-buy" if is_buy else "signal-card-sell"
-            emoji = "🟢" if is_buy else "🔴"
-            sym = w.get('symbol', '')
-            sec = snap.get('sector', get_stock_sector(sym))
-            hist_similar = w.get("historical_similar", [])
-            hist_text = ""
-            if hist_similar:
-                avg_fwd = np.mean([h.get("fwd_return_5d", 0) for h in hist_similar])
-                hist_text = f"<div style='font-size:10px;color:#9da3c7;margin-top:4px;'>📜 {len(hist_similar)} similar setups • Avg 5d: <b style='color:{('#00ffaa' if avg_fwd > 0 else '#ff3366')}'>{avg_fwd:+.1f}%</b></div>"
-
-            if is_intraday:
-                st.markdown(f"""
-                <div class='signal-card {card_cls}'>
-                    <div style='display:flex;justify-content:space-between;align-items:center;'>
-                        <span class='card-symbol'>{emoji} {sym}</span>
-                        <span class='card-score score-high'>+{w.get('move_pct', 0):.1f}%</span>
-                    </div>
-                    <div class='card-setup'>{w.get('direction', '')} WINNER • {sec}</div>
-                    <div class='card-prices'>ORB: ₹{w.get('fc_high', 0):,.1f} / ₹{w.get('fc_low', 0):,.1f} → Day: ₹{w.get('day_high', 0):,.1f} / ₹{w.get('day_low', 0):,.1f}</div>
-                    <div class='card-indicators'>
-                        ST {'↑' if snap.get('daily_st_dir') == 1 else '↓'} • RSI {snap.get('rsi_14', '—')} • Vol {snap.get('vol_ratio', 0)}x • Gap {snap.get('gap_pct', 0):+.1f}%
-                        • <span class='pivot-badge pivot-{'above' if 'above' in snap.get('pivot_pos', '') else 'below'}'>{snap.get('pivot_pos', '—')}</span>
-                    </div>
-                    <div style='font-size:10px;color:#7a82a6;margin-top:4px;'>1st Candle: Body {w.get('fc_body_pct', 0):.2f}% • Vol Ratio {w.get('fc_vol_ratio', 0):.1f}x • ADL: {snap.get('adl_trend', '—')}</div>
-                    {hist_text}
-                </div>
-                """, unsafe_allow_html=True)
-            else:
-                st.markdown(f"""
-                <div class='signal-card {card_cls}'>
-                    <div style='display:flex;justify-content:space-between;align-items:center;'>
-                        <span class='card-symbol'>{emoji} {sym}</span>
-                        <span class='card-score score-high'>+{w.get('move_pct', 0):.1f}% weekly</span>
-                    </div>
-                    <div class='card-setup'>{w.get('direction', '')} SWING WINNER • {sec}</div>
-                    <div class='card-prices'>Week Range: ₹{w.get('week_low', 0):,.1f} → ₹{w.get('week_high', 0):,.1f} | Close: ₹{w.get('week_close', 0):,.1f}</div>
-                    <div class='card-indicators'>
-                        ST {'↑' if snap.get('daily_st_dir') == 1 else '↓'} • RSI {snap.get('rsi_14', '—')} • EMA {snap.get('ema_alignment', '—')}
-                        • <span class='pivot-badge pivot-{'above' if 'above' in snap.get('pivot_pos', '') else 'below'}'>{snap.get('pivot_pos', '—')}</span>
-                    </div>
-                    {hist_text}
-                </div>
-                """, unsafe_allow_html=True)
+# ---------------------------------------------------------------- SWING
+with TABS[3]:
+    st.markdown("#### Weekly swing plan — LONG ONLY, Monday 1-hour ORB")
+    st.caption("Run on Friday evening or over the weekend. Refresh again at month end, when the "
+               "monthly pivot resets.")
+    if st.button("📈 Build weekly swing plan", type="primary", key="sw"):
+        with st.spinner("building weekly + monthly-pivot + sector features…"):
+            st.session_state.sw = scan_swing(capital=capital)
+    res = st.session_state.get("sw") or load_scan("swing")
+    if res and not res.get("error"):
+        st.error("**Read this before you place a swing order.** In 3 years of hourly data, only "
+                 "**2.2%** of week-stock combinations reached +10% before a −5% stop. Even the "
+                 "single best-ranked name each week reached +10% about **13%** of the time. "
+                 "+10% is the runner, not the plan — the honest plan is +3% / +5% laddered exits "
+                 "with +10% left to run, which is what these tickets do.")
+        st.caption(f"week starting {res.get('for_week')} • regime {res.get('regime')}")
+        for i, p in enumerate(res.get("top") or [], 1):
+            r = p["row"]
+            ticket_card(p["ticket"], prob=r.get("p"), ladder=p["ticket"].get("ladder"), extra_rows=[
+                ("Sector", r.get("sector")),
+                ("ATR% (must be ≥2.2)", num(r.get("atr_pct"))),
+                ("Last week return", pct(r.get("prev_wk_ret"))),
+                ("Weekly RSI", num(r.get("w_rsi"), 0)),
+                ("Position in monthly pivot range", num(r.get("piv_pos"), 0)),
+                ("Distance from 52w high", pct(r.get("d_hi52"))),
+                ("Model drivers", ", ".join(f"{a} {b:+.2f}" for a, b in (r.get("drivers") or [])[:3])),
+            ])
+            with st.expander(f"{r['sym']} pivots"):
+                pivot_table(r.get("pivots") or {})
+        st.markdown("##### Entry rule")
+        st.code(res.get("entry_rule", ""), language=None)
+        tb = res.get("table")
+        if isinstance(tb, pd.DataFrame):
+            with st.expander("full ranked swing table"):
+                st.dataframe(tb.drop(columns=[c for c in ("pivots", "drivers") if c in tb.columns]).round(2),
+                             use_container_width=True, height=420)
     else:
-        flat_winners = []
-        for w in winners:
-            snap = w.get("snapshot", {})
-            sym = w.get("symbol", "")
-            sec = snap.get("sector", get_stock_sector(sym))
-            if is_intraday:
-                flat_winners.append({
-                    "Symbol": sym,
-                    "Sector": sec,
-                    "Direction": w.get("direction", ""),
-                    "Move %": f"+{w.get('move_pct', 0):.2f}%",
-                    "1st Candle Body %": f"{w.get('fc_body_pct', 0):.2f}%",
-                    "Day High": f"₹{w.get('day_high', 0):,.1f}",
-                    "Day Low": f"₹{w.get('day_low', 0):,.1f}",
-                    "RSI": snap.get("rsi_14", "—"),
-                    "Vol Ratio": f"{snap.get('vol_ratio', 0)}x",
-                    "Pivot": snap.get("pivot_pos", "—"),
-                })
-            else:
-                flat_winners.append({
-                    "Symbol": sym,
-                    "Sector": sec,
-                    "Direction": w.get("direction", ""),
-                    "Weekly Return %": f"+{w.get('move_pct', 0):.2f}%",
-                    "Week High": f"₹{w.get('week_high', 0):,.1f}",
-                    "Week Low": f"₹{w.get('week_low', 0):,.1f}",
-                    "ST Dir": "↑ Bull" if snap.get("daily_st_dir") == 1 else "↓ Bear",
-                    "RSI": snap.get("rsi_14", "—"),
-                    "EMA Alignment": snap.get("ema_alignment", "—"),
-                    "Monthly Pivot": snap.get("pivot_pos", "—"),
-                })
-        st.dataframe(pd.DataFrame(flat_winners), use_container_width=True)
+        st.info("No swing plan stored yet.")
 
-def render_historical_top3_view(record, is_intraday=True, key_prefix="hist_top3"):
-    if not record:
-        st.info("No historical data available for selected period.")
-        return
-
-    gainers = record.get("gainers", [])
-    losers = record.get("losers", [])
-
-    mode = display_view_toggle(key_prefix, default="list")
-
-    col_g, col_l = st.columns(2)
-
-    with col_g:
-        st.markdown("<h5 style='color:#00ffaa;'>🟢 Top 3 Gainers (NSE F&O)</h5>", unsafe_allow_html=True)
-        if mode == "card":
-            for g in gainers:
-                ret_val = g.get("change_pct", g.get("weekly_return_pct", 0))
-                sym = g.get('symbol', '')
-                sec = g.get('sector', get_stock_sector(sym))
-                st.markdown(f"""
-                <div class='gainer-card'>
-                    <div style='display:flex;justify-content:space-between;align-items:center;'>
-                        <span class='card-symbol'>🟢 {sym}</span>
-                        <span class='card-score score-high'>+{ret_val:.2f}%</span>
-                    </div>
-                    <div class='card-setup'>Sector: {sec} • Turnover: ₹{g.get('turnover_cr', 0):,.1f} Cr</div>
-                    <div class='card-prices'>
-                        {f"Close ₹{g.get('close', 0):,.1f} (Prev ₹{g.get('prev_close', 0):,.1f}) | High ₹{g.get('high', 0):,.1f} / Low ₹{g.get('low', 0):,.1f}" if is_intraday else f"Fri Close ₹{g.get('fri_close', 0):,.1f} (Mon Open ₹{g.get('mon_open', 0):,.1f}) | Range {g.get('week_range_pct', 0):.1f}%"}
-                    </div>
-                    <div class='card-indicators'>
-                        {f"Intraday Move: {g.get('intra_move_pct', 0):+.2f}% • Day Range: {g.get('day_range_pct', 0):.2f}% • Vol: {g.get('volume', 0):,}" if is_intraday else f"Week High ₹{g.get('week_high', 0):,.1f} / Low ₹{g.get('week_low', 0):,.1f} • Total Vol: {g.get('total_volume', 0):,}"}
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-        else:
-            df_g = pd.DataFrame(gainers)
-            cols = [c for c in ['symbol', 'change_pct', 'weekly_return_pct', 'close', 'fri_close', 'turnover_cr', 'sector'] if c in df_g.columns]
-            st.dataframe(df_g[cols], use_container_width=True)
-
-    with col_l:
-        st.markdown("<h5 style='color:#ff3366;'>🔴 Top 3 Losers (NSE F&O)</h5>", unsafe_allow_html=True)
-        if mode == "card":
-            for l in losers:
-                ret_val = l.get("change_pct", l.get("weekly_return_pct", 0))
-                sym = l.get('symbol', '')
-                sec = l.get('sector', get_stock_sector(sym))
-                st.markdown(f"""
-                <div class='loser-card'>
-                    <div style='display:flex;justify-content:space-between;align-items:center;'>
-                        <span class='card-symbol'>🔴 {sym}</span>
-                        <span class='card-score score-low'>{ret_val:.2f}%</span>
-                    </div>
-                    <div class='card-setup'>Sector: {sec} • Turnover: ₹{l.get('turnover_cr', 0):,.1f} Cr</div>
-                    <div class='card-prices'>
-                        {f"Close ₹{l.get('close', 0):,.1f} (Prev ₹{l.get('prev_close', 0):,.1f}) | High ₹{l.get('high', 0):,.1f} / Low ₹{l.get('low', 0):,.1f}" if is_intraday else f"Fri Close ₹{l.get('fri_close', 0):,.1f} (Mon Open ₹{l.get('mon_open', 0):,.1f}) | Range {l.get('week_range_pct', 0):.1f}%"}
-                    </div>
-                    <div class='card-indicators'>
-                        {f"Intraday Move: {l.get('intra_move_pct', 0):+.2f}% • Day Range: {l.get('day_range_pct', 0):.2f}% • Vol: {l.get('volume', 0):,}" if is_intraday else f"Week High ₹{l.get('week_high', 0):,.1f} / Low ₹{l.get('week_low', 0):,.1f} • Total Vol: {l.get('total_volume', 0):,}"}
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-        else:
-            df_l = pd.DataFrame(losers)
-            cols = [c for c in ['symbol', 'change_pct', 'weekly_return_pct', 'close', 'fri_close', 'turnover_cr', 'sector'] if c in df_l.columns]
-            st.dataframe(df_l[cols], use_container_width=True)
-
-# =============================================================================
-# STATEFUL MAIN NAVIGATION (Immune to resets on rerun)
-# =============================================================================
-main_nav_options = ["🌅 PRE-MARKET SCREENER", "⚡ LIVE SCREENER", "📈 PERFORMANCE LAB", "🎯 ENTRY PLAYBOOK", "🛠️ TOOLS"]
-if "main_nav" not in st.session_state:
-    st.session_state["main_nav"] = main_nav_options[0]
-
-main_tab = st.radio(
-    "Main Navigation",
-    main_nav_options,
-    key="main_nav",
-    label_visibility="collapsed"
-)
-
-# ═══════════════════════════════════════════════════════════════
-# TAB 1: PRE-MARKET SCREENER
-# ═══════════════════════════════════════════════════════════════
-if main_tab == "🌅 PRE-MARKET SCREENER":
-    sub_pm_options = ["⚡ Pre-Market Open Heroes (09:08 AM)", "📅 Intraday EOD Picks (For Tomorrow)", "📈 Swing EOD Picks (Multi-Day)"]
-    if "sub_pm_nav" not in st.session_state:
-        st.session_state["sub_pm_nav"] = sub_pm_options[0]
-
-    sub_pm = st.radio("Pre-Market Subsections", sub_pm_options, key="sub_pm_nav", label_visibility="collapsed")
-
-    if sub_pm == "⚡ Pre-Market Open Heroes (09:08 AM)":
-        st.markdown("### ⚡ Pre-Market Open Heroes (09:00 AM – 09:08 AM)")
-        st.markdown("<div class='info-panel'>🏆 Reads NSE Pre-Open Auction data at 09:08 AM to find high-turnover institutional gap-ups and gap-downs with Daily Trend confirmation, Breakout Geometry, ATR Beta, and Sector Surge Confluence (Exclusively NSE F&O).</div>", unsafe_allow_html=True)
-        render_heroes_view(hero_long, hero_short, bull_heroes=bull_heroes_list, bear_heroes=bear_heroes_list, key_prefix="hero_pm")
-
-    elif sub_pm == "📅 Intraday EOD Picks (For Tomorrow)":
-        st.markdown("### 📅 Intraday EOD Picks (For Tomorrow)")
-        st.markdown("<div class='info-panel'>📊 Top 5 highest-conviction intraday setups from 1-Hour chart analysis • Weekly Pivot • Pivot Compression</div>", unsafe_allow_html=True)
-
-        is_scanning = render_scan_status("intraday_eod")
-
-        if st.button("🚀 Compile Intraday EOD Top 5", key="ieodb", type="primary"):
-            start_background_scan(
-                "intraday_eod", active_tickers, "60d", "1h", True, False,
-                intra_rr, intra_min_score, nifty_rs_series, capital_base,
-                risk_per_trade, market_regime, "EOD_PLAYBOOK"
-            )
-            st.rerun()
-
-        if is_scanning:
-            st.info("🔄 Scan running in background... You will stay on this tab!")
-        else:
-            saved, stime = load_session_results("intraday_eod")
-            if saved:
-                st.session_state['intraday_eod_results'] = saved
-                st.session_state['intraday_eod_scan_time'] = stime
-            if st.session_state.get('intraday_eod_results'):
-                display_results(st.session_state['intraday_eod_results'], scan_key="intraday_eod", fetch_live=False)
-
-    elif sub_pm == "📈 Swing EOD Picks (Multi-Day)":
-        st.markdown("### 📈 Swing EOD Picks (Multi-Day)")
-        st.markdown("<div class='info-panel'>📊 Top 5 highest-conviction swing setups • Daily + Weekly trend • Monthly Pivot</div>", unsafe_allow_html=True)
-
-        is_scanning = render_scan_status("swing_eod")
-
-        if st.button("🚀 Compile Swing EOD Top 5", key="seodb", type="primary"):
-            start_background_scan(
-                "swing_eod", active_tickers, "2y", "1d", False, False,
-                swing_rr, swing_min_score, nifty_rs_series, capital_base,
-                risk_per_trade, market_regime, "EOD_PLAYBOOK"
-            )
-            st.rerun()
-
-        if is_scanning:
-            st.info("🔄 Scan running in background... You will stay on this tab!")
-        else:
-            saved, stime = load_session_results("swing_eod")
-            if saved:
-                st.session_state['swing_eod_results'] = saved
-                st.session_state['swing_eod_scan_time'] = stime
-            if st.session_state.get('swing_eod_results'):
-                display_results(st.session_state['swing_eod_results'], scan_key="swing_eod", fetch_live=False)
-
-# ═══════════════════════════════════════════════════════════════
-# TAB 2: LIVE SCREENER
-# ═══════════════════════════════════════════════════════════════
-elif main_tab == "⚡ LIVE SCREENER":
-    sub_live_options = ["⚡ Intraday Live (15m/30m)", "📊 Swing Live (1-Hour)", "🏃 One-Way Momentum Runners"]
-    if "sub_live_nav" not in st.session_state:
-        st.session_state["sub_live_nav"] = sub_live_options[0]
-
-    sub_live = st.radio("Live Subsections", sub_live_options, key="sub_live_nav", label_visibility="collapsed")
-
-    if sub_live == "⚡ Intraday Live (15m/30m)":
-        st.markdown("### ⚡ Intraday Live Scanner")
-        st.markdown("<div class='info-panel'>🧠 Multi-TF: 15m + 30m + 1h • Weekly Pivot • Volume Profile • ORB + 0.70% Filter</div>", unsafe_allow_html=True)
-
-        top5_i = st.checkbox("🎯 Top 5 Only", value=True, key="strict_i")
-        is_scanning = render_scan_status("intraday_live")
-
-        if st.button("🚀 Scan Intraday Live", key="isb", type="primary"):
-            mode = "TOP5_ONLY" if top5_i else "ALL"
-            start_background_scan(
-                "intraday_live", active_tickers, "30d", "15m", True, True,
-                intra_rr, intra_min_score, None, capital_base,
-                risk_per_trade, market_regime, mode
-            )
-            st.rerun()
-
-        if is_scanning:
-            st.info("🔄 Scanning in background... You will stay on this tab!")
-        else:
-            saved, stime = load_session_results("intraday_live")
-            if saved:
-                st.session_state['intraday_live_results'] = saved
-                st.session_state['intraday_live_scan_time'] = stime
-            if st.session_state.get('intraday_live_results'):
-                display_results(st.session_state['intraday_live_results'], scan_key="intraday_live")
-
-    elif sub_live == "📊 Swing Live (1-Hour)":
-        st.markdown("### 📊 Swing Live Scanner (1-Hour)")
-        st.markdown("<div class='info-panel'>🧠 Multi-TF: 1-Hour (60m) + 1D Daily Confluence • Monthly Pivot • Volume Profile • Institutional ADL</div>", unsafe_allow_html=True)
-
-        top5_s = st.checkbox("🎯 Top 5 Only", value=True, key="strict_s")
-        is_scanning = render_scan_status("swing_live")
-
-        if st.button("🚀 Scan Swing Live", key="ssb", type="primary"):
-            mode = "TOP5_ONLY" if top5_s else "ALL"
-            start_background_scan(
-                "swing_live", active_tickers, "60d", "60m", False, False,
-                swing_rr, swing_min_score, nifty_rs_series, capital_base,
-                risk_per_trade, market_regime, mode
-            )
-            st.rerun()
-
-        if is_scanning:
-            st.info("🔄 Scanning in background... You will stay on this tab!")
-        else:
-            saved, stime = load_session_results("swing_live")
-            if saved:
-                st.session_state['swing_live_results'] = saved
-                st.session_state['swing_live_scan_time'] = stime
-            if st.session_state.get('swing_live_results'):
-                display_results(st.session_state['swing_live_results'], scan_key="swing_live")
-
-    elif sub_live == "🏃 One-Way Momentum Runners":
-        st.markdown("### 🏃 One-Way Momentum Runners")
-        st.markdown("<div class='info-panel'>⚡ Extreme momentum stocks breaking ORB on heavy volume & NEVER retracing past VWAP</div>", unsafe_allow_html=True)
-
-        rc1, rc2 = st.columns(2)
-        with rc1:
-            runner_intra = st.button("⚡ Scan Intraday Runners", key="irunb", type="primary")
-        with rc2:
-            runner_swing = st.button("⚡ Scan Swing Runners", key="srunb", type="primary")
-
-        if runner_intra:
-            start_background_scan(
-                "intraday_runners", active_tickers, "30d", "15m", True, False,
-                intra_rr, 0, None, capital_base, risk_per_trade,
-                market_regime, "RUNNERS_ONLY"
-            )
-            st.rerun()
-
-        if runner_swing:
-            start_background_scan(
-                "swing_runners", active_tickers, "60d", "60m", False, False,
-                swing_rr, 0, None, capital_base, risk_per_trade,
-                market_regime, "RUNNERS_ONLY"
-            )
-            st.rerun()
-
-        # Show runner results
-        for rk, label in [("intraday_runners", "⚡ Intraday"), ("swing_runners", "⚡ Swing")]:
-            is_s = render_scan_status(rk)
-            if not is_s:
-                saved, stime = load_session_results(rk)
-                if saved:
-                    st.session_state[f'{rk}_results'] = saved
-                    st.session_state[f'{rk}_scan_time'] = stime
-                if st.session_state.get(f'{rk}_results'):
-                    st.markdown(f"#### {label} Runners")
-                    display_results(st.session_state[f'{rk}_results'], scan_key=rk)
-
-# ═══════════════════════════════════════════════════════════════
-# TAB 3: HIGH-CONFIDENCE ENTRY PLAYBOOK
-# ═══════════════════════════════════════════════════════════════
-elif main_tab == "🎯 ENTRY PLAYBOOK":
-    st.markdown("### 🎯 High-Confidence Trade Entry Blueprint")
+# ---------------------------------------------------------------- CALIBRATION
+with TABS[4]:
+    st.markdown("#### What the data actually says")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Names moving ≥2.5% per day", "~33", "of ~830 liquid names")
+    m2.metric("Top-1 ORB long hits +2%", "37.5%", "vs 9.6% unfiltered")
+    m3.metric("Measured expectancy", "+0.32%", "per trade, after 0.06% cost")
+    m4.metric("Swing +10% in a week", "2.2%", "top-3 ranked: 11.1%")
     st.markdown("""
-    <div class='glass-card'>
-        <h4 style='color:#00ffaa;'>⚡ 1. Intraday One-Way Runner Entry Checklist (90%+ Confidence)</h4>
-        <ul>
-            <li><b>Timing:</b> 09:20 AM – 10:15 AM (after first 5-min/15-min candle forms).</li>
-            <li><b>First Candle Rule:</b> First 5-min candle body should be <b>between 0.25% and 0.70%</b>. Avoid candles >0.70% (exhaustion risk).</li>
-            <li><b>ORB Trigger:</b> Enter on break of 5-min/15-min High (BUY) or Low (SELL) with Volume > 2x 20-bar average.</li>
-            <li><b>VWAP Defense:</b> Price must be comfortably ABOVE VWAP for BUY (BELOW VWAP for SELL). If price crosses back over VWAP, exit immediately.</li>
-            <li><b>Pivot Launchpad:</b> BUY when price is opening near/above <b>Weekly Pivot (P) or R1</b>. SELL when below S1.</li>
-            <li><b>RSI Room:</b> 15m RSI between <b>45 and 65</b> (do NOT enter if RSI > 75).</li>
-            <li><b>Target & SL:</b> Minimum 1:2.0 R:R. Stop loss placed just below the breakout candle low / VWAP.</li>
-        </ul>
-    </div>
-    <div class='glass-card'>
-        <h4 style='color:#4da6ff;'>📈 2. Swing Trade Entry Checklist (Holding 3 to 15 Days)</h4>
-        <ul>
-            <li><b>Timing:</b> 02:45 PM – 03:20 PM (near market close to confirm daily candle structure).</li>
-            <li><b>Confluence Alignment:</b> 1-Hour + Daily (1D) Supertrend must both point in the same direction.</li>
-            <li><b>Monthly Pivot Anchor:</b> Stock must be holding above the <b>Monthly Pivot (P)</b> or testing R1 on rising Volume Profile POC.</li>
-            <li><b>Volume Profile:</b> Buy on breakout above Value Area High (VAH) or on bounce from POC.</li>
-            <li><b>Daily Pullback Rule:</b> Ideal entry is on a 2-3 day shallow pullback to the 20-day EMA on diminishing volume.</li>
-            <li><b>Position Sizing:</b> Risk no more than 1% to 1.5% of total trading capital per trade.</li>
-        </ul>
-    </div>
-    """, unsafe_allow_html=True)
+##### Base rates — liquid F&O universe, last 180 sessions, 148,678 stock-days
+| Event | Probability | Names per day |
+|---|---|---|
+| Travels ≥2% UP from the open | 20.7% | ~41 |
+| Travels ≥2% DOWN from the open | 22.8% | ~45 |
+| Absolute day move ≥2.5% | 16.6% | ~33 |
+| Finishes as a top-3 gainer | 1.35% | 3 |
 
-# ═══════════════════════════════════════════════════════════════
-# TAB 4: TOOLS
-# ═══════════════════════════════════════════════════════════════
-elif main_tab == "🛠️ TOOLS":
-    sub_tool_options = ["📖 Today's Signal Ledger", "ℹ️ System Architecture"]
-    if "sub_tool_nav" not in st.session_state or st.session_state["sub_tool_nav"] not in sub_tool_options:
-        st.session_state["sub_tool_nav"] = sub_tool_options[0]
+##### Gaps mean-revert — this is where v20 was backwards
+| Opening gap | P(+2% up during the day) | P(−2% down) | What to do |
+|---|---|---|---|
+| below −2% | **60.0%** | 33.7% | look for LONGS |
+| −2% to −1% | 36.9% | 30.2% | mild long bias |
+| −0.3% to +0.3% | 22.9% | 20.9% | neutral |
+| +1% to +2% | 30.8% | 32.5% | mild short bias |
+| above +2% | 41.0% | **47.8%** | look for SHORTS |
 
-    sub_tool = st.radio("Tool Sections", sub_tool_options, key="sub_tool_nav", label_visibility="collapsed")
+##### Which features matter (top-quintile lift for a ≥2% move)
+`atr_pct` 1.63× · `adr20` 1.56× · `vol20` 1.48× · `big_moves_60` 1.46× ·
+`big_moves_20` 1.45× · `bbw` 1.33× · `rvol` ~1.20×.
+Momentum and MACD are near 1.0× — **they do not tell you direction**.
 
-    if sub_tool == "📖 Today's Signal Ledger":
-        st.markdown("### 📖 Today's Signal Ledger")
-        st.markdown("<div class='info-panel'>📋 Comprehensive real-time ledger of all signals generated across today's live & EOD scans with complete Risk:Reward metrics.</div>", unsafe_allow_html=True)
-        all_results = []
-        for key in SCAN_KEYS:
-            saved, _ = load_session_results(key)
-            if saved:
-                for r in saved:
-                    r['Source'] = key.upper()
-                all_results.extend(saved)
-        render_ledger_view(all_results, key_prefix="ledger")
+##### Entry-style test (walk-forward, 33 sessions, top-3 per day)
+| Entry | Exit | Target hit | Profitable trades | Expectancy |
+|---|---|---|---|---|
+| touch of ORB high | fixed +2% | 28.3% | 37.4% | +0.05% |
+| **close beyond ORB high** | fixed +2% | **29.9%** | 44.2% | **+0.17%** |
+| **close beyond ORB high** | ladder | 27.3% | **64.9%** | **+0.24%** |
+| 15-minute ORB | fixed +2% | 23.7% | 35.5% | −0.06% |
 
-    elif sub_tool == "ℹ️ System Architecture":
-        st.markdown("### ℹ️ QUANT-EDGE v20 Architecture")
-        st.markdown("""
-        <div class='glass-card'>
-            <b>🧠 Multi-Timeframe Confluence</b><br/>
-            • Intraday: 15m + 30m + 1h scan with weekly pivots<br/>
-            • Swing: 1h + 1D scan with monthly pivots<br/><br/>
-            <b>📊 Volume Profile & Floor Pivots</b><br/>
-            • POC (Point of Control) — highest volume price<br/>
-            • VAH/VAL — institutional value area boundaries<br/>
-            • Standard Weekly & Monthly Floor Pivots (P, R1-R3, S1-S3)<br/><br/>
-            <b>⚡ One-Way Runner Detection</b><br/>
-            • ORB breakout + VWAP never violated = pure momentum<br/>
-            • 0.70% first-candle filter flags extended opens<br/><br/>
-            <b>🏛️ Historical Top 3 Backtest Engine</b><br/>
-            • Intraday: Top 3 Gainers & Losers across past 60 trading days<br/>
-            • Swing: Top 3 Weekly Gainers & Losers across past 12 weeks<br/>
-            • 100% Exclusively NSE F&O Universe (219 Active Symbols)<br/><br/>
-            <b>💾 Data Persistence</b><br/>
-            • Scan results survive page refreshes<br/>
-            • Data persists until next trading day 9:00 AM<br/>
-            • Capital & risk settings saved automatically
-        </div>
-        """, unsafe_allow_html=True)
-
-# ═══════════════════════════════════════════════════════════════
-# TAB 3: PERFORMANCE LAB (100% EXCLUSIVELY NSE F&O UNIVERSE)
-# ═══════════════════════════════════════════════════════════════
-elif main_tab == "📈 PERFORMANCE LAB":
-    sub_perf_options = ["📝 Manual Stock Logger", "🏆 Auto-Discovered Winners", "🧠 Pattern Intelligence", "📊 Backtest & Historical Top 3 Lab"]
-    if "sub_perf_nav" not in st.session_state or st.session_state["sub_perf_nav"] not in sub_perf_options:
-        st.session_state["sub_perf_nav"] = sub_perf_options[0]
-
-    sub_perf = st.radio("Performance Lab Sections", sub_perf_options, key="sub_perf_nav", label_visibility="collapsed")
-
-    # ─── SUBTAB 1: MANUAL STOCK LOGGER ───
-    if sub_perf == "📝 Manual Stock Logger":
-        st.markdown("### 📝 Manual Winner Logger")
-        st.markdown("<div class='info-panel'>📋 Add stocks that performed well today. Technical data will be auto-captured from the NSE F&O universe. This data feeds into Pattern Intelligence to refine screener scoring.</div>", unsafe_allow_html=True)
-
-        with st.form("manual_log_form", clear_on_submit=True):
-            ml_col1, ml_col2, ml_col3 = st.columns([3, 1, 1])
-            with ml_col1:
-                ml_tickers = st.text_input("F&O Stock Symbols (comma-separated)", placeholder="MCX, BANKBARODA, SAIL", key="ml_tickers")
-            with ml_col2:
-                ml_type = st.selectbox("Trade Type", ["Intraday", "Swing"], key="ml_type")
-            with ml_col3:
-                ml_dir = st.selectbox("Direction", ["BUY", "SELL"], key="ml_dir")
-
-            ml_col4, ml_col5 = st.columns([1, 3])
-            with ml_col4:
-                ml_date = st.date_input("Date", value=get_ist_now().date(), key="ml_date")
-            with ml_col5:
-                ml_notes = st.text_input("Notes (optional)", placeholder="Strong opening drive, held VWAP all day", key="ml_notes")
-
-            submitted = st.form_submit_button("💾 Save Winners", type="primary")
-
-            if submitted and ml_tickers:
-                existing_entries = load_manual_log()
-                tickers_raw = [t.strip().upper() for t in ml_tickers.split(",") if t.strip()]
-                new_entries = []
-                for sym in tickers_raw:
-                    ticker = sym + ".NS" if not sym.endswith(".NS") else sym
-                    try:
-                        daily_df = yf.download(ticker, period="1y", interval="1d", progress=False, auto_adjust=True)
-                        if isinstance(daily_df.columns, pd.MultiIndex):
-                            daily_df.columns = daily_df.columns.get_level_values(0)
-                        snapshot = _capture_technical_snapshot(ticker, daily_df, is_intraday=(ml_type == "Intraday"))
-                    except Exception:
-                        snapshot = {"ticker": ticker, "symbol": sym}
-                    new_entries.append({
-                        "symbol": sym.replace(".NS", ""),
-                        "ticker": ticker,
-                        "trade_type": ml_type,
-                        "direction": ml_dir,
-                        "date": str(ml_date),
-                        "notes": ml_notes,
-                        "added_at": get_ist_now().strftime('%Y-%m-%d %H:%M:%S'),
-                        "snapshot": snapshot,
-                    })
-                existing_entries.extend(new_entries)
-                save_manual_log(existing_entries)
-                st.success(f"✅ Added {len(new_entries)} F&O stocks to manual log!")
-                st.rerun()
-
-        # Display existing manual log in Card or List view
-        manual_entries = load_manual_log()
-        render_manual_log_view(manual_entries, key_prefix="manual_log")
-
-    # ─── SUBTAB 2: AUTO-DISCOVERED WINNERS (SIDE-BY-SIDE INTRADAY & SWING) ───
-    elif sub_perf == "🏆 Auto-Discovered Winners":
-        st.markdown("### 🏆 Auto-Discovered Winners <span class='fo-badge'>💎 Exclusively NSE F&O (219 Symbols)</span>", unsafe_allow_html=True)
-        st.markdown("<div class='info-panel'>🔍 Automatically discovers stocks that made clean one-way runner moves: <b>≥2% Intraday</b> from 1st 5-min candle edge, or <b>≥7% Swing</b> from Monday 1st 1-hour candle. Runs automatically after 3:35 PM on market days.</div>", unsafe_allow_html=True)
-
-        disc_btn_c1, disc_btn_c2 = st.columns(2)
-        with disc_btn_c1:
-            is_disc_running_i = render_scan_status("perf_intraday_discovery")
-            if st.button("🔍 Discover Today's Intraday Winners", key="disc_intra_btn", type="primary", use_container_width=True):
-                start_auto_discovery("intraday")
-                st.rerun()
-            if is_disc_running_i:
-                st.info("🔄 Scanning 219 F&O stocks for intraday winners...")
-
-        with disc_btn_c2:
-            is_disc_running_s = render_scan_status("perf_swing_discovery")
-            if st.button("🔍 Discover This Week's Swing Winners", key="disc_swing_btn", type="primary", use_container_width=True):
-                start_auto_discovery("swing")
-                st.rerun()
-            if is_disc_running_s:
-                st.info("🔄 Scanning 219 F&O stocks for swing winners...")
-
-        st.markdown("---")
-
-        # Side-by-Side Results Display
-        col_intra_disp, col_swing_disp = st.columns(2)
-
-        # ── LEFT COLUMN: INTRADAY WINNERS ──
-        with col_intra_disp:
-            st.markdown("#### ⚡ Intraday Winners (≥2% ORB Move)")
-            intraday_dates = get_all_intraday_winner_dates()
-            if intraday_dates:
-                selected_date = st.selectbox("📅 Select Intraday Session", intraday_dates[::-1], key="sel_intra_date")
-                iw_data = load_perf_winners(os.path.join(INTRADAY_WINNERS_DIR, f"{selected_date}.json"))
-                if iw_data and iw_data.get("winners"):
-                    st.markdown(f"**{iw_data['winners_found']} F&O winners** on {selected_date} (scanned {iw_data['total_scanned']} symbols)")
-                    
-                    flat_iw = []
-                    for w in iw_data["winners"]:
-                        snap = w.get("snapshot", {})
-                        flat_iw.append({
-                            "Symbol": w["symbol"], "Direction": w["direction"],
-                            "Move %": w["move_pct"], "1st Candle Body %": w.get("fc_body_pct", ""),
-                            "1st Candle Vol Ratio": w.get("fc_vol_ratio", ""),
-                            "Day High": w.get("day_high", ""), "Day Low": w.get("day_low", ""),
-                            "ST Dir": snap.get("daily_st_dir", ""), "RSI": snap.get("rsi_14", ""),
-                            "EMA Alignment": snap.get("ema_alignment", ""), "Vol Ratio": snap.get("vol_ratio", ""),
-                            "Gap %": snap.get("gap_pct", ""), "Pivot": snap.get("pivot_pos", ""), "Sector": snap.get("sector", ""),
-                        })
-                    csv_iw = perf_data_to_csv(flat_iw, "intraday_winners")
-                    if csv_iw:
-                        st.download_button("⬇️ Download Intraday CSV", csv_iw, file_name=f"intraday_winners_{selected_date}.csv", mime="text/csv", key="dl_iw_btn")
-
-                    render_winners_view(iw_data.get("winners", []), is_intraday=True, key_prefix="auto_intra_view")
-                else:
-                    st.info(f"No intraday winners recorded for {selected_date}.")
-            else:
-                st.info("📭 No intraday winner sessions yet. Discovery runs automatically after 3:35 PM IST, or click the button above.")
-
-        # ── RIGHT COLUMN: SWING WINNERS ──
-        with col_swing_disp:
-            st.markdown("#### 📈 Swing Winners (≥7% Weekly Move)")
-            swing_weeks = get_all_swing_winner_weeks()
-            if swing_weeks:
-                selected_week = st.selectbox("📅 Select Swing Session", swing_weeks[::-1], key="sel_swing_week")
-                sw_data = load_perf_winners(os.path.join(SWING_WINNERS_DIR, f"{selected_week}.json"))
-                if sw_data and sw_data.get("winners"):
-                    st.markdown(f"**{sw_data['winners_found']} F&O swing winners** in week {selected_week}")
-
-                    flat_sw = []
-                    for w in sw_data["winners"]:
-                        snap = w.get("snapshot", {})
-                        flat_sw.append({
-                            "Symbol": w["symbol"], "Direction": w["direction"],
-                            "Move %": w["move_pct"], "Week High": w.get("week_high", ""), "Week Low": w.get("week_low", ""),
-                            "ST Dir": snap.get("daily_st_dir", ""), "RSI": snap.get("rsi_14", ""),
-                            "EMA": snap.get("ema_alignment", ""), "Monthly Pivot": snap.get("pivot_pos", ""), "Sector": snap.get("sector", ""),
-                        })
-                    csv_sw = perf_data_to_csv(flat_sw, "swing_winners")
-                    if csv_sw:
-                        st.download_button("⬇️ Download Swing CSV", csv_sw, file_name=f"swing_winners_{selected_week}.csv", mime="text/csv", key="dl_sw_btn")
-
-                    render_winners_view(sw_data.get("winners", []), is_intraday=False, key_prefix="auto_swing_view")
-                else:
-                    st.info(f"No swing winners recorded for week {selected_week}.")
-            else:
-                st.info("📭 No swing winner sessions yet. Discovery runs automatically on Fridays after 3:35 PM IST, or click the button above.")
-
-    # ─── SUBTAB 3: PATTERN INTELLIGENCE ───
-    elif sub_perf == "🧠 Pattern Intelligence":
-        st.markdown("### 🧠 Pattern Intelligence — Golden Rules <span class='fo-badge'>💎 NSE F&O</span>", unsafe_allow_html=True)
-        st.markdown("<div class='info-panel'>🧪 Statistically analyzes all historical winners to compute high-probability technical confluence rules for stock selection.</div>", unsafe_allow_html=True)
-
-        if st.button("🔬 Analyze All Winner Patterns", key="analyze_btn", type="primary"):
-            with st.spinner("Analyzing winner data across 219 F&O symbols..."):
-                patterns = analyze_winner_patterns()
-                st.success("✅ Pattern analysis complete!")
-
-        patterns = load_pattern_analysis()
-        if patterns:
-            st.markdown(f"<div class='last-updated'>🕐 Last analyzed: {patterns.get('analyzed_at', 'Never')}</div>", unsafe_allow_html=True)
-
-            pat_c1, pat_c2 = st.columns(2)
-
-            for col, label, key, sample_key in [
-                (pat_c1, "⚡ Intraday Golden Rules", "intraday", "intraday_sample_size"),
-                (pat_c2, "📈 Swing Golden Rules", "swing", "swing_sample_size")
-            ]:
-                with col:
-                    st.markdown(f"#### {label}")
-                    rules = patterns.get(key, {})
-                    sample_size = patterns.get(sample_key, 0)
-                    st.caption(f"📊 Sample size: {sample_size} F&O winners")
-
-                    if not rules or rules.get("_total_winners", 0) == 0:
-                        st.info("🔍 Not enough winner samples yet. Run discovery or log winners first.")
-                        continue
-
-                    sorted_rules = sorted(
-                        [(k, v) for k, v in rules.items() if isinstance(v, (int, float)) and not k.startswith("_")],
-                        key=lambda x: x[1], reverse=True
-                    )
-
-                    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
-                    for idx, (rule_name, pct) in enumerate(sorted_rules):
-                        medal = medals[idx] if idx < len(medals) else "•"
-                        color = "#00ffaa" if pct >= 70 else ("#ffaa00" if pct >= 50 else "#ff6b6b")
-                        bar_width = min(pct, 100)
-                        st.markdown(f"""
-                        <div style='margin-bottom:8px;'>
-                            <div style='font-size:12px;font-weight:700;color:#e2e4ef;'>{medal} {pct:.0f}% — {rule_name}</div>
-                            <div style='background:rgba(255,255,255,0.05);border-radius:4px;height:8px;margin-top:2px;'>
-                                <div style='background:{color};width:{bar_width}%;height:100%;border-radius:4px;'></div>
-                            </div>
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                    sector_dist = rules.get("_sector_distribution", {})
-                    if sector_dist:
-                        st.markdown("##### 🏭 Sector Distribution")
-                        sector_df = pd.DataFrame([
-                            {"Sector": k, "Winners": v} for k, v in
-                            sorted(sector_dist.items(), key=lambda x: x[1], reverse=True)
-                        ])
-                        st.dataframe(sector_df, use_container_width=True, height=200)
-
-            st.markdown("---")
-            pat_json = json.dumps(patterns, indent=2, default=str)
-            st.download_button("⬇️ Download Pattern Analysis (JSON)", pat_json, file_name="pattern_analysis.json", mime="application/json", key="dl_pat")
+##### Honest limits
+* The short-side ORB model was flat to negative in walk-forward testing. It is included
+  but gated and flagged; do not size it like the long side.
+* The intraday walk-forward covers 33 sessions (that is all the 5-minute history a free
+  data feed will return). Treat +0.3%/trade as an estimate with wide error bars.
+* No screener can promise 2% every day. What this one does is concentrate your one or two
+  daily trades into the setups where the measured hit rate is roughly 4× the base rate.
+""")
+    st.divider()
+    st.markdown("##### Learning loop")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Record today's ORB outcomes"):
+            n = record_outcomes()
+            st.success(f"{n} labelled ORB events appended")
+        if os.path.exists(F_TRAIN_INTRA):
+            try:
+                dfl = pd.read_csv(F_TRAIN_INTRA)
+                st.caption(f"training store: {len(dfl):,} events, "
+                           f"{dfl.date.nunique()} sessions, "
+                           f"win rate {100*dfl.win.mean():.1f}%")
+            except Exception:
+                pass
         else:
-            st.info("🔍 No pattern analysis yet. Click 'Analyze' after collecting winner data.")
+            st.caption("training store empty — it fills up automatically after each session")
+    with c2:
+        if st.button("Refit models now"):
+            st.info(refit_models())
+        st.caption("The loop appends every ORB event with its true outcome each evening and "
+                   "refits the logistic models monthly. Feature and label definitions are "
+                   "identical to the offline calibration, so the sample simply keeps growing.")
 
-    # ─── SUBTAB 4: BACKTEST & HISTORICAL TOP 3 LAB ───
-    # ─── SUBTAB 4: BACKTEST & HISTORICAL TOP 3 LAB ───
-    elif sub_perf == "📊 Backtest & Historical Top 3 Lab":
-        st.markdown("### 📊 Backtest & Historical Top 3 Lab <span class='fo-badge'>💎 Exclusively NSE F&O</span>", unsafe_allow_html=True)
-        st.markdown("<div class='info-panel'>🏛️ Complete historical quantitative performance laboratory. Features <b>Intraday Top 3 Gainers & Losers (up to 180+ Days / 1000+ Stocks)</b>, <b>Swing Top 3 Gainers & Losers (up to 104 Weeks / 2 Years)</b>, and Strategy Screener Hit-Rate Backtesting with Manual Winner Logger integration.</div>", unsafe_allow_html=True)
+# ---------------------------------------------------------------- JOURNAL
+with TABS[5]:
+    st.markdown("#### Trade journal")
+    with st.form("jf"):
+        j1, j2, j3, j4 = st.columns(4)
+        sym = j1.text_input("Symbol")
+        side = j2.selectbox("Side", ["BUY", "SELL"])
+        entry = j3.number_input("Entry", 0.0, step=0.05)
+        exitp = j4.number_input("Exit", 0.0, step=0.05)
+        k1, k2, k3 = st.columns(3)
+        qty = k1.number_input("Qty", 0, step=1)
+        setup = k2.selectbox("Setup", ["Intraday ORB", "Swing 1h ORB", "Other"])
+        note = k3.text_input("Note")
+        if st.form_submit_button("Save trade"):
+            if sym and entry > 0 and exitp > 0:
+                pnl = (exitp - entry) * qty * (1 if side == "BUY" else -1)
+                pnlp = (exitp / entry - 1) * 100 * (1 if side == "BUY" else -1)
+                row = pd.DataFrame([dict(ts=get_ist_now().isoformat(), symbol=sym.upper(),
+                                         side=side, entry=entry, exit=exitp, qty=qty,
+                                         pnl=round(pnl, 2), pnl_pct=round(pnlp, 3),
+                                         setup=setup, note=note)])
+                row.to_csv(F_JOURNAL, mode="a", header=not os.path.exists(F_JOURNAL), index=False)
+                st.success("saved")
+    if os.path.exists(F_JOURNAL):
+        try:
+            J = pd.read_csv(F_JOURNAL)
+            a, b_, c_, d_ = st.columns(4)
+            a.metric("Trades", len(J))
+            b_.metric("Win rate", f"{100*(J.pnl>0).mean():.1f}%")
+            c_.metric("Total P&L", money(J.pnl.sum()))
+            d_.metric("Avg per trade", f"{J.pnl_pct.mean():+.2f}%")
+            st.dataframe(J.iloc[::-1], use_container_width=True, height=380, hide_index=True)
+        except Exception as e:
+            st.caption(f"journal unreadable: {e}")
+    else:
+        st.caption("No trades logged yet.")
 
-        bt_tab_choice = st.radio("Backtest Module", [
-            "⚡ Intraday Top 3 (Daily Backtest)",
-            "📈 Swing Top 3 (Weekly Backtest)",
-            "🧪 Strategy Screener Hit-Rate Backtest",
-            "🧠 Adaptive Intelligence Weights"
-        ], horizontal=True, key="bt_mod_tab")
-
-        # ── 1. INTRADAY TOP 3 GAINERS & LOSERS (EXPANDED DEPTH: 60 to 252 DAYS) ──
-        if bt_tab_choice == "⚡ Intraday Top 3 (Daily Backtest)":
-            st.markdown("#### ⚡ Historical Intraday Top 3 Gainers & Losers (NSE F&O)")
-            st.markdown("<div class='info-panel' style='font-size:11px;'>Calculates the Top 3 Gainers & Top 3 Losers for every single trading day across the 219 NSE F&O stocks with 100% accurate sector classification. Mathematical formula: <code>Daily Return % = (Close - Prev_Close) / Prev_Close * 100</code>.</div>", unsafe_allow_html=True)
-
-            is_hist_intra_running = render_scan_status("hist_intraday_fetch")
-            c_fetch_i1, c_fetch_i2, c_fetch_i3 = st.columns([2, 1.5, 2.5])
-            with c_fetch_i1:
-                intra_lookback_choice = st.selectbox("⏳ Select Backtest Depth", [
-                    "60 Trading Days (~360 Gainers/Losers)",
-                    "90 Trading Days (~540 Gainers/Losers)",
-                    "120 Trading Days (~720 Gainers/Losers)",
-                    "180+ Trading Days (~1080 Gainers/Losers)",
-                    "MAX Limit (252 Trading Days / 1 Year)"
-                ], index=0, key="sel_intra_lookback")
-                lookback_days_map = {
-                    "60 Trading Days (~360 Gainers/Losers)": 60,
-                    "90 Trading Days (~540 Gainers/Losers)": 90,
-                    "120 Trading Days (~720 Gainers/Losers)": 120,
-                    "180+ Trading Days (~1080 Gainers/Losers)": 180,
-                    "MAX Limit (252 Trading Days / 1 Year)": 252
-                }
-                chosen_days = lookback_days_map.get(intra_lookback_choice, 60)
-            with c_fetch_i2:
-                st.write("")
-                st.write("")
-                if st.button("🚀 Fetch / Recalculate", key="btn_fetch_hist_intra", type="primary", use_container_width=True):
-                    start_historical_intraday_fetch(lookback_days=chosen_days)
-                    st.rerun()
-            with c_fetch_i3:
-                if is_hist_intra_running:
-                    st.info(f"🔄 Downloading & calculating {chosen_days}-day historical data for all 219 F&O stocks...")
-
-            hist_intra_records = load_hist_intraday()
-            if hist_intra_records:
-                # Summary metrics
-                all_g_moves = [g['change_pct'] for r in hist_intra_records for g in r.get('gainers', [])]
-                all_l_moves = [l['change_pct'] for r in hist_intra_records for l in r.get('losers', [])]
-                max_g = max(all_g_moves) if all_g_moves else 0
-                avg_g = np.mean(all_g_moves) if all_g_moves else 0
-                avg_l = np.mean(all_l_moves) if all_l_moves else 0
-
-                sm1, sm2, sm3, sm4 = st.columns(4)
-                with sm1:
-                    st.markdown(f"""<div class='metric-card'>
-                        <div class='metric-header'>DAYS AVAILABLE</div>
-                        <div class='metric-val'>{len(hist_intra_records)}</div>
-                    </div>""", unsafe_allow_html=True)
-                with sm2:
-                    st.markdown(f"""<div class='metric-card'>
-                        <div class='metric-header'>AVG TOP 3 GAINER</div>
-                        <div class='metric-val' style='color:#00ffaa;'>+{avg_g:.2f}%</div>
-                    </div>""", unsafe_allow_html=True)
-                with sm3:
-                    st.markdown(f"""<div class='metric-card'>
-                        <div class='metric-header'>AVG TOP 3 LOSER</div>
-                        <div class='metric-val' style='color:#ff3366;'>{avg_l:.2f}%</div>
-                    </div>""", unsafe_allow_html=True)
-                with sm4:
-                    st.markdown(f"""<div class='metric-card'>
-                        <div class='metric-header'>MAX SINGLE DAY GAIN</div>
-                        <div class='metric-val' style='color:#FFD700;'>+{max_g:.2f}%</div>
-                    </div>""", unsafe_allow_html=True)
-
-                st.markdown("---")
-                
-                # Date selector
-                date_options = [r["date"] for r in hist_intra_records]
-                c_sel1, c_sel2 = st.columns([2, 2])
-                with c_sel1:
-                    selected_date = st.selectbox("📅 Select Trading Day to Inspect", date_options, key="sel_hist_intra_date")
-                with c_sel2:
-                    flat_hist_rows = []
-                    for r in hist_intra_records:
-                        dt = r["date"]
-                        for rank, g in enumerate(r.get("gainers", []), 1):
-                            sym = g.get("symbol", "")
-                            flat_hist_rows.append({
-                                "Date": dt, "Category": "Top Gainer", "Rank": rank, "Symbol": sym,
-                                "Sector": g.get("sector", get_stock_sector(sym)),
-                                "Change %": g["change_pct"], "Intra Move %": g.get("intra_move_pct", ""),
-                                "Prev Close": g.get("prev_close", ""), "Open": g.get("open", ""),
-                                "High": g.get("high", ""), "Low": g.get("low", ""), "Close": g.get("close", ""),
-                                "Volume": g.get("volume", ""), "Turnover Cr": g.get("turnover_cr", "")
-                            })
-                        for rank, l in enumerate(r.get("losers", []), 1):
-                            sym = l.get("symbol", "")
-                            flat_hist_rows.append({
-                                "Date": dt, "Category": "Top Loser", "Rank": rank, "Symbol": sym,
-                                "Sector": l.get("sector", get_stock_sector(sym)),
-                                "Change %": l["change_pct"], "Intra Move %": l.get("intra_move_pct", ""),
-                                "Prev Close": l.get("prev_close", ""), "Open": l.get("open", ""),
-                                "High": l.get("high", ""), "Low": l.get("low", ""), "Close": l.get("close", ""),
-                                "Volume": l.get("volume", ""), "Turnover Cr": l.get("turnover_cr", "")
-                            })
-                    csv_intra_all = perf_data_to_csv(flat_hist_rows, "historical_intraday")
-                    st.download_button(f"⬇️ Download Full Top 3 Dataset ({len(hist_intra_records)} Days - CSV)", csv_intra_all, file_name=f"historical_intraday_top3_{len(hist_intra_records)}days.csv", mime="text/csv", key="dl_hist_intra_all")
-
-                target_rec = next((r for r in hist_intra_records if r["date"] == selected_date), None)
-                if target_rec:
-                    st.markdown(f"##### 📊 Daily Performance for **{selected_date}** (Scanned {target_rec.get('total_fo_scanned', 219)} F&O Symbols)")
-                    render_historical_top3_view(target_rec, is_intraday=True, key_prefix=f"hist_intra_{selected_date}")
-            else:
-                st.info("📭 No historical intraday data stored yet. Click '🚀 Fetch / Recalculate' to generate!")
-
-        # ── 2. SWING TOP 3 GAINERS & LOSERS (EXPANDED DEPTH: 12 to 104 WEEKS) ──
-        elif bt_tab_choice == "📈 Swing Top 3 (Weekly Backtest)":
-            st.markdown("#### 📈 Historical Swing Top 3 Gainers & Losers (NSE F&O)")
-            st.markdown("<div class='info-panel' style='font-size:11px;'>Calculates the Top 3 Weekly Gainers & Top 3 Weekly Losers for every weekly session (Monday to Friday) across the 219 NSE F&O stocks with 100% accurate sector classification. Mathematical formula: <code>Weekly Session Return % = (Friday Close - Monday Open) / Monday Open * 100</code>.</div>", unsafe_allow_html=True)
-
-            is_hist_swing_running = render_scan_status("hist_swing_fetch")
-            c_fetch_s1, c_fetch_s2, c_fetch_s3 = st.columns([2, 1.5, 2.5])
-            with c_fetch_s1:
-                swing_lookback_choice = st.selectbox("⏳ Select Backtest Depth", [
-                    "12 Weeks (~72 Gainers/Losers - 3 Months)",
-                    "26 Weeks (~156 Gainers/Losers - 6 Months)",
-                    "52 Weeks (~312 Gainers/Losers - 1 Year)",
-                    "MAX Limit (104 Weeks - 2 Years)"
-                ], index=0, key="sel_swing_lookback")
-                lookback_weeks_map = {
-                    "12 Weeks (~72 Gainers/Losers - 3 Months)": 12,
-                    "26 Weeks (~156 Gainers/Losers - 6 Months)": 26,
-                    "52 Weeks (~312 Gainers/Losers - 1 Year)": 52,
-                    "MAX Limit (104 Weeks - 2 Years)": 104
-                }
-                chosen_weeks = lookback_weeks_map.get(swing_lookback_choice, 12)
-            with c_fetch_s2:
-                st.write("")
-                st.write("")
-                if st.button("🚀 Fetch / Recalculate", key="btn_fetch_hist_swing", type="primary", use_container_width=True):
-                    start_historical_swing_fetch(lookback_weeks=chosen_weeks)
-                    st.rerun()
-            with c_fetch_s3:
-                if is_hist_swing_running:
-                    st.info(f"🔄 Downloading & calculating {chosen_weeks}-week historical data for all 219 F&O stocks...")
-
-            hist_swing_records = load_hist_swing()
-            if hist_swing_records:
-                all_g_sw_moves = [g['weekly_return_pct'] for r in hist_swing_records for g in r.get('gainers', [])]
-                all_l_sw_moves = [l['weekly_return_pct'] for r in hist_swing_records for l in r.get('losers', [])]
-                max_sw_g = max(all_g_sw_moves) if all_g_sw_moves else 0
-                avg_sw_g = np.mean(all_g_sw_moves) if all_g_sw_moves else 0
-                avg_sw_l = np.mean(all_l_sw_moves) if all_l_sw_moves else 0
-
-                wm1, wm2, wm3, wm4 = st.columns(4)
-                with wm1:
-                    st.markdown(f"""<div class='metric-card'>
-                        <div class='metric-header'>WEEKS AVAILABLE</div>
-                        <div class='metric-val'>{len(hist_swing_records)}</div>
-                    </div>""", unsafe_allow_html=True)
-                with wm2:
-                    st.markdown(f"""<div class='metric-card'>
-                        <div class='metric-header'>AVG WEEKLY GAINER</div>
-                        <div class='metric-val' style='color:#00ffaa;'>+{avg_sw_g:.2f}%</div>
-                    </div>""", unsafe_allow_html=True)
-                with wm3:
-                    st.markdown(f"""<div class='metric-card'>
-                        <div class='metric-header'>AVG WEEKLY LOSER</div>
-                        <div class='metric-val' style='color:#ff3366;'>{avg_sw_l:.2f}%</div>
-                    </div>""", unsafe_allow_html=True)
-                with wm4:
-                    st.markdown(f"""<div class='metric-card'>
-                        <div class='metric-header'>MAX WEEKLY GAIN</div>
-                        <div class='metric-val' style='color:#FFD700;'>+{max_sw_g:.2f}%</div>
-                    </div>""", unsafe_allow_html=True)
-
-                st.markdown("---")
-
-                week_options = [r["week_key"] for r in hist_swing_records]
-                c_sel_w1, c_sel_w2 = st.columns([2, 2])
-                with c_sel_w1:
-                    selected_wk = st.selectbox("📅 Select Weekly Session to Inspect", week_options, key="sel_hist_swing_wk")
-                with c_sel_w2:
-                    flat_hist_sw_rows = []
-                    for r in hist_swing_records:
-                        wk = r["week_key"]
-                        for rank, g in enumerate(r.get("gainers", []), 1):
-                            sym = g.get("symbol", "")
-                            flat_hist_sw_rows.append({
-                                "Week": wk, "Week Start": r.get("week_start", ""), "Week End": r.get("week_end", ""),
-                                "Category": "Top Weekly Gainer", "Rank": rank, "Symbol": sym,
-                                "Sector": g.get("sector", get_stock_sector(sym)),
-                                "Weekly Return %": g["weekly_return_pct"], "Monday Open": g.get("mon_open", ""),
-                                "Friday Close": g.get("fri_close", ""), "Week High": g.get("week_high", ""),
-                                "Week Low": g.get("week_low", ""), "Week Range %": g.get("week_range_pct", ""),
-                                "Total Volume": g.get("total_volume", ""), "Turnover Cr": g.get("turnover_cr", "")
-                            })
-                        for rank, l in enumerate(r.get("losers", []), 1):
-                            sym = l.get("symbol", "")
-                            flat_hist_sw_rows.append({
-                                "Week": wk, "Week Start": r.get("week_start", ""), "Week End": r.get("week_end", ""),
-                                "Category": "Top Weekly Loser", "Rank": rank, "Symbol": sym,
-                                "Sector": l.get("sector", get_stock_sector(sym)),
-                                "Weekly Return %": l["weekly_return_pct"], "Monday Open": l.get("mon_open", ""),
-                                "Friday Close": l.get("fri_close", ""), "Week High": l.get("week_high", ""),
-                                "Week Low": l.get("week_low", ""), "Week Range %": l.get("week_range_pct", ""),
-                                "Total Volume": l.get("total_volume", ""), "Turnover Cr": l.get("turnover_cr", "")
-                            })
-                    csv_swing_all = perf_data_to_csv(flat_hist_sw_rows, "historical_swing")
-                    st.download_button(f"⬇️ Download Full Top 3 Dataset ({len(hist_swing_records)} Weeks - CSV)", csv_swing_all, file_name=f"historical_swing_top3_{len(hist_swing_records)}weeks.csv", mime="text/csv", key="dl_hist_swing_all")
-
-                target_wk_rec = next((r for r in hist_swing_records if r["week_key"] == selected_wk), None)
-                if target_wk_rec:
-                    st.markdown(f"##### 📊 Weekly Session: **{target_wk_rec.get('week_start')} to {target_wk_rec.get('week_end')} ({selected_wk})**")
-                    render_historical_top3_view(target_wk_rec, is_intraday=False, key_prefix=f"hist_swing_{selected_wk}")
-            else:
-                st.info("📭 No historical swing data stored yet. Click '🚀 Fetch / Recalculate' to generate!")
-
-        # ── 3. STRATEGY SCREENER HIT-RATE BACKTEST ──
-        elif bt_tab_choice == "🧪 Strategy Screener Hit-Rate Backtest":
-            st.markdown("#### 🧪 Strategy Screener Hit-Rate Analysis (Multi-TF + Manual Logger)")
-            st.markdown("<div class='info-panel' style='font-size:11px;'>Quantitative hit-rate backtesting evaluating whether our screener setup caught confirmed winners & losers (Historical Top 3, Auto-Discovered Winners, and Manual Stock Logger entries) before their moves.</div>", unsafe_allow_html=True)
-
-            bt_c1, bt_c2 = st.columns(2)
-            with bt_c1:
-                intra_bt_depth = st.selectbox("Intraday Backtest Lookback", ["60 Trading Days", "90 Trading Days", "120 Trading Days", "180+ Trading Days"], index=0, key="intra_bt_depth")
-                bt_days_map = {"60 Trading Days": 60, "90 Trading Days": 90, "120 Trading Days": 120, "180+ Trading Days": 180}
-                if st.button(f"🧪 Run Intraday Backtest ({intra_bt_depth})", key="bt_intra_btn", type="primary", use_container_width=True):
-                    with st.spinner("Backtesting intraday screener hit-rate against all historical & manual data..."):
-                        bt_result = backtest_intraday_strategy(lookback_days=bt_days_map.get(intra_bt_depth, 60))
-                        st.success(f"✅ Intraday Backtest Complete! Avg Hit Rate: {bt_result.get('avg_hit_rate', 0):.1f}%")
-
-            with bt_c2:
-                swing_bt_depth = st.selectbox("Swing Backtest Lookback", ["12 Weeks (3 Mo)", "26 Weeks (6 Mo)", "52 Weeks (1 Yr)", "104 Weeks (2 Yrs)"], index=0, key="swing_bt_depth")
-                bt_wks_map = {"12 Weeks (3 Mo)": 12, "26 Weeks (6 Mo)": 26, "52 Weeks (1 Yr)": 52, "104 Weeks (2 Yrs)": 104}
-                if st.button(f"🧪 Run Swing Backtest ({swing_bt_depth})", key="bt_swing_btn", type="primary", use_container_width=True):
-                    with st.spinner("Backtesting swing screener hit-rate against all historical & manual data..."):
-                        bt_result = backtest_swing_strategy(lookback_weeks=bt_wks_map.get(swing_bt_depth, 12))
-                        st.success(f"✅ Swing Backtest Complete! Avg Hit Rate: {bt_result.get('avg_hit_rate', 0):.1f}%")
-
-            bt_data = load_backtest_results()
-            if bt_data:
-                st.markdown(f"<div class='last-updated'>🕐 Last backtest run: {bt_data.get('run_at', 'Never')}</div>", unsafe_allow_html=True)
-                bt_type = bt_data.get("type", "intraday")
-
-                m1, m2, m3, m4 = st.columns(4)
-                with m1:
-                    avg_hr = bt_data.get("avg_hit_rate", 0)
-                    hr_color = "#00ffaa" if avg_hr >= 50 else ("#ffaa00" if avg_hr >= 30 else "#ff3366")
-                    st.markdown(f"""<div class='metric-card'>
-                        <div class='metric-header'>AVG HIT RATE</div>
-                        <div class='metric-val' style='color:{hr_color};'>{avg_hr:.1f}%</div>
-                    </div>""", unsafe_allow_html=True)
-                with m2:
-                    total_w = bt_data.get("total_winners_found", sum(r.get("total_winners", 0) for r in bt_data.get("daily_results", bt_data.get("weekly_results", []))))
-                    st.markdown(f"""<div class='metric-card'>
-                        <div class='metric-header'>TOTAL WINNERS</div>
-                        <div class='metric-val'>{total_w}</div>
-                    </div>""", unsafe_allow_html=True)
-                with m3:
-                    total_hits = bt_data.get("total_screener_hits", sum(r.get("screener_found", 0) for r in bt_data.get("daily_results", bt_data.get("weekly_results", []))))
-                    st.markdown(f"""<div class='metric-card'>
-                        <div class='metric-header'>SCREENER HITS</div>
-                        <div class='metric-val' style='color:#00ffaa;'>{total_hits}</div>
-                    </div>""", unsafe_allow_html=True)
-                with m4:
-                    days_tested = len(bt_data.get("daily_results", bt_data.get("weekly_results", [])))
-                    period_label = "Days" if bt_type == "intraday" else "Weeks"
-                    st.markdown(f"""<div class='metric-card'>
-                        <div class='metric-header'>{period_label.upper()} TESTED</div>
-                        <div class='metric-val'>{days_tested}</div>
-                    </div>""", unsafe_allow_html=True)
-
-                # Sector Breakdown
-                sector_bd = bt_data.get("sector_breakdown", {})
-                if sector_bd:
-                    st.markdown("##### 🏭 Sector Hit-Rate Breakdown")
-                    sec_rows = [{"Sector": k, "Screener Hit Rate %": f"{v:.1f}%"} for k, v in sorted(sector_bd.items(), key=lambda x: x[1], reverse=True)]
-                    st.dataframe(pd.DataFrame(sec_rows), use_container_width=True, height=200)
-
-                result_rows = bt_data.get("daily_results", bt_data.get("weekly_results", []))
-                if result_rows:
-                    st.markdown("#### 📊 Detailed Hit-Rate Breakdown")
-                    bt_df = pd.DataFrame(result_rows)
-                    date_col = "date" if "date" in bt_df.columns else "week"
-                    display_cols = [c for c in [date_col, "total_winners", "screener_found", "hit_rate", "missed"] if c in bt_df.columns]
-                    st.dataframe(bt_df[display_cols], use_container_width=True, height=350)
-
-                    if "hit_rate" in bt_df.columns and len(bt_df) > 1:
-                        chart_df = bt_df[bt_df["total_winners"] > 0].copy()
-                        if not chart_df.empty:
-                            fig = go.Figure()
-                            fig.add_trace(go.Scatter(
-                                x=chart_df[date_col], y=chart_df["hit_rate"],
-                                mode='lines+markers', name='Hit Rate %',
-                                line=dict(color='#00ffaa', width=2),
-                                marker=dict(size=6)
-                            ))
-                            fig.add_hline(y=50, line_dash="dash", line_color="#ffaa00", annotation_text="50% target")
-                            fig.update_layout(
-                                title="Screener Hit Rate Over Time",
-                                template="plotly_dark",
-                                paper_bgcolor='rgba(0,0,0,0)',
-                                plot_bgcolor='rgba(0,0,0,0)',
-                                height=320,
-                                margin=dict(l=40, r=20, t=40, b=40)
-                            )
-                            st.plotly_chart(fig, use_container_width=True)
-
-                    bt_csv = bt_df.to_csv(index=False)
-                    st.download_button("⬇️ Download Hit-Rate CSV", bt_csv, file_name=f"backtest_{bt_type}_results.csv", mime="text/csv", key="dl_bt_hitrate")
-            else:
-                st.info("📭 No hit-rate backtest results yet. Click a button above to run.")
-
-        # ── 4. ADAPTIVE INTELLIGENCE WEIGHTS ──
-        elif bt_tab_choice == "🧠 Adaptive Intelligence Weights":
-            st.markdown("#### 🧠 Multi-Timeframe Adaptive Screener Intelligence")
-            st.markdown("<div class='info-panel' style='font-size:11px;'>Displays the dynamic calibrated weights automatically derived by analyzing 180+ days Intraday Top 3, 104 weeks Swing Top 3, and Manual Stock Logger entries. These weights continuously adapt the Live & EOD Screener confluence scoring.</div>", unsafe_allow_html=True)
-
-            ad_w = load_adaptive_weights()
-            if not ad_w:
-                st.info("⚙️ Calibrating initial adaptive weights from historical dataset...")
-                ad_w = learn_adaptive_screener_weights()
-
-            st.markdown(f"<div class='last-updated'>🕐 Last calibrated: {ad_w.get('calibrated_at', 'Active')}</div>", unsafe_allow_html=True)
-            
-            c_w1, c_w2, c_w3, c_w4 = st.columns(4)
-            with c_w1:
-                st.markdown(f"""<div class='metric-card'>
-                    <div class='metric-header'>TREND ALIGNMENT WEIGHT</div>
-                    <div class='metric-val' style='color:#00ffaa;'>{ad_w.get('trend_weight', 15.0)} pts</div>
-                </div>""", unsafe_allow_html=True)
-            with c_w2:
-                st.markdown(f"""<div class='metric-card'>
-                    <div class='metric-header'>SUPERTREND WEIGHT</div>
-                    <div class='metric-val' style='color:#00ffaa;'>{ad_w.get('supertrend_weight', 15.0)} pts</div>
-                </div>""", unsafe_allow_html=True)
-            with c_w3:
-                st.markdown(f"""<div class='metric-card'>
-                    <div class='metric-header'>VOLUME SPIKE WEIGHT</div>
-                    <div class='metric-val' style='color:#00ffaa;'>{ad_w.get('volume_weight', 15.0)} pts</div>
-                </div>""", unsafe_allow_html=True)
-            with c_w4:
-                st.markdown(f"""<div class='metric-card'>
-                    <div class='metric-header'>PIVOT ALIGNMENT WEIGHT</div>
-                    <div class='metric-val' style='color:#00ffaa;'>{ad_w.get('pivot_weight', 15.0)} pts</div>
-                </div>""", unsafe_allow_html=True)
-
-            st.markdown("---")
-            st.markdown("##### 🏆 Current Sector Tailwinds")
-            top_sec = ad_w.get("top_sectors", [])
-            if top_sec:
-                st.markdown("Top performing sectors currently awarded **+5.0 pts Confluence Boost** in screener:")
-                sec_badges = " • ".join([f"<span class='fo-badge' style='background:rgba(0,255,170,0.15);color:#00ffaa;padding:4px 8px;'>{s}</span>" for s in top_sec[:4]])
-                st.markdown(sec_badges, unsafe_allow_html=True)
-
-# =============================================================================
-# FOOTER
-# =============================================================================
-st.markdown("---")
-st.markdown(f"<div style='text-align:center;color:#6b7294;font-size:11px;padding:8px;font-weight:600;'>👑 QUANT-EDGE v20 • Multi-TF Confluence • Floor Pivots • Volume Profile • Institutional Psychology • 180D/104W Backtest Lab • {get_ist_now().strftime('%d %b %Y, %I:%M %p IST')}</div>", unsafe_allow_html=True)
+st.divider()
+st.caption("QUANT-EDGE v21 • For research and personal use. Every probability shown is an "
+           "out-of-sample estimate from historical data, not a forecast. Position sizing assumes "
+           "you can lose the full stop distance on every trade.")
