@@ -1,6 +1,6 @@
 """
 ================================================================================
- QUANT-EDGE v21  —  INSTITUTIONAL ORB TERMINAL  (NSE F&O)
+ QUANT-EDGE v22  —  INSTITUTIONAL ORB TERMINAL  (NSE F&O)
 ================================================================================
  Zero-decision screener. Three engines, one calibrated probability model each:
 
@@ -77,7 +77,7 @@ try:
 except Exception:
     HAS_FYERS = False
 
-st.set_page_config(page_title="QUANT-EDGE v21 — Institutional ORB Terminal",
+st.set_page_config(page_title="QUANT-EDGE v22 — Institutional ORB Terminal",
                    page_icon="⚡", layout="wide", initial_sidebar_state="expanded")
 
 # =============================================================================
@@ -140,7 +140,11 @@ CFG = dict(
     TARGET_PCT           = 2.00,   # intraday objective
     PARTIAL_PCT          = 1.00,   # book half here, stop to breakeven
     USE_PARTIAL          = True,
-    MAX_TRADES_DAY       = 2,      # k=1..2 held the best expectancy
+    MAX_TRADES_DAY       = 2,
+    INTRADAY_TOP_N       = 1,      # walk-forward: top-1 +0.318%/trade, top-2 +0.098%,
+                                   # top-3 +0.073%. The edge is concentrated; k=1 is
+                                   # the default because k>1 dilutes it.
+    SHORT_TOP_N          = 1,      # shown, never recommended: -0.026%/trade
     COST_PCT             = 0.06,   # round-trip cost assumption
     LAST_ENTRY_TIME      = dtime(13, 0),
     SQUARE_OFF_TIME      = dtime(15, 10),
@@ -166,91 +170,114 @@ RENAMES = {"TATAMOTORS.NS": "TMPV.NS", "ZOMATO.NS": "ETERNAL.NS",
            "LTIM.NS": None, "PEL.NS": None, "MINDTREE.NS": None,
            "SRTRANSFIN.NS": "SHRIRAMFIN.NS", "HDFC.NS": None}
 
+# ---- OFFICIAL NSE F&O UNIVERSE ----------------------------------------------
+# 210 symbols, fetched live from https://www.nseindia.com/api/master-quote on
+# 2026-08-27. fetch_fno_universe() re-fetches at runtime; this list is the
+# fallback so the app never depends on the NSE endpoint being reachable.
+FNO_STATIC = [
+ "360ONE","ABB","ABCAPITAL","ADANIENSOL","ADANIENT","ADANIGREEN","ADANIPORTS","ADANIPOWER",
+ "ALKEM","AMBER","AMBUJACEM","ANGELONE","APLAPOLLO","APOLLOHOSP","ASHOKLEY","ASIANPAINT",
+ "ASTRAL","ATHERENERG","AUBANK","AUROPHARMA","AXISBANK","BAJAJ-AUTO","BAJAJFINSV","BAJAJHLDNG",
+ "BAJFINANCE","BANDHANBNK","BANKBARODA","BANKINDIA","BDL","BEL","BHARATFORG","BHARTIARTL",
+ "BHEL","BIOCON","BLUESTARCO","BOSCHLTD","BPCL","BRITANNIA","BSE","CAMS",
+ "CANBK","CDSL","CGPOWER","CHOLAFIN","CIPLA","COALINDIA","COCHINSHIP","COFORGE",
+ "COLPAL","CONCOR","CROMPTON","CUMMINSIND","DABUR","DELHIVERY","DIVISLAB","DIXON",
+ "DLF","DMART","DRREDDY","EICHERMOT","ETERNAL","FEDERALBNK","FORCEMOT","FORTIS",
+ "GAIL","GLENMARK","GMRAIRPORT","GODFRYPHLP","GODREJCP","GODREJPROP","GRASIM","GVT&D",
+ "HAL","HAVELLS","HCLTECH","HDFCAMC","HDFCBANK","HDFCLIFE","HEROMOTOCO","HINDALCO",
+ "HINDPETRO","HINDUNILVR","HINDZINC","HYUNDAI","ICICIBANK","ICICIGI","ICICIPRULI","IDEA",
+ "IDFCFIRSTB","IEX","INDHOTEL","INDIANB","INDIGO","INDUSINDBK","INDUSTOWER","INFY",
+ "INOXWIND","IOC","IREDA","IRFC","ITC","JINDALSTEL","JIOFIN","JSWENERGY",
+ "JSWSTEEL","JUBLFOOD","KALYANKJIL","KAYNES","KEI","KFINTECH","KOTAKBANK","KPITTECH",
+ "LAURUSLABS","LICHSGFIN","LICI","LODHA","LT","LTF","LTM","LUPIN",
+ "M&M","MAHABANK","MANAPPURAM","MANKIND","MARICO","MARUTI","MAXHEALTH","MAZDOCK",
+ "MCX","MFSL","MOTHERSON","MOTILALOFS","MPHASIS","MUTHOOTFIN","NAM-INDIA","NATIONALUM",
+ "NAUKRI","NBCC","NESTLEIND","NHPC","NMDC","NTPC","NYKAA","OBEROIRLTY",
+ "OFSS","OIL","ONGC","PAGEIND","PATANJALI","PAYTM","PERSISTENT","PETRONET",
+ "PFC","PGEL","PHOENIXLTD","PIDILITIND","PIIND","PNB","PNBHOUSING","POLICYBZR",
+ "POLYCAB","POWERGRID","POWERINDIA","PREMIERENE","PRESTIGE","RADICO","RBLBANK","RECLTD",
+ "RELIANCE","RVNL","SAGILITY","SAIL","SBICARD","SBILIFE","SBIN","SHREECEM",
+ "SHRIRAMFIN","SIEMENS","SOLARINDS","SONACOMS","SRF","SUNPHARMA","SUPREMEIND","SUZLON",
+ "SWIGGY","TATACONSUM","TATAELXSI","TATAPOWER","TATASTEEL","TCS","TECHM","TIINDIA",
+ "TITAN","TMPV","TORNTPHARM","TRENT","TVSMOTOR","ULTRACEMCO","UNIONBANK","UNITDSPR",
+ "UNOMINDA","UPL","VBL","VEDL","VMM","VOLTAS","WAAREEENER","WIPRO",
+ "YESBANK","ZYDUSLIFE",
+]
 UNIVERSE_RAW = [
- # ---- Index heavyweights / Nifty50
- "RELIANCE.NS","HDFCBANK.NS","ICICIBANK.NS","INFY.NS","TCS.NS","SBIN.NS","BHARTIARTL.NS",
- "ITC.NS","LT.NS","KOTAKBANK.NS","AXISBANK.NS","HINDUNILVR.NS","BAJFINANCE.NS","MARUTI.NS",
- "SUNPHARMA.NS","TITAN.NS","ULTRACEMCO.NS","ASIANPAINT.NS","NESTLEIND.NS","WIPRO.NS",
- "HCLTECH.NS","TECHM.NS","POWERGRID.NS","NTPC.NS","ONGC.NS","COALINDIA.NS","JSWSTEEL.NS",
- "TATASTEEL.NS","HINDALCO.NS","GRASIM.NS","ADANIENT.NS","ADANIPORTS.NS","BAJAJFINSV.NS",
- "BAJAJ-AUTO.NS","HEROMOTOCO.NS","EICHERMOT.NS","M&M.NS","CIPLA.NS","DRREDDY.NS",
- "DIVISLAB.NS","APOLLOHOSP.NS","BRITANNIA.NS","TATACONSUM.NS","SHRIRAMFIN.NS","SBILIFE.NS",
- "HDFCLIFE.NS","INDUSINDBK.NS","BPCL.NS","IOC.NS","TRENT.NS","JIOFIN.NS","ETERNAL.NS",
- # ---- Banks / NBFC / capital markets (highest intraday velocity group)
- "BANKBARODA.NS","PNB.NS","CANBK.NS","UNIONBANK.NS","IDFCFIRSTB.NS","FEDERALBNK.NS",
- "BANDHANBNK.NS","AUBANK.NS","RBLBANK.NS","YESBANK.NS","INDIANB.NS","IOB.NS","UCOBANK.NS",
- "CHOLAFIN.NS","MUTHOOTFIN.NS","MANAPPURAM.NS","LICHSGFIN.NS","PFC.NS","RECLTD.NS",
- "IRFC.NS","SBICARD.NS","POONAWALLA.NS","LTF.NS","ABCAPITAL.NS","IIFL.NS","ANGELONE.NS",
- "MOTILALOFS.NS","NUVAMA.NS","360ONE.NS","BSE.NS","MCX.NS","CDSL.NS","IEX.NS","KFINTECH.NS",
- "NAM-INDIA.NS","HDFCAMC.NS","CAMSONLINE.NS","PAYTM.NS","POLICYBZR.NS","SAMMAANCAP.NS",
- # ---- Auto & ancillary
- "TVSMOTOR.NS","ASHOKLEY.NS","TMPV.NS","BHARATFORG.NS","MOTHERSON.NS","BALKRISIND.NS",
- "APOLLOTYRE.NS","MRF.NS","EXIDEIND.NS","SONACOMS.NS","UNOMINDA.NS","ENDURANCE.NS",
- "TIINDIA.NS","BOSCHLTD.NS","SCHAEFFLER.NS","FORCEMOT.NS","HYUNDAI.NS","OLECTRA.NS",
- # ---- Metals, mining, energy
- "VEDL.NS","SAIL.NS","NMDC.NS","JINDALSTEL.NS","NATIONALUM.NS","HINDZINC.NS","HINDCOPPER.NS",
- "JSL.NS","APLAPOLLO.NS","WELCORP.NS","GAIL.NS","PETRONET.NS","IGL.NS","MGL.NS","OIL.NS",
- "ATGL.NS","ADANIGREEN.NS","ADANIPOWER.NS","TATAPOWER.NS","JSWENERGY.NS","NHPC.NS","SJVN.NS",
- "TORNTPOWER.NS","CESC.NS","POWERINDIA.NS","PREMIERENE.NS","WAAREEENER.NS","SUZLON.NS","INOXWIND.NS",
- # ---- Infra, capital goods, defence, railways
- "BEL.NS","HAL.NS","BDL.NS","MAZDOCK.NS","COCHINSHIP.NS","GRSE.NS","BHEL.NS","SIEMENS.NS",
- "ABB.NS","CUMMINSIND.NS","THERMAX.NS","KEC.NS","KALPATPOWR.NS","NCC.NS","IRB.NS","GMRAIRPORT.NS",
- "RVNL.NS","IRCON.NS","RAILTEL.NS","TITAGARH.NS","JWL.NS","IRCTC.NS","CONCOR.NS","NBCC.NS",
- "HUDCO.NS","SOLARINDS.NS","AMBER.NS","PGEL.NS","DIXON.NS","KAYNES.NS","CGPOWER.NS","POLYCAB.NS",
- "HAVELLS.NS","VOLTAS.NS","BLUESTARCO.NS","CROMPTON.NS","KEI.NS","SUPREMEIND.NS","ASTRAL.NS",
- # ---- Pharma & healthcare
- "LUPIN.NS","AUROPHARMA.NS","ZYDUSLIFE.NS","ALKEM.NS","TORNTPHARM.NS","MANKIND.NS","IPCALAB.NS",
- "GLENMARK.NS","LAURUSLABS.NS","BIOCON.NS","GRANULES.NS","NATCOPHARM.NS","AJANTPHARM.NS",
- "PPLPHARMA.NS","ABBOTINDIA.NS","MAXHEALTH.NS","FORTIS.NS","SYNGENE.NS","METROPOLIS.NS","LALPATHLAB.NS",
- # ---- IT & new-age
- "LTTS.NS","MPHASIS.NS","PERSISTENT.NS","COFORGE.NS","KPITTECH.NS","CYIENT.NS","TATAELXSI.NS",
- "OFSS.NS","SONATSOFTW.NS","NAUKRI.NS","SWIGGY.NS","NYKAA.NS","DELHIVERY.NS","ZEEL.NS",
- # ---- Consumer, retail, cement, chemicals, others
- "DMART.NS","JUBLFOOD.NS","DEVYANI.NS","VBL.NS","UBL.NS","RADICO.NS","MARICO.NS","DABUR.NS",
- "GODREJCP.NS","COLPAL.NS","PGHH.NS","EMAMILTD.NS","BATAINDIA.NS","PAGEIND.NS","ABFRL.NS",
- "GODFRYPHLP.NS","SHREECEM.NS","AMBUJACEM.NS","ACC.NS","DALBHARAT.NS","JKCEMENT.NS","RAMCOCEM.NS",
- "PIDILITIND.NS","SRF.NS","PIIND.NS","DEEPAKNTR.NS","AARTIIND.NS","TATACHEM.NS","UPL.NS",
- "COROMANDEL.NS","CHAMBLFERT.NS","GNFC.NS","NAVINFLUOR.NS","ATUL.NS","VINATIORGA.NS",
- "INDIGO.NS","SPICEJET.NS","INDHOTEL.NS","LEMONTREE.NS","OBEROIRLTY.NS","DLF.NS","GODREJPROP.NS",
- "PRESTIGE.NS","LODHA.NS","PHOENIXLTD.NS","BRIGADE.NS","SOBHA.NS","CENTURYPLY.NS",
- "TATACOMM.NS","IDEA.NS","HFCL.NS","INDUSTOWER.NS","BSOFT.NS","ITI.NS",
+ "360ONE.NS","ABB.NS","ABCAPITAL.NS","ADANIENSOL.NS","ADANIENT.NS","ADANIGREEN.NS",
+ "ADANIPORTS.NS","ADANIPOWER.NS","ALKEM.NS","AMBER.NS","AMBUJACEM.NS","ANGELONE.NS",
+ "APLAPOLLO.NS","APOLLOHOSP.NS","ASHOKLEY.NS","ASIANPAINT.NS","ASTRAL.NS","ATHERENERG.NS",
+ "AUBANK.NS","AUROPHARMA.NS","AXISBANK.NS","BAJAJ-AUTO.NS","BAJAJFINSV.NS","BAJAJHLDNG.NS",
+ "BAJFINANCE.NS","BANDHANBNK.NS","BANKBARODA.NS","BANKINDIA.NS","BDL.NS","BEL.NS",
+ "BHARATFORG.NS","BHARTIARTL.NS","BHEL.NS","BIOCON.NS","BLUESTARCO.NS","BOSCHLTD.NS",
+ "BPCL.NS","BRITANNIA.NS","BSE.NS","CAMS.NS","CANBK.NS","CDSL.NS",
+ "CGPOWER.NS","CHOLAFIN.NS","CIPLA.NS","COALINDIA.NS","COCHINSHIP.NS","COFORGE.NS",
+ "COLPAL.NS","CONCOR.NS","CROMPTON.NS","CUMMINSIND.NS","DABUR.NS","DELHIVERY.NS",
+ "DIVISLAB.NS","DIXON.NS","DLF.NS","DMART.NS","DRREDDY.NS","EICHERMOT.NS",
+ "ETERNAL.NS","FEDERALBNK.NS","FORCEMOT.NS","FORTIS.NS","GAIL.NS","GLENMARK.NS",
+ "GMRAIRPORT.NS","GODFRYPHLP.NS","GODREJCP.NS","GODREJPROP.NS","GRASIM.NS","GVT&D.NS",
+ "HAL.NS","HAVELLS.NS","HCLTECH.NS","HDFCAMC.NS","HDFCBANK.NS","HDFCLIFE.NS",
+ "HEROMOTOCO.NS","HINDALCO.NS","HINDPETRO.NS","HINDUNILVR.NS","HINDZINC.NS","HYUNDAI.NS",
+ "ICICIBANK.NS","ICICIGI.NS","ICICIPRULI.NS","IDEA.NS","IDFCFIRSTB.NS","IEX.NS",
+ "INDHOTEL.NS","INDIANB.NS","INDIGO.NS","INDUSINDBK.NS","INDUSTOWER.NS","INFY.NS",
+ "INOXWIND.NS","IOC.NS","IREDA.NS","IRFC.NS","ITC.NS","JINDALSTEL.NS",
+ "JIOFIN.NS","JSWENERGY.NS","JSWSTEEL.NS","JUBLFOOD.NS","KALYANKJIL.NS","KAYNES.NS",
+ "KEI.NS","KFINTECH.NS","KOTAKBANK.NS","KPITTECH.NS","LAURUSLABS.NS","LICHSGFIN.NS",
+ "LICI.NS","LODHA.NS","LT.NS","LTF.NS","LTM.NS","LUPIN.NS",
+ "M&M.NS","MAHABANK.NS","MANAPPURAM.NS","MANKIND.NS","MARICO.NS","MARUTI.NS",
+ "MAXHEALTH.NS","MAZDOCK.NS","MCX.NS","MFSL.NS","MOTHERSON.NS","MOTILALOFS.NS",
+ "MPHASIS.NS","MUTHOOTFIN.NS","NAM-INDIA.NS","NATIONALUM.NS","NAUKRI.NS","NBCC.NS",
+ "NESTLEIND.NS","NHPC.NS","NMDC.NS","NTPC.NS","NYKAA.NS","OBEROIRLTY.NS",
+ "OFSS.NS","OIL.NS","ONGC.NS","PAGEIND.NS","PATANJALI.NS","PAYTM.NS",
+ "PERSISTENT.NS","PETRONET.NS","PFC.NS","PGEL.NS","PHOENIXLTD.NS","PIDILITIND.NS",
+ "PIIND.NS","PNB.NS","PNBHOUSING.NS","POLICYBZR.NS","POLYCAB.NS","POWERGRID.NS",
+ "POWERINDIA.NS","PREMIERENE.NS","PRESTIGE.NS","RADICO.NS","RBLBANK.NS","RECLTD.NS",
+ "RELIANCE.NS","RVNL.NS","SAGILITY.NS","SAIL.NS","SBICARD.NS","SBILIFE.NS",
+ "SBIN.NS","SHREECEM.NS","SHRIRAMFIN.NS","SIEMENS.NS","SOLARINDS.NS","SONACOMS.NS",
+ "SRF.NS","SUNPHARMA.NS","SUPREMEIND.NS","SUZLON.NS","SWIGGY.NS","TATACONSUM.NS",
+ "TATAELXSI.NS","TATAPOWER.NS","TATASTEEL.NS","TCS.NS","TECHM.NS","TIINDIA.NS",
+ "TITAN.NS","TMPV.NS","TORNTPHARM.NS","TRENT.NS","TVSMOTOR.NS","ULTRACEMCO.NS",
+ "UNIONBANK.NS","UNITDSPR.NS","UNOMINDA.NS","UPL.NS","VBL.NS","VEDL.NS",
+ "VMM.NS","VOLTAS.NS","WAAREEENER.NS","WIPRO.NS","YESBANK.NS","ZYDUSLIFE.NS",
 ]
 
+
+def fetch_fno_universe(timeout=8):
+    """Live official F&O list from NSE. Returns (symbols, source)."""
+    try:
+        import requests
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.nseindia.com/market-data/equity-derivatives-watch",
+        })
+        s.get("https://www.nseindia.com/", timeout=timeout)
+        r = s.get("https://www.nseindia.com/api/master-quote", timeout=timeout)
+        arr = r.json()
+        arr = [x for x in arr if isinstance(x, str) and x.strip()]
+        if len(arr) >= 150:
+            return sorted(set(arr)), f"NSE live ({len(arr)} symbols)"
+    except Exception:
+        pass
+    return list(FNO_STATIC), f"static fallback ({len(FNO_STATIC)} symbols)"
+
+FNO_SYMBOLS, FNO_SOURCE = list(FNO_STATIC), "static"
+
 SECTOR_MAP = {
- "BANK": ["HDFCBANK","ICICIBANK","SBIN","KOTAKBANK","AXISBANK","INDUSINDBK","BANKBARODA","PNB",
-          "CANBK","UNIONBANK","IDFCFIRSTB","FEDERALBNK","BANDHANBNK","AUBANK","RBLBANK","YESBANK",
-          "INDIANB","IOB","UCOBANK"],
- "NBFC/CAPMKT": ["BAJFINANCE","BAJAJFINSV","CHOLAFIN","MUTHOOTFIN","MANAPPURAM","LICHSGFIN","PFC",
-          "RECLTD","IRFC","SBICARD","POONAWALLA","LTF","ABCAPITAL","IIFL","ANGELONE","MOTILALOFS",
-          "NUVAMA","360ONE","BSE","MCX","CDSL","IEX","KFINTECH","NAM-INDIA","HDFCAMC","CAMS",
-          "PAYTM","POLICYBZR","SAMMAANCAP","JIOFIN","SHRIRAMFIN","SBILIFE","HDFCLIFE"],
- "IT": ["INFY","TCS","WIPRO","HCLTECH","TECHM","LTTS","MPHASIS","PERSISTENT","COFORGE","KPITTECH",
-        "CYIENT","TATAELXSI","OFSS","SONATSOFTW","BSOFT"],
- "AUTO": ["MARUTI","M&M","BAJAJ-AUTO","HEROMOTOCO","EICHERMOT","TVSMOTOR","ASHOKLEY","TMPV",
-          "BHARATFORG","MOTHERSON","BALKRISIND","APOLLOTYRE","MRF","EXIDEIND","SONACOMS","UNOMINDA",
-          "ENDURANCE","TIINDIA","BOSCHLTD","SCHAEFFLER","FORCEMOT","HYUNDAI","OLECTRA"],
- "METAL": ["TATASTEEL","JSWSTEEL","HINDALCO","VEDL","SAIL","NMDC","JINDALSTEL","NATIONALUM",
-           "HINDZINC","HINDCOPPER","JSL","APLAPOLLO","WELCORP","COALINDIA"],
- "ENERGY": ["RELIANCE","ONGC","BPCL","IOC","GAIL","PETRONET","IGL","MGL","OIL","ATGL","ADANIGREEN",
-            "ADANIPOWER","TATAPOWER","JSWENERGY","NHPC","SJVN","TORNTPOWER","CESC","NTPC","POWERGRID",
-            "POWERINDIA","PREMIERENE","WAAREEENER","SUZLON","INOXWIND"],
- "PHARMA": ["SUNPHARMA","CIPLA","DRREDDY","DIVISLAB","LUPIN","AUROPHARMA","ZYDUSLIFE","ALKEM",
-            "TORNTPHARM","MANKIND","IPCALAB","GLENMARK","LAURUSLABS","BIOCON","GRANULES","NATCOPHARM",
-            "AJANTPHARM","PPLPHARMA","ABBOTINDIA","APOLLOHOSP","MAXHEALTH","FORTIS","SYNGENE",
-            "METROPOLIS","LALPATHLAB"],
- "FMCG/RETAIL": ["HINDUNILVR","ITC","NESTLEIND","BRITANNIA","TATACONSUM","DMART","TRENT","JUBLFOOD",
-            "DEVYANI","VBL","UBL","RADICO","MARICO","DABUR","GODREJCP","COLPAL","PGHH","EMAMILTD",
-            "BATAINDIA","PAGEIND","ABFRL","GODFRYPHLP","TITAN","NYKAA","ETERNAL","SWIGGY"],
- "INFRA/CAPGOODS": ["LT","BEL","HAL","BDL","MAZDOCK","COCHINSHIP","GRSE","BHEL","SIEMENS","ABB",
-            "CUMMINSIND","THERMAX","KEC","KPIL","NCC","IRB","GMRAIRPORT","RVNL","IRCON",
-            "RAILTEL","TITAGARH","JWL","IRCTC","CONCOR","NBCC","HUDCO","SOLARINDS","AMBER","PGEL",
-            "DIXON","KAYNES","CGPOWER","POLYCAB","HAVELLS","VOLTAS","BLUESTARCO","CROMPTON","KEI",
-            "SUPREMEIND","ASTRAL","ADANIENT","ADANIPORTS"],
- "CEMENT/CHEM": ["ULTRACEMCO","SHREECEM","AMBUJACEM","ACC","DALBHARAT","JKCEMENT","RAMCOCEM","GRASIM",
-            "ASIANPAINT","PIDILITIND","SRF","PIIND","DEEPAKNTR","AARTIIND","TATACHEM","UPL",
-            "COROMANDEL","CHAMBLFERT","GNFC","NAVINFLUOR","ATUL","VINATIORGA"],
- "REALTY/HOTEL": ["DLF","GODREJPROP","OBEROIRLTY","PRESTIGE","LODHA","PHOENIXLTD","BRIGADE","SOBHA",
-            "CENTURYPLY","INDHOTEL","LEMONTREE","INDIGO","SPICEJET"],
+ "BANK": ["HDFCBANK","ICICIBANK","SBIN","KOTAKBANK","AXISBANK","INDUSINDBK","BANKBARODA","PNB","CANBK","UNIONBANK","IDFCFIRSTB","FEDERALBNK","BANDHANBNK","AUBANK","RBLBANK","YESBANK","INDIANB","IOB","UCOBANK","BANKINDIA","MAHABANK"],
+ "NBFC/CAPMKT": ["BAJFINANCE","BAJAJFINSV","CHOLAFIN","MUTHOOTFIN","MANAPPURAM","LICHSGFIN","PFC","RECLTD","IRFC","SBICARD","POONAWALLA","LTF","ABCAPITAL","IIFL","ANGELONE","MOTILALOFS","NUVAMA","360ONE","BSE","MCX","CDSL","IEX","KFINTECH","NAM-INDIA","HDFCAMC","CAMS","PAYTM","POLICYBZR","SAMMAANCAP","JIOFIN","SHRIRAMFIN","SBILIFE","HDFCLIFE","BAJAJHLDNG","ICICIGI","ICICIPRULI","IREDA","LICI","MFSL","PNBHOUSING"],
+ "IT": ["INFY","TCS","WIPRO","HCLTECH","TECHM","LTTS","MPHASIS","PERSISTENT","COFORGE","KPITTECH","CYIENT","TATAELXSI","OFSS","SONATSOFTW","BSOFT","LTM","SAGILITY"],
+ "AUTO": ["MARUTI","M&M","BAJAJ-AUTO","HEROMOTOCO","EICHERMOT","TVSMOTOR","ASHOKLEY","TMPV","BHARATFORG","MOTHERSON","BALKRISIND","APOLLOTYRE","MRF","EXIDEIND","SONACOMS","UNOMINDA","ENDURANCE","TIINDIA","BOSCHLTD","SCHAEFFLER","FORCEMOT","HYUNDAI","OLECTRA","ATHERENERG"],
+ "METAL": ["TATASTEEL","JSWSTEEL","HINDALCO","VEDL","SAIL","NMDC","JINDALSTEL","NATIONALUM","HINDZINC","HINDCOPPER","JSL","APLAPOLLO","WELCORP","COALINDIA"],
+ "ENERGY": ["RELIANCE","ONGC","BPCL","IOC","GAIL","PETRONET","IGL","MGL","OIL","ATGL","ADANIGREEN","ADANIPOWER","TATAPOWER","JSWENERGY","NHPC","SJVN","TORNTPOWER","CESC","NTPC","POWERGRID","POWERINDIA","PREMIERENE","WAAREEENER","SUZLON","INOXWIND","ADANIENSOL","HINDPETRO"],
+ "PHARMA": ["SUNPHARMA","CIPLA","DRREDDY","DIVISLAB","LUPIN","AUROPHARMA","ZYDUSLIFE","ALKEM","TORNTPHARM","MANKIND","IPCALAB","GLENMARK","LAURUSLABS","BIOCON","GRANULES","NATCOPHARM","AJANTPHARM","PPLPHARMA","ABBOTINDIA","APOLLOHOSP","MAXHEALTH","FORTIS","SYNGENE","METROPOLIS","LALPATHLAB"],
+ "FMCG/RETAIL": ["HINDUNILVR","ITC","NESTLEIND","BRITANNIA","TATACONSUM","DMART","TRENT","JUBLFOOD","DEVYANI","VBL","UBL","RADICO","MARICO","DABUR","GODREJCP","COLPAL","PGHH","EMAMILTD","BATAINDIA","PAGEIND","ABFRL","GODFRYPHLP","TITAN","NYKAA","ETERNAL","SWIGGY","KALYANKJIL","PATANJALI","UNITDSPR","VMM"],
+ "INFRA/CAPGOODS": ["LT","BEL","HAL","BDL","MAZDOCK","COCHINSHIP","GRSE","BHEL","SIEMENS","ABB","CUMMINSIND","THERMAX","KEC","KPIL","NCC","IRB","GMRAIRPORT","RVNL","IRCON","RAILTEL","TITAGARH","JWL","IRCTC","CONCOR","NBCC","HUDCO","SOLARINDS","AMBER","PGEL","DIXON","KAYNES","CGPOWER","POLYCAB","HAVELLS","VOLTAS","BLUESTARCO","CROMPTON","KEI","SUPREMEIND","ASTRAL","ADANIENT","ADANIPORTS","GVT&D"],
+ "CEMENT/CHEM": ["ULTRACEMCO","SHREECEM","AMBUJACEM","ACC","DALBHARAT","JKCEMENT","RAMCOCEM","GRASIM","ASIANPAINT","PIDILITIND","SRF","PIIND","DEEPAKNTR","AARTIIND","TATACHEM","UPL","COROMANDEL","CHAMBLFERT","GNFC","NAVINFLUOR","ATUL","VINATIORGA"],
+ "REALTY/HOTEL": ["DLF","GODREJPROP","OBEROIRLTY","PRESTIGE","LODHA","PHOENIXLTD","BRIGADE","SOBHA","CENTURYPLY","INDHOTEL","LEMONTREE","INDIGO","SPICEJET"],
  "TELECOM/MEDIA": ["BHARTIARTL","IDEA","TATACOMM","INDUSTOWER","HFCL","ITI","ZEEL","NAUKRI","DELHIVERY"],
 }
 SECTOR_OF = {}
@@ -1175,33 +1202,66 @@ def load_model(path, embedded=None):
     return None
 
 # =============================================================================
-
-# EMBEDDED CALIBRATED MODELS  (fitted offline on the full study sample)
-
-# Regenerated automatically by the learning loop into data/models/*.json.
-
+# EMBEDDED CALIBRATED MODELS — v22
+# Refitted 2026-08-27 on the OFFICIAL 210-name NSE F&O universe:
+#   16,280 close-confirmed 5-min ORB trigger events across 59 sessions
+#   (2026-06-05 -> 2026-08-27), liquidity floor 25 cr, stop capped at 1.0%.
+# Labels are SEQUENTIAL, not MFE: win = target reached BEFORE the capped stop,
+# measured strictly on bars AFTER the confirming candle (the v21 study allowed
+# the confirming candle's own high/low to settle the trade, which flattered it).
+#
+# WALK-FORWARD RESULT (expanding window, refit daily, 33 unseen sessions,
+# scale-out exit = half at +1% then stop to breakeven, 0.06% costs):
+#   long top-1 + confluence gate : target-hit 33.3%, profitable 66.7%,
+#                                  avg +0.318%/trade, MFE>=3% on 24% of picks
+#   long top-2 : +0.098%   long top-3 : +0.073%   (edge decays with k)
+#   short top-1: -0.026%   -> short stays LOW-CONF, gated, never the default
+#   WITHOUT the confluence gate top-1 was -0.028%/trade. The gate IS the edge.
 # =============================================================================
+CONFLUENCE_GATE = dict(atr_pct=2.0, adr20=2.0, orb_rng_pct=0.60, trig_min_max=20)
 
 EMB_LONG = dict(
-  features=['atr_pct', 'adr20', 'vol20', 'big_moves_20', 'big_moves_60', 'bbw', 'bbw_pctile', 'rvol', 'ret1', 'ret3', 'ret5', 'ret21', 'gap_today', 'gap_x_atr', 'clv', 'body', 'px_vs_e20', 'e20_vs_e50', 'rsi', 'macd_h_norm', 'd_hi20', 'd_lo20', 'd_hi52', 'd_lo52', 'st_dir', 'rs21', 'rs1', 'acc2', 'orb_range_pct', 'orb_rng_x_atr', 'fc_body', 'orb_pos_in_pd', 'nf_gap', 'nf_fc', 'nf_fc_range', 'turn_ma_cr', 'px', 'orb_h_vs_pdh', 'long_break_pct', 'room_to_pdh', 'L_trig_min'],
-  coef=[0.18083033, 0.02633692, 0.14291853, 0.02566966, 0.17181047, -0.05313657, -0.02048169, 0.01916862, -0.07098634, -0.04268473, 0.01900845, 0.39863376, 0.02340167, 8.026e-05, -0.05787861, 0.04771921, 0.05651406, -0.09871257, -0.15878899, -0.05545435, 0.21548272, -0.07067705, -0.11937098, 0.18261505, 0.0555955, -0.32014754, -0.00715987, 0.07626524, 0.06676832, 0.25515546, 0.05178576, 0.21034861, 0.12971936, 0.0156963, -0.0524823, -0.11156248, -0.03142569, -0.12554577, 0.03731731, 0.06733564, -0.59476752],
-  intercept=-2.36207775,
-  mean=[2.57848127, 2.48251041, 1.76259277, 2.75740517, 9.97949337, 11.39442122, 0.38811542, 0.96561571, 0.02271691, 0.19570207, 0.2960721, 1.37910898, 0.11605456, 0.04184956, 0.46567761, -0.06153242, 0.3909272, 0.6474431, 51.37746988, -0.02089715, -5.40202171, 6.7506139, -17.09130535, 30.60842363, 0.05857124, 0.44117949, 0.05638601, 0.20721083, 0.80443012, 0.3150812, 0.11531403, 0.6398848, 0.05775785, 0.00532797, 0.25803658, 313.00036412, 2282.12611728, -0.47057368, 0.44013948, 0.49466932, 45.67216191],
-  scale=[0.68499393, 0.61498745, 0.59455605, 2.02725377, 5.23867883, 5.56895208, 0.2808568, 0.80471341, 1.82207479, 3.05034258, 3.87035114, 7.54503773, 0.75426996, 0.28942527, 0.28312261, 0.50887929, 3.44284145, 2.93521217, 11.00239137, 0.57123955, 3.96011915, 5.45257336, 11.37850701, 25.46225631, 0.99828323, 7.33738072, 1.63203483, 0.45925706, 0.46963472, 0.1636733, 0.60923913, 0.57138511, 0.48782951, 0.17452143, 0.08013684, 350.59597387, 4109.11955903, 1.46644736, 0.50197667, 1.48526026, 77.15409823],
-  n=7461,
-  trained_at='offline calibration 2026-08-27',
-  note='P(+2% from close-confirmed 5m ORB high before capped stop). Walk-forward top-1 target-hit 37.5%, expectancy +0.32%/trade after costs.',
+  features=['atr_pct', 'adr20', 'rsi', 'vr', 'ret1', 'ret5', 'ret21', 'big20', 'd_hi20', 'd_lo20', 'px_vs_e20', 'pd_rng', 'nr7', 'e_stack', 'gap', 'orb_rng_pct', 'orb_pos_pd', 'above_R1', 'above_P', 'below_S1', 'below_P', 'orb_h_R1', 'orb_l_S1', 'd_R1', 'd_S1', 'trig_min', 'brk_ext', 'sl_pct', 'mkt_early', 'sec_early', 'sec_rel', 'stk_rel', 'sec_breadth'],
+  coef=[0.078405, 0.29391907, -0.01591169, 0.11336119, -0.00049124, 0.07015533, -0.03889627, -0.06021505, 0.20074277, 0.01918102, -0.16674709, -0.01846165, -0.05034406, -0.0379986, 0.2201195, 0.15098722, 0.07645531, -0.01888617, 0.10179208, 0.07548601, 0.00786571, 0.08105434, -0.06802344, 0.11507225, -0.15507216, -0.54072934, 0.02705965, 0.23794425, 0.08648622, 0.0125351, -0.07654266, -0.02930699, -0.01708232],
+  intercept=-2.419485411099459,
+  mean=[2.55877155, 2.47161629, 51.88849749, 0.95060489, 0.03311124, 0.36233392, 1.67943141, 2.78449053, -5.26887654, 7.06109231, 0.52964124, 2.39429246, 0.15251836, 0.17068144, 0.33721592, 0.79857811, 70039172.86996242, 0.15998969, 0.59925287, 0.04508566, 0.39958779, 0.3033621, 0.11348705, 0.88539525, 1.50044403, 60.49465413, 0.18693142, 0.80298032, 0.27531035, 0.32035762, 0.04504727, 0.14646934, 63.3432001],
+  scale=[0.63402798, 0.56726819, 11.39126136, 0.71222054, 1.80599966, 3.99020552, 8.16082972, 1.96164605, 4.0078529, 5.96552157, 3.6390981, 1.20189722, 0.35952261, 0.98532626, 0.96378098, 0.45204361, 5257933688.43151, 0.3665965, 0.49004986, 0.20749204, 0.48981363, 0.45971028, 0.31718724, 1.14687063, 1.19127264, 81.07789437, 0.21514903, 0.20814257, 0.51682735, 0.71068875, 0.46758087, 0.89871596, 27.87712328],
+  n=7763, base_rate=0.10009, sessions=59,
+  trained_at='v22 F&O-210 calibration 2026-08-27',
+  note='P(+2% before the capped stop) on a close-confirmed 5m ORB-high break. Base rate 10.01%. Strongest drivers: early trigger (trig_min, -0.54), ADR20 (+0.29), available stop room (+0.24), gap (+0.22), proximity to the 20d high (+0.20).',
+)
+
+EMB_LONG3 = dict(
+  features=['atr_pct', 'adr20', 'rsi', 'vr', 'ret1', 'ret5', 'ret21', 'big20', 'd_hi20', 'd_lo20', 'px_vs_e20', 'pd_rng', 'nr7', 'e_stack', 'gap', 'orb_rng_pct', 'orb_pos_pd', 'above_R1', 'above_P', 'below_S1', 'below_P', 'orb_h_R1', 'orb_l_S1', 'd_R1', 'd_S1', 'trig_min', 'brk_ext', 'sl_pct', 'mkt_early', 'sec_early', 'sec_rel', 'stk_rel', 'sec_breadth'],
+  coef=[0.15865226, 0.35568154, 0.19558626, -0.02826749, 0.093572, 0.12120064, 0.16188731, -0.10347991, 0.22670678, -0.01050817, -0.44949579, 0.01954759, -0.08320338, -0.21022783, 0.19319067, 0.15433395, 0.0863257, -0.05115923, 0.05637217, 0.18042503, -0.01126294, 0.09758657, -0.10872126, 0.19266298, -0.18942061, -0.46256085, 0.0569095, 0.23566347, 0.1185649, 0.06406219, -0.03368253, 0.09574251, -0.03042693],
+  intercept=-3.6132990692641753,
+  mean=[2.55877155, 2.47161629, 51.88849749, 0.95060489, 0.03311124, 0.36233392, 1.67943141, 2.78449053, -5.26887654, 7.06109231, 0.52964124, 2.39429246, 0.15251836, 0.17068144, 0.33721592, 0.79857811, 70039172.86996242, 0.15998969, 0.59925287, 0.04508566, 0.39958779, 0.3033621, 0.11348705, 0.88539525, 1.50044403, 60.49465413, 0.18693142, 0.80298032, 0.27531035, 0.32035762, 0.04504727, 0.14646934, 63.3432001],
+  scale=[0.63402798, 0.56726819, 11.39126136, 0.71222054, 1.80599966, 3.99020552, 8.16082972, 1.96164605, 4.0078529, 5.96552157, 3.6390981, 1.20189722, 0.35952261, 0.98532626, 0.96378098, 0.45204361, 5257933688.43151, 0.3665965, 0.49004986, 0.20749204, 0.48981363, 0.45971028, 0.31718724, 1.14687063, 1.19127264, 81.07789437, 0.21514903, 0.20814257, 0.51682735, 0.71068875, 0.46758087, 0.89871596, 27.87712328],
+  n=7763, base_rate=0.03658, sessions=59,
+  trained_at='v22 F&O-210 calibration 2026-08-27',
+  note='P(+3% before the capped stop) — the "3%+ runner" model the user asked for. Base rate only 3.66%: a 3% ORB run is a 1-in-27 event unconditionally and about 1-in-6 on the best-ranked name of the day. Used to rank, not to promise.',
 )
 
 EMB_SHORT = dict(
-  features=['atr_pct', 'adr20', 'vol20', 'big_moves_20', 'big_moves_60', 'bbw', 'bbw_pctile', 'rvol', 'ret1', 'ret3', 'ret5', 'ret21', 'gap_today', 'gap_x_atr', 'clv', 'body', 'px_vs_e20', 'e20_vs_e50', 'rsi', 'macd_h_norm', 'd_hi20', 'd_lo20', 'd_hi52', 'd_lo52', 'st_dir', 'rs21', 'rs1', 'acc2', 'orb_range_pct', 'orb_rng_x_atr', 'fc_body', 'orb_pos_in_pd', 'nf_gap', 'nf_fc', 'nf_fc_range', 'turn_ma_cr', 'px', 'orb_l_vs_pdl', 'short_break_pct', 'room_to_pdl', 'S_trig_min'],
-  coef=[-0.1056424, 0.42845958, -0.11851633, -0.07123081, 0.19703245, 0.1558002, -0.17626433, -0.01504971, 0.09740448, -0.01878963, 0.01010589, 0.13492799, -0.01481683, -0.0866516, -0.03882722, 0.155875, -0.26276068, 0.18482643, 0.16080909, 0.22403774, 0.02071291, -0.00837516, -0.0309619, 0.10862821, -0.00869091, -0.22061007, -0.26688805, 0.0863963, 0.2097631, 0.16930441, -0.02685223, 0.02485294, -0.23082518, 0.05882071, -0.0548983, -0.11746585, 0.02084141, 0.2406635, 0.06611457, -0.01063444, -0.52165259],
-  intercept=-2.75420633,
-  mean=[2.58296004, 2.49542239, 1.76938181, 2.76631183, 10.0338134, 11.45196761, 0.38576967, 0.96778681, 0.12262535, 0.29464413, 0.35518591, 1.3980886, 0.13915648, 0.05134345, 0.48605101, -0.0361171, 0.45912762, 0.64337411, 51.55022665, -0.01164366, -5.36767423, 6.8688771, -17.13882232, 31.61879033, 0.07326237, 0.44421976, 0.12314913, 0.21815905, 0.79242951, 0.31076407, -0.12718236, 0.66339353, 0.06926131, -0.01011709, 0.2588878, 315.22552895, 2268.34097288, 1.13479881, 0.45994793, 1.09886601, 51.05197245],
-  scale=[0.68985433, 0.62092136, 0.60444468, 2.04170475, 5.2568692, 5.57058641, 0.27997348, 0.82305196, 1.79077924, 3.0326244, 3.90476394, 7.51207508, 0.72574851, 0.28123589, 0.28607415, 0.51015698, 3.44574283, 3.06245419, 10.96716861, 0.5770299, 3.96478966, 5.44694511, 11.55570578, 26.56610607, 0.9973127, 7.34571095, 1.65270103, 0.47425477, 0.43828165, 0.15570381, 0.58762175, 0.56095256, 0.46376182, 0.17711859, 0.08261423, 346.42905922, 4236.19741129, 1.56052307, 0.45303664, 1.50478514, 84.64860766],
-  n=7985,
-  trained_at='offline calibration 2026-08-27',
-  note='Short side. LOW CONFIDENCE: walk-forward expectancy was flat to negative; gated behind a higher probability floor.',
+  features=['atr_pct', 'adr20', 'rsi', 'vr', 'ret1', 'ret5', 'ret21', 'big20', 'd_hi20', 'd_lo20', 'px_vs_e20', 'pd_rng', 'nr7', 'e_stack', 'gap', 'orb_rng_pct', 'orb_pos_pd', 'above_R1', 'above_P', 'below_S1', 'below_P', 'orb_h_R1', 'orb_l_S1', 'd_R1', 'd_S1', 'trig_min', 'brk_ext', 'sl_pct', 'mkt_early', 'sec_early', 'sec_rel', 'stk_rel', 'sec_breadth'],
+  coef=[-0.08559717, 0.30470453, 0.28317564, -0.0391873, -0.07966547, 0.14758603, -0.10650499, 0.04208805, 0.10514699, -0.04703151, -0.2370983, 0.06683626, 0.07614761, -0.06562036, 0.07942299, 0.09170073, 0.07569774, -0.03414977, 0.06702643, 0.04641895, 0.0109654, 0.05227597, -0.00687253, 0.06177356, 0.00986393, -0.41458606, 0.09496003, 0.27194431, -0.08617359, -0.07949514, -0.01931168, -0.0868916, 0.06082423],
+  intercept=-2.875070030217415,
+  mean=[2.55801163, 2.4832512, 51.89757722, 0.94311323, 0.14562198, 0.41737572, 1.57722195, 2.78959728, -5.26943701, 7.1078532, 0.56125039, 2.35925291, 0.16590349, 0.14993542, 0.33957835, 0.77933566, 271179919.17595255, 0.1583891, 0.61794059, 0.0393331, 0.38112011, 0.26476459, 0.13021017, 0.84402547, 1.50687292, 60.74791593, 0.15317281, 0.78655455, 0.25423927, 0.2387945, -0.01544477, -0.01642086, 59.92581559],
+  scale=[0.63814705, 0.57395196, 11.30057178, 0.73927659, 1.7534332, 3.95559504, 8.09158001, 1.98842956, 4.03035157, 5.99973612, 3.60814107, 1.23102634, 0.37199398, 0.98869579, 0.9425837, 0.4202034, 8993195936.497879, 0.36510546, 0.48589095, 0.19438623, 0.48566199, 0.44120778, 0.33653452, 1.12715934, 1.17636223, 84.26873333, 0.18373556, 0.21054279, 0.50133803, 0.64462535, 0.41645691, 0.89337336, 27.09279976],
+  n=8517, base_rate=0.06516, sessions=58,
+  trained_at='v22 F&O-210 calibration 2026-08-27',
+  note='Short side, P(-2% before stop). Base 6.52%. Walk-forward expectancy was -0.03%/trade at top-1, so this is LOW CONFIDENCE and gated behind a higher floor.',
+)
+
+EMB_SHORT3 = dict(
+  features=['atr_pct', 'adr20', 'rsi', 'vr', 'ret1', 'ret5', 'ret21', 'big20', 'd_hi20', 'd_lo20', 'px_vs_e20', 'pd_rng', 'nr7', 'e_stack', 'gap', 'orb_rng_pct', 'orb_pos_pd', 'above_R1', 'above_P', 'below_S1', 'below_P', 'orb_h_R1', 'orb_l_S1', 'd_R1', 'd_S1', 'trig_min', 'brk_ext', 'sl_pct', 'mkt_early', 'sec_early', 'sec_rel', 'stk_rel', 'sec_breadth'],
+  coef=[0.07663947, 0.36196255, 0.25198277, -0.01055159, -0.05088186, -0.026676, 0.06830369, -0.01957342, 0.25231981, -0.20270999, -0.22225693, 0.08829366, 0.07378655, -0.04313707, -0.1166647, -0.04973085, -0.02520849, -0.14921757, -0.00668907, -0.09652409, 0.03999511, 0.1485923, 0.26704643, -0.0057318, 0.12218762, -0.45351563, 0.15828871, 0.38557214, -0.07937051, -0.12018178, -0.09047939, -0.0514187, 0.2739984],
+  intercept=-4.3474431397524,
+  mean=[2.55801163, 2.4832512, 51.89757722, 0.94311323, 0.14562198, 0.41737572, 1.57722195, 2.78959728, -5.26943701, 7.1078532, 0.56125039, 2.35925291, 0.16590349, 0.14993542, 0.33957835, 0.77933566, 271179919.17595255, 0.1583891, 0.61794059, 0.0393331, 0.38112011, 0.26476459, 0.13021017, 0.84402547, 1.50687292, 60.74791593, 0.15317281, 0.78655455, 0.25423927, 0.2387945, -0.01544477, -0.01642086, 59.92581559],
+  scale=[0.63814705, 0.57395196, 11.30057178, 0.73927659, 1.7534332, 3.95559504, 8.09158001, 1.98842956, 4.03035157, 5.99973612, 3.60814107, 1.23102634, 0.37199398, 0.98869579, 0.9425837, 0.4202034, 8993195936.497879, 0.36510546, 0.48589095, 0.19438623, 0.48566199, 0.44120778, 0.33653452, 1.12715934, 1.17636223, 84.26873333, 0.18373556, 0.21054279, 0.50133803, 0.64462535, 0.41645691, 0.89337336, 27.09279976],
+  n=8517, base_rate=0.01843, sessions=58,
+  trained_at='v22 F&O-210 calibration 2026-08-27',
+  note='Short side, P(-3% before stop). Base 1.84%. Reference only.',
 )
 
 EMB_SWING = dict(
@@ -1214,6 +1274,89 @@ EMB_SWING = dict(
   trained_at='offline calibration 2026-08-27 (3y 60m bars, 133 weeks)',
   note='P(+7% before -5% stop) on Monday 1h-ORB long. Validated top-3 = 19.8% vs 6.2% base; +10% top-3 = 11.1% vs 2.1% base.',
 )
+
+# =============================================================================
+# v22 FEATURE VECTOR — must match EMB_LONG["features"] exactly.
+# Every field below is knowable at the moment the ORB break confirms, so there
+# is no look-ahead: daily features come from the PREVIOUS session's close,
+# sector strength from the first 5-minute candle of the current session.
+# =============================================================================
+def sector_early_context(early_by_sym):
+    """early_by_sym = {SYMBOL: % move of the opening candle vs prev close}.
+    Returns (market_median, {sector: (median, breadth_pct)}) — the sector-rotation
+    signal the 24-26 Aug case study pointed to (on 2 of 3 days sector beta explained
+    more of the winners than any company news did)."""
+    vals = [v for v in early_by_sym.values() if v == v and np.isfinite(v)]
+    mkt = float(np.median(vals)) if vals else 0.0
+    buckets = defaultdict(list)
+    for s, v in early_by_sym.items():
+        if v == v and np.isfinite(v):
+            buckets[sector_of(s)].append(v)
+    sec = {k: (float(np.median(v)), 100.0 * float(np.mean([x > 0 for x in v])))
+           for k, v in buckets.items() if v}
+    return mkt, sec
+
+
+def v22_features(base, orb, prev, piv_d, side, sec_ctx=None, sym=None):
+    """base = D-1 daily snapshot, orb = orb_from_bars() output,
+    prev = dict(pdh, pdl, pdc), piv_d = previous-day classic pivots,
+    sec_ctx = (mkt_early, {sector: (median, breadth)})."""
+    g = lambda k, d=np.nan: base.get(k, d)
+    pdh, pdl, pdc = prev.get("pdh"), prev.get("pdl"), prev.get("pdc")
+    op = orb.get("orb_o") or orb.get("orb_h")
+    c920 = orb.get("orb_c", op)
+    P = piv_d.get("P", np.nan); R1 = piv_d.get("R1", np.nan); S1 = piv_d.get("S1", np.nan)
+    entry = orb.get(f"{side}_entry") or (orb["orb_h"] if side == "L" else orb["orb_l"])
+    level = orb["orb_h"] if side == "L" else orb["orb_l"]
+    slp = float(np.clip(abs(entry - (orb["orb_l"] if side == "L" else orb["orb_h"]))
+                        / max(entry, 1e-9) * 100, CFG["SL_FLOOR_PCT"], CFG["SL_CAP_PCT"]))
+    early = ((c920 / pdc - 1) * 100) if (pdc and c920) else np.nan
+    mkt_e, sec_e, sec_b = 0.0, 0.0, 50.0
+    if sec_ctx and sym:
+        mkt_e = sec_ctx[0]
+        sec_e, sec_b = sec_ctx[1].get(sector_of(sym), (mkt_e, 50.0))
+    f = {
+        "atr_pct": g("atr_pct"), "adr20": g("adr20"), "rsi": g("rsi"), "vr": g("rvol"),
+        "ret1": g("ret1"), "ret5": g("ret5"), "ret21": g("ret21"),
+        "big20": g("big_moves_20"), "d_hi20": g("d_hi20"), "d_lo20": g("d_lo20"),
+        "px_vs_e20": g("px_vs_e20"), "nr7": g("nr7"), "e_stack": g("stack_up"),
+        "pd_rng": ((pdh - pdl) / pdc * 100) if (pdh and pdl and pdc) else np.nan,
+        "gap": ((op / pdc - 1) * 100) if (pdc and op) else np.nan,
+        "orb_rng_pct": orb.get("orb_range_pct"),
+        "orb_pos_pd": ((op - pdl) / max(pdh - pdl, 1e-9)) if (pdh and pdl) else np.nan,
+        "above_R1": int(op > R1) if R1 == R1 else 0,
+        "above_P": int(op > P) if P == P else 0,
+        "below_S1": int(op < S1) if S1 == S1 else 0,
+        "below_P": int(op < P) if P == P else 0,
+        "orb_h_R1": int(orb["orb_h"] > R1) if R1 == R1 else 0,
+        "orb_l_S1": int(orb["orb_l"] < S1) if S1 == S1 else 0,
+        "d_R1": ((R1 / op - 1) * 100) if (R1 == R1 and op) else np.nan,
+        "d_S1": ((1 - S1 / op) * 100) if (S1 == S1 and op) else np.nan,
+        "trig_min": orb.get(f"{side}_trig_min", 5), "sl_pct": slp,
+        "brk_ext": abs(entry - level) / max(entry, 1e-9) * 100,
+        "mkt_early": mkt_e, "sec_early": sec_e, "sec_rel": sec_e - mkt_e,
+        "stk_rel": (early - sec_e) if early == early else 0.0,
+        "sec_breadth": sec_b,
+    }
+    return f
+
+
+def passes_confluence_gate(base, orb, side="L"):
+    """The single most important filter in v22. Walk-forward: applying this gate
+    turned top-1 long from -0.028%/trade into +0.318%/trade. It is a HARD gate,
+    not a score, because each condition on its own is weak."""
+    G = CONFLUENCE_GATE
+    reasons = []
+    if not (base.get("atr_pct", 0) >= G["atr_pct"]):
+        reasons.append(f"ATR% {base.get('atr_pct', 0):.2f} < {G['atr_pct']}")
+    if not (base.get("adr20", 0) >= G["adr20"]):
+        reasons.append(f"ADR20 {base.get('adr20', 0):.2f} < {G['adr20']}")
+    if not ((orb.get("orb_range_pct") or 0) >= G["orb_rng_pct"]):
+        reasons.append(f"opening range {orb.get('orb_range_pct', 0):.2f}% < {G['orb_rng_pct']}%")
+    tm = orb.get(f"{side}_trig_min")
+    if tm is None or tm > G["trig_min_max"]:
+        reasons.append(f"break at +{tm}min > {G['trig_min_max']}min")
+    return (not reasons), reasons
 
 
 # =============================================================================
@@ -1876,6 +2019,570 @@ def stop_auto():
     AUTOSTATE["running"] = False
     _log("automation stopped")
 
+# =============================================================================
+# v22 LAYER — overrides and new engines.
+#
+#   * scan_live_orb()      : rebuilt on the v22 model + hard confluence gate,
+#                            top-1 by default (that is where the edge lives).
+#   * replay_session()     : runs all three intraday engines on any past date,
+#                            so the terminal is useful when the market is shut.
+#   * top_movers()         : automatic top-3 gainers/losers, daily / weekly /
+#                            monthly, straight off the price panel.
+#   * manual movers store  : the user's own gainer/loser entries.
+#   * journal              : automatic (every signal) + manual (own trades).
+#   * learn_from_movers()  : the self-improvement loop and its cadence.
+# =============================================================================
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+for _sub in ("scans", "models", "journal", "movers", "learning"):
+    try:
+        os.makedirs(os.path.join(DATA_DIR, _sub), exist_ok=True)
+    except Exception:
+        pass
+
+MODEL_L3 = load_model(os.path.join(DATA_DIR, "models", "model_long3.json"), EMB_LONG3)
+MODEL_S3 = load_model(os.path.join(DATA_DIR, "models", "model_short3.json"), EMB_SHORT3)
+
+
+def _csv_path(*parts):
+    return os.path.join(DATA_DIR, *parts)
+
+
+def _read_csv(path, cols):
+    try:
+        if os.path.exists(path):
+            d = pd.read_csv(path)
+            for c in cols:
+                if c not in d.columns:
+                    d[c] = None
+            return d[cols]
+    except Exception:
+        pass
+    return pd.DataFrame(columns=cols)
+
+
+def _append_csv(path, rec):
+    d = pd.DataFrame([rec])
+    hdr = not os.path.exists(path)
+    d.to_csv(path, mode="a", header=hdr, index=False)
+
+
+# =============================================================================
+# JOURNAL — automatic + manual
+# =============================================================================
+AUTO_COLS = ["logged_at", "for_date", "engine", "sym", "sector", "side", "entry", "sl",
+             "sl_pct", "target", "target_pct", "qty", "prob_pct", "p3_pct", "trig_min",
+             "orb_h", "orb_l", "gate", "note", "outcome", "exit_px", "pnl_pct"]
+MAN_COLS = ["trade_date", "sym", "side", "entry", "exit_px", "qty", "sl", "target",
+            "pnl_pct", "pnl_rs", "setup", "followed_plan", "emotion", "notes"]
+JOURNAL_AUTO = _csv_path("journal", "auto_signals.csv")
+JOURNAL_MAN = _csv_path("journal", "manual_trades.csv")
+
+
+def journal_auto_log(engine, rows, for_date=None):
+    """Every signal the screener generates is written here, whether or not it is
+    traded. This is what makes the hit-rate numbers on the Learning tab real
+    rather than remembered."""
+    for_date = str(for_date or session_date())
+    existing = _read_csv(JOURNAL_AUTO, AUTO_COLS)
+    seen = set(zip(existing.for_date.astype(str), existing.engine.astype(str),
+                   existing.sym.astype(str), existing.side.astype(str)))
+    n = 0
+    for r in rows or []:
+        tk = r.get("ticket") or {}
+        sym = r.get("sym") or tk.get("sym")
+        side = r.get("side") or tk.get("side")
+        if (for_date, engine, str(sym), str(side)) in seen:
+            continue
+        _append_csv(JOURNAL_AUTO, dict(
+            logged_at=fmt_ist(), for_date=for_date, engine=engine, sym=sym,
+            sector=r.get("sector"), side=side, entry=tk.get("entry") or r.get("entry"),
+            sl=tk.get("sl"), sl_pct=r.get("sl_pct"), target=tk.get("target"),
+            target_pct=tk.get("target_pct"), qty=tk.get("qty"),
+            prob_pct=r.get("prob_pct"), p3_pct=r.get("p3_pct"),
+            trig_min=r.get("trig_min"), orb_h=r.get("orb_h"), orb_l=r.get("orb_l"),
+            gate="PASS" if r.get("gate_pass", True) else "FAIL",
+            note=r.get("gate_note") or "", outcome="", exit_px="", pnl_pct=""))
+        n += 1
+    return n
+
+
+def journal_auto():
+    return _read_csv(JOURNAL_AUTO, AUTO_COLS)
+
+
+def journal_manual():
+    return _read_csv(JOURNAL_MAN, MAN_COLS)
+
+
+def journal_manual_add(rec):
+    _append_csv(JOURNAL_MAN, {k: rec.get(k) for k in MAN_COLS})
+
+
+# =============================================================================
+# MOVERS — automatic top-3 gainers / losers, and the manual list
+# =============================================================================
+MOVER_COLS = ["period", "period_label", "rank", "kind", "sym", "sector", "ret_pct",
+             "close", "turnover_cr", "atr_pct", "adr20", "rvol", "gap", "captured_at"]
+MAN_MOVER_COLS = ["period", "period_label", "kind", "sym", "ret_pct", "reason", "added_at"]
+MOVERS_AUTO = _csv_path("movers", "auto_movers.csv")
+MOVERS_MAN = _csv_path("movers", "manual_movers.csv")
+
+
+def _period_frames(bundle):
+    """Daily / weekly / monthly percentage-change frames from the price panel."""
+    C = bundle["px"]["Close"]
+    idx = pd.DatetimeIndex(C.index)
+    d_ret = C.pct_change() * 100
+    iso = idx.isocalendar()
+    wk = pd.Series([f"{a}-W{b:02d}" for a, b in zip(iso.year, iso.week)], index=idx)
+    mo = pd.Series([f"{d.year}-{d.month:02d}" for d in idx], index=idx)
+    wC = C.groupby(wk).last(); mC = C.groupby(mo).last()
+    wO = bundle["px"]["Open"].groupby(wk).first()
+    mO = bundle["px"]["Open"].groupby(mo).first()
+    return dict(D=(d_ret, [str(x.date()) for x in idx]),
+                W=((wC / wO - 1) * 100, list(wC.index)),
+                M=((mC / mO - 1) * 100, list(mC.index)))
+
+
+def top_movers(bundle=None, period="D", n=3, back=1):
+    """Top-n gainers and losers. period D = intraday/daily (F&O),
+    W = swing week, M = swing month. `back` = how many periods back (0 = latest).
+    Weekly and monthly are measured open-to-close of the period, which is what a
+    swing trade actually captures — not close-to-close."""
+    b = bundle or load_bundle()
+    if not b:
+        return dict(error="no data")
+    frames = _period_frames(b)
+    if period not in frames:
+        return dict(error=f"bad period {period}")
+    R, labels = frames[period]
+    if len(R) < back + 1:
+        return dict(error="not enough history")
+    pos = len(R) - 1 - back
+    row = R.iloc[pos].dropna()
+    label = str(labels[pos]) if pos < len(labels) else str(pos)
+    liq = {t: (b["snap"].get(t, {}) or {}).get("turn_ma_cr", 0) or 0 for t in row.index}
+    row = row[[t for t in row.index if liq.get(t, 0) >= CFG["MIN_TURNOVER_CR"]]]
+    if row.empty:
+        return dict(error="no liquid names")
+    out = []
+    for kind, ser in (("GAINER", row.sort_values(ascending=False).head(n)),
+                      ("LOSER", row.sort_values().head(n))):
+        for rank, (t, v) in enumerate(ser.items(), 1):
+            f = b["snap"].get(t, {}) or {}
+            out.append(dict(period=period, period_label=label, rank=rank, kind=kind,
+                            sym=t.replace(".NS", ""), sector=sector_of(t),
+                            ret_pct=round(float(v), 2), close=f.get("px"),
+                            turnover_cr=f.get("turn_ma_cr"), atr_pct=f.get("atr_pct"),
+                            adr20=f.get("adr20"), rvol=f.get("rvol"), gap=f.get("gap"),
+                            captured_at=fmt_ist()))
+    return dict(period=period, label=label, rows=out,
+                table=pd.DataFrame(out), n_universe=int(len(row)))
+
+
+def movers_capture(bundle=None, periods=("D", "W", "M"), n=3, history=1):
+    """Persist the automatic movers so the learning loop has a growing record."""
+    b = bundle or load_bundle()
+    existing = _read_csv(MOVERS_AUTO, MOVER_COLS)
+    seen = set(zip(existing.period.astype(str), existing.period_label.astype(str),
+                   existing.kind.astype(str), existing.sym.astype(str)))
+    added = 0
+    for p in periods:
+        for back in range(history):
+            res = top_movers(b, period=p, n=n, back=back)
+            for r in (res.get("rows") or []):
+                key = (str(r["period"]), str(r["period_label"]), r["kind"], r["sym"])
+                if key in seen:
+                    continue
+                _append_csv(MOVERS_AUTO, r)
+                seen.add(key)
+                added += 1
+    return added
+
+
+def movers_auto_history():
+    return _read_csv(MOVERS_AUTO, MOVER_COLS)
+
+
+def movers_manual():
+    return _read_csv(MOVERS_MAN, MAN_MOVER_COLS)
+
+
+def movers_manual_add(rec):
+    _append_csv(MOVERS_MAN, {k: rec.get(k) for k in MAN_MOVER_COLS})
+
+
+# =============================================================================
+# SELF-IMPROVEMENT LOOP
+#
+# Cadence answer (question 3): BOTH, at different jobs.
+#   * DAILY   — append today's movers + today's signal outcomes to the record.
+#               Cheap, no refit, no risk of overfitting to one session.
+#   * WEEKLY  — recompute the CHARACTER PROFILE of the winners (the feature
+#               medians below) and refresh the F&O universe. 5 sessions x ~200
+#               names is enough to move a median, not enough to move a model.
+#   * MONTHLY — full logistic refit of the ranking models + monthly pivots.
+#               A refit needs >=1,500 fresh labelled events to be stable; the
+#               study produced ~275 trigger events per session, so a month
+#               (~5,500) is the right size and a week (~1,375) is not.
+# That is why the automation runs three jobs, not one.
+# =============================================================================
+LEARN_PATH = _csv_path("learning", "mover_profile.json")
+
+
+def learn_from_movers(bundle=None, lookback_days=30, min_move=3.0):
+    """Builds the empirical 'character profile' of names that actually ran >=3%
+    in a session, using D-1 features only, and stores the medians. The screener
+    shows every candidate's distance from this profile, so the thing the user
+    asked for -- 'find that reason, that common thing' -- is explicit and
+    updates itself as the market changes."""
+    b = bundle or load_bundle()
+    if not b:
+        return dict(error="no data")
+    px = b["px"]
+    C, O = px["Close"], px["Open"]
+    F = b["F"]
+    ret = (C / O - 1) * 100
+    idx = pd.DatetimeIndex(C.index)
+    keep = idx[-min(lookback_days, len(idx)):]
+    prof, rest = defaultdict(list), defaultdict(list)
+    FEATS = ["atr_pct", "adr20", "rvol", "ret1", "ret5", "ret21", "px_vs_e20",
+             "d_hi20", "d_lo20", "gap", "vol20", "bbw", "big_moves_20", "rsi",
+             "turn_ma_cr"]
+    for i, dt_ in enumerate(idx):
+        if dt_ not in keep or i == 0:
+            continue
+        today = ret.loc[dt_]
+        win = set(today[today.abs() >= min_move].dropna().index)
+        if not win:
+            continue
+        for f in FEATS:
+            df = F.get(f)
+            if df is None or dt_ not in df.index:
+                continue
+            prev = df.iloc[df.index.get_loc(dt_) - 1]
+            for t, v in prev.items():
+                if v != v or not np.isfinite(v):
+                    continue
+                (prof if t in win else rest)[f].append(float(v))
+    out = {}
+    for f in FEATS:
+        if len(prof.get(f, [])) < 20 or len(rest.get(f, [])) < 50:
+            continue
+        w, r = float(np.median(prof[f])), float(np.median(rest[f]))
+        # A ratio of medians is meaningless when the denominator sits on zero
+        # (ret5, gap and px_vs_e20 all straddle zero), so report the ratio only
+        # when the baseline is far enough from zero, and always report the gap
+        # in the same units alongside it.
+        scale = float(np.median(np.abs(rest[f]))) or 1.0
+        ratio = round(w / r, 3) if (r and abs(r) >= 0.15 * scale) else None
+        out[f] = dict(winner_median=round(w, 4), rest_median=round(r, 4),
+                      ratio=ratio, diff=round(w - r, 4),
+                      n_winner=len(prof[f]), n_rest=len(rest[f]))
+    payload = dict(built_at=fmt_ist(), lookback_days=lookback_days,
+                   min_move_pct=min_move, features=out,
+                   n_sessions=int(len(keep)))
+    try:
+        json.dump(payload, open(LEARN_PATH, "w"), indent=1)
+    except Exception:
+        pass
+    return payload
+
+
+def learn_profile():
+    try:
+        if os.path.exists(LEARN_PATH):
+            return json.load(open(LEARN_PATH))
+    except Exception:
+        pass
+    return None
+
+
+# =============================================================================
+# ENGINE 2 (v22) — LIVE 5-MIN ORB with the confluence gate. Overrides p3_scan.
+# =============================================================================
+def scan_live_orb(capital=None, bundle=None, watch=None, orb_minutes=None,
+                  top_n=None, bars=None, as_of=None, log=True):
+    capital = capital or CFG["DEFAULT_CAPITAL"]
+    top_n = CFG["INTRADAY_TOP_N"] if top_n is None else top_n
+    om = orb_minutes or CFG["ORB_MINUTES"]
+    b = bundle or load_bundle()
+    if not b:
+        return dict(error="no data")
+    day = as_of or get_ist_now().date()
+    if isinstance(day, str):
+        day = pd.Timestamp(day).date()
+
+    if bars is None:
+        names = watch or liquid_names(b)
+        intraday = download(names, period="1d", interval="5m", ttl=45)
+    else:
+        intraday = bars
+    nf5 = download([NIFTY], period="1d" if as_of is None else "5d", interval="5m", ttl=45).get(NIFTY)
+    nfctx = nifty_context(nf5, b["nfd"])
+
+    # --- pass 1: opening candle of every name -> sector strength context -------
+    orbs, early = {}, {}
+    for t, d in intraday.items():
+        try:
+            g = d.copy()
+            g.index = pd.DatetimeIndex(g.index)
+            if g.index.tz is not None:
+                g.index = g.index.tz_convert(IST)
+            g = g[g.index.date == day]
+            g = g[(g.index.time >= MKT_OPEN) & (g.index.time <= MKT_CLOSE)]
+            if len(g) < 1:
+                continue
+            o = orb_from_bars(g, om)
+            if not o:
+                continue
+            orbs[t] = o
+            pdc = b["prev"]["pdc"].get(t)
+            if pdc:
+                early[t.replace(".NS", "")] = (o["orb_c"] / pdc - 1) * 100
+        except Exception:
+            continue
+    sec_ctx = sector_early_context(early)
+
+    # --- pass 2: score every confirmed break ---------------------------------
+    cands = []
+    for t, orb in orbs.items():
+        base = b["snap"].get(t, {}) or {}
+        prev = dict(pdh=b["prev"]["pdh"].get(t), pdl=b["prev"]["pdl"].get(t),
+                    pdc=b["prev"]["pdc"].get(t))
+        piv_d = (b["piv"].get(t, {}) or {}).get("D", {}) or {}
+        sym = t.replace(".NS", "")
+        for side, mdl, mdl3, minp in (("L", MODEL_L, MODEL_L3, CFG["MIN_P_LONG"]),
+                                      ("S", MODEL_S, MODEL_S3, CFG["MIN_P_SHORT"])):
+            if not orb.get(f"{side}_trig") or mdl is None:
+                continue
+            gate_ok, gate_why = passes_confluence_gate(base, orb, side)
+            fv = v22_features(base, orb, prev, piv_d, side, sec_ctx, sym)
+            p = mdl.prob(fv)
+            p3 = mdl3.prob(fv) if mdl3 else np.nan
+            conf_entry = orb[f"{side}_entry"]
+            sl_pct = fv["sl_pct"]
+            moved = ((orb["last"] / conf_entry - 1) * 100) * (1 if side == "L" else -1)
+            cands.append(dict(
+                ticker=t, sym=sym, sector=sector_of(t),
+                side="BUY" if side == "L" else "SELL", p=p, prob_pct=p * 100,
+                p3=p3, p3_pct=(p3 * 100 if p3 == p3 else np.nan),
+                orb_h=orb["orb_h"], orb_l=orb["orb_l"],
+                orb_range_pct=orb["orb_range_pct"], entry=conf_entry,
+                level=orb["orb_h"] if side == "L" else orb["orb_l"],
+                sl_pct=sl_pct, trig_min=orb.get(f"{side}_trig_min"),
+                trig_time=orb.get(f"{side}_trig_time"), last=orb["last"], moved=moved,
+                gap=fv["gap"], atr_pct=base.get("atr_pct"), adr20=base.get("adr20"),
+                rvol=base.get("rvol"), turn=base.get("turn_ma_cr"),
+                sec_early=fv["sec_early"], sec_rel=fv["sec_rel"],
+                sec_breadth=fv["sec_breadth"], stk_rel=fv["stk_rel"],
+                orb_h_R1=fv["orb_h_R1"], above_R1=fv["above_R1"],
+                below_S1=fv["below_S1"],
+                gate_pass=gate_ok, gate_note="; ".join(gate_why),
+                still_valid=bool(moved < CFG["TARGET_PCT"] * 0.6 and moved > -sl_pct),
+                drivers=mdl.top_drivers(fv, 5),
+                ticket=build_ticket(t, "BUY" if side == "L" else "SELL",
+                                    conf_entry, sl_pct, capital),
+                low_conf=(side == "S"),
+                passed_p=bool(p >= minp),
+            ))
+    D = pd.DataFrame(cands)
+    out = dict(ts=fmt_ist(), for_date=str(day), regime=nfctx["regime"], nfctx=nfctx,
+               orb_minutes=om, n_triggers=int(len(D)), top_n=top_n,
+               sector_early=sec_ctx[1], mkt_early=sec_ctx[0],
+               table=D, actionable=[], rejected=[])
+    # `still_valid` only makes sense while the market is actually open: it asks
+    # "has price already run away from the confirmed break?". Post-close and in
+    # replay, `last` is the day's close, so enforcing it would reject everything
+    # and the tab would look empty for the wrong reason.
+    live_now = (as_of is None and market_phase() in ("ORB", "LIVE"))
+    out["valid_enforced"] = bool(live_now)
+    if not D.empty:
+        sel = D.gate_pass & D.passed_p
+        if live_now:
+            sel = sel & D.still_valid
+        ok = D[sel].copy()
+        out["n_p_pass"] = int((D.gate_pass & D.passed_p).sum())
+        longs = ok[ok.side == "BUY"].sort_values("p", ascending=False).head(top_n)
+        shorts = ok[ok.side == "SELL"].sort_values("p", ascending=False).head(
+            max(0, CFG["SHORT_TOP_N"]))
+        act = pd.concat([longs, shorts])
+        out["actionable"] = act.to_dict("records")
+        out["all_ranked"] = D.sort_values("p", ascending=False).to_dict("records")
+        out["rejected"] = D[~D.gate_pass].sort_values("p", ascending=False) \
+                           .head(15).to_dict("records")
+        out["n_gate_pass"] = int(D.gate_pass.sum())
+    if log:
+        save_scan("live_orb", out)
+        journal_auto_log("LIVE_ORB", out["actionable"], for_date=day)
+    return out
+
+
+# =============================================================================
+# HISTORICAL REPLAY (question 9)
+# Runs Pre-Market / Live ORB / EOD exactly as they would have run on a past
+# date. 5-minute bars are only available for ~60 calendar days from the data
+# provider, so the ORB replay window is bounded by that -- it is stated on the
+# tab rather than silently truncated.
+# =============================================================================
+@st.cache_data(ttl=1800, show_spinner=False)
+def _replay_bars(day_str, tickers):
+    """60 days of 5-minute bars, sliced to one session."""
+    raw = download(list(tickers), period="60d", interval="5m", ttl=1800)
+    day = pd.Timestamp(day_str).date()
+    out = {}
+    for t, d in (raw or {}).items():
+        try:
+            g = d.copy()
+            g.index = pd.DatetimeIndex(g.index)
+            if g.index.tz is not None:
+                g.index = g.index.tz_convert(IST)
+            g = g[g.index.date == day]
+            if len(g) >= 5:
+                out[t] = g
+        except Exception:
+            continue
+    return out
+
+
+def replay_session(day, capital=None, bundle=None, top_n=None):
+    """Full historical replay of one session."""
+    capital = capital or CFG["DEFAULT_CAPITAL"]
+    day = pd.Timestamp(day).date() if not isinstance(day, date) else day
+    if not is_trading_day(day):
+        return dict(error=f"{day} was not an NSE trading session")
+    b = bundle or load_bundle()
+    if not b:
+        return dict(error="no data")
+    C = b["px"]["Close"]
+    dates = [x.date() for x in pd.DatetimeIndex(C.index)]
+    if day not in dates:
+        return dict(error=f"{day} is outside the loaded daily history")
+    pos = dates.index(day)
+    # rebuild the snapshot as it stood at the PREVIOUS close -> no look-ahead
+    snap_prev = snapshot(b["F"], when=pos - 1)
+    bb = dict(b)
+    bb["snap"] = snap_prev
+    O, H, L = b["px"]["Open"], b["px"]["High"], b["px"]["Low"]
+    bb["prev"] = dict(pdh={t: float(H[t].iloc[pos - 1]) for t in C.columns},
+                      pdl={t: float(L[t].iloc[pos - 1]) for t in C.columns},
+                      pdc={t: float(C[t].iloc[pos - 1]) for t in C.columns})
+    names = [t for t in C.columns
+             if (snap_prev.get(t, {}) or {}).get("turn_ma_cr", 0) >= CFG["MIN_TURNOVER_CR"]]
+    bars = _replay_bars(str(day), names)
+    res = dict(day=str(day), n_names=len(names), n_bars=len(bars))
+    if not bars:
+        res["orb_error"] = ("5-minute bars are not available for this date "
+                            "(the provider only keeps ~60 calendar days).")
+    else:
+        res["orb"] = scan_live_orb(capital=capital, bundle=bb, orb_minutes=CFG["ORB_MINUTES"],
+                                   top_n=top_n, bars=bars, as_of=day, log=False)
+        # what actually happened, so the replay is a scorecard and not a guess
+        for r in res["orb"].get("actionable", []):
+            g = bars.get(r["ticker"])
+            if g is None:
+                continue
+            r.update(_replay_outcome(g, r))
+    res["eod"] = _replay_eod(bb, day, capital)
+    res["premarket"] = _replay_premarket(bb, bars, day, capital)
+    return res
+
+
+def _replay_outcome(g, r):
+    """Walk the real bars after the confirming candle: half off at +1%, stop to
+    breakeven, rest at target or the 15:10 close."""
+    try:
+        g = g[(g.index.time >= MKT_OPEN) & (g.index.time <= CFG["SQUARE_OFF_TIME"])]
+        after = g[g.index > pd.Timestamp(r["trig_time"])] if r.get("trig_time") is not None else g
+        if len(after) == 0:
+            return dict(rp_result="no bars after entry")
+        e = float(r["entry"]); sgn = 1 if r["side"] == "BUY" else -1
+        sl = e * (1 - sgn * r["sl_pct"] / 100)
+        p1 = e * (1 + sgn * CFG["PARTIAL_PCT"] / 100)
+        tp = e * (1 + sgn * CFG["TARGET_PCT"] / 100)
+        half, pnl = False, 0.0
+        mfe = 0.0
+        for _, row in after.iterrows():
+            hi, lo = float(row.High), float(row.Low)
+            mfe = max(mfe, ((hi - e) / e * 100) if sgn > 0 else ((e - lo) / e * 100))
+            if (lo <= sl) if sgn > 0 else (hi >= sl):
+                pnl += (0.5 if half else 1.0) * sgn * (sl / e - 1) * 100
+                return dict(rp_result="STOPPED" if not half else "BE/partial",
+                            rp_pnl_pct=round(pnl - CFG["COST_PCT"], 3),
+                            rp_mfe_pct=round(mfe, 2))
+            if not half and ((hi >= p1) if sgn > 0 else (lo <= p1)):
+                pnl += 0.5 * CFG["PARTIAL_PCT"]; half = True; sl = e
+            if (hi >= tp) if sgn > 0 else (lo <= tp):
+                pnl += (0.5 if half else 1.0) * CFG["TARGET_PCT"]
+                return dict(rp_result="TARGET HIT",
+                            rp_pnl_pct=round(pnl - CFG["COST_PCT"], 3),
+                            rp_mfe_pct=round(mfe, 2))
+        last = float(after.Close.iloc[-1])
+        pnl += (0.5 if half else 1.0) * sgn * (last / e - 1) * 100
+        return dict(rp_result="squared off at close",
+                    rp_pnl_pct=round(pnl - CFG["COST_PCT"], 3), rp_mfe_pct=round(mfe, 2))
+    except Exception as ex:
+        return dict(rp_result=f"outcome unavailable ({ex})")
+
+
+def _replay_eod(bb, day, capital):
+    """The EOD scan as it would have printed after that session's close, plus
+    what the named stocks did the NEXT session."""
+    try:
+        res = scan_eod(capital=capital, bundle=bb, top_n=5)
+        C = bb["px"]["Close"]; O = bb["px"]["Open"]
+        dates = [x.date() for x in pd.DatetimeIndex(C.index)]
+        pos = dates.index(day)
+        for p in res.get("top", []):
+            t = p["row"]["ticker"]
+            if pos + 1 < len(dates):
+                try:
+                    o1 = float(O[t].iloc[pos + 1]); h1 = float(bb["px"]["High"][t].iloc[pos + 1])
+                    l1 = float(bb["px"]["Low"][t].iloc[pos + 1])
+                    p["next_day"] = dict(date=str(dates[pos + 1]),
+                                         up_pct=round((h1 / o1 - 1) * 100, 2),
+                                         dn_pct=round((1 - l1 / o1) * 100, 2))
+                except Exception:
+                    pass
+        return res
+    except Exception as ex:
+        return dict(error=str(ex))
+
+
+def _replay_premarket(bb, bars, day, capital):
+    """Pre-market ranking for that date. The live engine reads the NSE pre-open
+    auction, which is not archived, so the replay substitutes the real opening
+    print -- this is stated in the UI because it is a genuine difference."""
+    rows = []
+    for t, f in bb["snap"].items():
+        if (f.get("turn_ma_cr", 0) or 0) < CFG["MIN_TURNOVER_CR"]:
+            continue
+        ok, _ = feasible(f, "L")
+        if not ok:
+            continue
+        g = bars.get(t)
+        if g is None or len(g) == 0:
+            continue
+        pdc = bb["prev"]["pdc"].get(t)
+        op = float(g.Open.iloc[0])
+        if not pdc:
+            continue
+        gap = (op / pdc - 1) * 100
+        pu, pd_ = gap_prior(gap)
+        rows.append(dict(ticker=t, sym=t.replace(".NS", ""), sector=sector_of(t),
+                         exp_open=op, gap=gap, atr_pct=f.get("atr_pct"),
+                         adr20=f.get("adr20"), big20=f.get("big_moves_20"),
+                         p_up=pu * 100, p_dn=pd_ * 100,
+                         score_L=pu * 100 * min((f.get("atr_pct") or 0) / 2.5, 1.6),
+                         score_S=pd_ * 100 * min((f.get("atr_pct") or 0) / 2.5, 1.6)))
+    if not rows:
+        return dict(error="no opening prints available for this date")
+    D = pd.DataFrame(rows)
+    return dict(source=f"actual opening print of {day} (pre-open book is not archived)",
+                longs=D.sort_values("score_L", ascending=False).head(8).to_dict("records"),
+                shorts=D.sort_values("score_S", ascending=False).head(8).to_dict("records"),
+                table=D, n_candidates=len(D))
+
 
 # =============================================================================
 # UI HELPERS
@@ -1977,7 +2684,145 @@ def pivot_table(piv):
                      "R1": num(p.get("R1")), "R2": num(p.get("R2")),
                      "CPR width %": num(p.get("CPR_W"))})
     if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+
+# =============================================================================
+# v22 UI HELPERS — list/card view, downloads, compact signal rendering
+# =============================================================================
+def view_toggle(key, default="List"):
+    """List / Card switch. Present on every tab; List is the default because it
+    is the fastest thing to scan when you only want the order."""
+    return st.radio("view", ["List", "Card"], horizontal=True, label_visibility="collapsed",
+                    index=0 if default == "List" else 1, key=f"view_{key}")
+
+
+def dl(df, filename, key, label=None):
+    """Download button for any table. Every table in the app has one."""
+    try:
+        if df is None or (hasattr(df, "empty") and df.empty):
+            return
+        data = df.to_csv(index=False).encode()
+        st.download_button(label or f"⬇ {filename}", data, file_name=filename,
+                           mime="text/csv", key=f"dl_{key}", width="stretch")
+    except Exception as ex:
+        st.caption(f"download unavailable ({ex})")
+
+
+def _clean(df, cols=None, rename=None, r=2):
+    if df is None or (hasattr(df, "empty") and df.empty):
+        return pd.DataFrame()
+    d = pd.DataFrame(df)
+    if cols:
+        d = d[[c for c in cols if c in d.columns]]
+    for c in d.columns:
+        if pd.api.types.is_numeric_dtype(d[c]):
+            d[c] = d[c].astype(float).round(r)
+    if rename:
+        d = d.rename(columns=rename)
+    return d
+
+
+SIG_COLS = ["sym", "sector", "side", "entry", "sl_pct", "prob_pct", "p3_pct",
+            "trig_min", "orb_range_pct", "atr_pct", "adr20", "gap", "sec_rel",
+            "sec_breadth", "moved", "last"]
+SIG_NAMES = {"sym": "Symbol", "sector": "Sector", "side": "Side", "entry": "Entry",
+             "sl_pct": "SL %", "prob_pct": "P(+2%) %", "p3_pct": "P(+3%) %",
+             "trig_min": "Break @min", "orb_range_pct": "ORB range %",
+             "atr_pct": "ATR %", "adr20": "ADR %", "gap": "Gap %",
+             "sec_rel": "Sector vs mkt %", "sec_breadth": "Sector breadth %",
+             "moved": "Moved since %", "last": "Last"}
+
+
+def signal_list(rows, key, qty=True):
+    """Sleek single-glance table. Highlights the row you are meant to trade."""
+    if not rows:
+        st.caption("nothing to show")
+        return
+    recs = []
+    for r in rows:
+        tk = r.get("ticket") or {}
+        d = {SIG_NAMES.get(c, c): r.get(c) for c in SIG_COLS if c in r}
+        if qty:
+            d["Qty"] = tk.get("qty")
+            d["Stop"] = tk.get("sl")
+            d["Target"] = tk.get("target")
+        recs.append(d)
+    D = pd.DataFrame(recs)
+    for c in D.columns:
+        if pd.api.types.is_numeric_dtype(D[c]):
+            D[c] = D[c].astype(float).round(2)
+    styler = D.style.background_gradient(subset=[c for c in ["P(+2%) %"] if c in D.columns],
+                                         cmap="Greens")
+    st.dataframe(styler, width="stretch", hide_index=True)
+    dl(D, f"{key}.csv", key)
+
+
+def signal_cards(rows, capital_note=True):
+    if not rows:
+        st.caption("nothing to show")
+        return
+    for r in rows:
+        extra = [("Model P(+2%)", f"{num(r.get('prob_pct'), 1)}%"),
+                 ("Model P(+3%)", f"{num(r.get('p3_pct'), 1)}%"),
+                 ("Break confirmed at", f"+{num(r.get('trig_min'), 0)} min"),
+                 ("Opening 5-min range", f"{num(r.get('orb_range_pct'))}%"),
+                 ("ATR% / ADR%", f"{num(r.get('atr_pct'))} / {num(r.get('adr20'))}"),
+                 ("Gap", pct(r.get("gap"))),
+                 ("Sector vs market", pct(r.get("sec_rel"))),
+                 ("Sector breadth (up names)", f"{num(r.get('sec_breadth'), 0)}%"),
+                 ("Moved since entry", pct(r.get("moved")))]
+        if r.get("rp_result"):
+            extra.append(("REPLAY RESULT", f"{r['rp_result']} · "
+                                           f"{pct(r.get('rp_pnl_pct'))} · MFE {num(r.get('rp_mfe_pct'))}%"))
+        ticket_card(r["ticket"], prob=r.get("p"), extra_rows=extra,
+                    low_conf=bool(r.get("low_conf")))
+        drv = r.get("drivers") or []
+        if drv:
+            st.caption("why this name ranked here: " +
+                       " · ".join(f"{a} {b:+.2f}" for a, b in drv))
+
+
+def render_signals(rows, key, default="List"):
+    v = view_toggle(key, default)
+    (signal_list(rows, key) if v == "List" else signal_cards(rows))
+
+
+def movers_block(res, key):
+    if not res or res.get("error"):
+        st.caption(res.get("error", "no data") if res else "no data")
+        return
+    st.caption(f"period {res.get('label')} · {res.get('n_universe')} liquid F&O names ranked")
+    D = _clean(res.get("table"),
+               ["rank", "kind", "sym", "sector", "ret_pct", "close", "turnover_cr",
+                "atr_pct", "adr20", "rvol", "gap"],
+               {"rank": "#", "kind": "Type", "sym": "Symbol", "sector": "Sector",
+                "ret_pct": "Move %", "close": "Close", "turnover_cr": "Turnover ₹cr",
+                "atr_pct": "ATR %", "adr20": "ADR %", "rvol": "RVOL", "gap": "Gap %"})
+    v = view_toggle(key)
+    if v == "List":
+        st.dataframe(D, width="stretch", hide_index=True)
+    else:
+        G = [r for r in res["rows"] if r["kind"] == "GAINER"]
+        Lo = [r for r in res["rows"] if r["kind"] == "LOSER"]
+        c1, c2 = st.columns(2)
+        for col, ttl, rows_, colr in ((c1, "🟢 Top gainers", G, "#0ecb81"),
+                                      (c2, "🔴 Top losers", Lo, "#f6465d")):
+            with col:
+                st.markdown(f"##### {ttl}")
+                for r in rows_:
+                    st.markdown(
+                        f"<div style='background:#11141f;border:1px solid {colr}55;"
+                        f"border-left:3px solid {colr};border-radius:10px;padding:10px 12px;"
+                        f"margin-bottom:8px'><b style='color:#fff;font-size:15px'>{r['sym']}</b>"
+                        f"<span style='color:{colr};font-weight:800;float:right'>"
+                        f"{r['ret_pct']:+.2f}%</span><br>"
+                        f"<span style='font-size:11px;color:#8f96b3'>{r['sector']} · "
+                        f"ATR {num(r.get('atr_pct'))}% · RVOL {num(r.get('rvol'))} · "
+                        f"₹{num(r.get('turnover_cr'), 0)}cr</span></div>",
+                        unsafe_allow_html=True)
+    dl(D, f"{key}.csv", key)
+
 
 # =============================================================================
 # HEADER
@@ -1991,10 +2836,11 @@ PHASE_TXT = {
 }
 ptxt, pkind = PHASE_TXT.get(ph, (ph, "neutral"))
 
-st.markdown("<div class='main-header'>⚡ QUANT-EDGE v21 — Institutional ORB Terminal</div>",
+st.markdown("<div class='main-header'>⚡ QUANT-EDGE v22 — Institutional ORB Terminal</div>",
             unsafe_allow_html=True)
-st.markdown("<div class='sub-caption'>Calibrated on 744 daily sessions • 12,598 real 5-min ORB events • "
-            "133 weeks of 60-min swing outcomes — every threshold below is measured, not guessed</div>",
+st.markdown("<div class='sub-caption'>Official NSE F&O universe · 16,280 close-confirmed "
+            "5-min ORB events · sequential win/stop labels · 33-session walk-forward: "
+            "top-1 long hits +2% on 33.3% of days at +0.32%/trade</div>",
             unsafe_allow_html=True)
 c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
 c1.markdown(chip(ptxt, pkind), unsafe_allow_html=True)
@@ -2009,350 +2855,728 @@ with st.sidebar:
                               CFG["DEFAULT_CAPITAL"], step=25000)
     CFG["RISK_PER_TRADE_PCT"] = st.slider("Risk per trade (% of capital)", 0.25, 3.0,
                                           CFG["RISK_PER_TRADE_PCT"], 0.25)
+    CFG["INTRADAY_TOP_N"] = st.selectbox(
+        "Intraday signals per day", [1, 2, 3], index=0,
+        help="Walk-forward expectancy: top-1 +0.32%/trade, top-2 +0.10%, top-3 +0.07%. "
+             "1 is the default because the edge is concentrated in the single best name.")
+    CFG["SHORT_TOP_N"] = 1 if st.checkbox("Show the short side too", value=True,
+                                          help="Short ORB expectancy was -0.03%/trade "
+                                               "in walk-forward. Shown, never recommended.") else 0
     st.divider()
     st.markdown("#### Automation")
     a1, a2 = st.columns(2)
-    if a1.button("▶ Start", use_container_width=True):
+    if a1.button("▶ Start", width="stretch", key="btn_auto_start"):
         start_auto()
-    if a2.button("■ Stop", use_container_width=True):
+    if a2.button("■ Stop", width="stretch", key="btn_auto_stop"):
         stop_auto()
-    st.caption(("🟢 running — pre-market at 09:00, ORB refresh every minute, "
-                "EOD + outcome recording after 15:45, swing plan on Friday, "
-                "model refit monthly") if AUTOSTATE["running"] else "⚪ idle")
+    st.caption(("🟢 running — pre-market 09:00 · ORB every minute · EOD + outcomes "
+                "after 15:45 · movers captured daily · profile refresh weekly · "
+                "full refit monthly") if AUTOSTATE["running"] else "⚪ idle")
     if AUTOSTATE["log"]:
         with st.expander("automation log", expanded=False):
-            for l in AUTOSTATE["log"][:25]:
-                st.caption(l)
+            for _l in AUTOSTATE["log"][:25]:
+                st.caption(_l)
     st.divider()
     live_refresh = st.checkbox("Auto-refresh page (30s)", value=(ph == "LIVE"))
     if live_refresh and HAS_AUTOREFRESH:
-        st_autorefresh(interval=30000, key="qe21refresh")
-    if st.button("🔄 Clear data cache", use_container_width=True):
+        st_autorefresh(interval=30000, key="qe22refresh")
+    if st.button("🔄 Clear data cache", width="stretch", key="btn_clear_cache"):
         CACHE.clear()
         st.success("cache cleared")
     st.divider()
-    st.markdown("#### Universe health")
+    st.markdown("#### F&O universe")
+    if st.button("↻ Re-fetch official F&O list", width="stretch", key="btn_fno"):
+        syms, src = fetch_fno_universe()
+        st.session_state.res_fno = (syms, src)
+    _fno = st.session_state.get("res_fno")
+    if _fno:
+        st.caption(f"{len(_fno[0])} symbols · {_fno[1]}")
+        _new = sorted(set(_fno[0]) - set(FNO_STATIC))
+        _gone = sorted(set(FNO_STATIC) - set(_fno[0]))
+        if _new:
+            st.caption("added since build: " + ", ".join(_new[:10]))
+        if _gone:
+            st.caption("removed since build: " + ", ".join(_gone[:10]))
+    else:
+        st.caption(f"{len(FNO_STATIC)} symbols (built-in list, 2026-08-27)")
     try:
         uni, dead = validated_universe()
-        st.caption(f"{len(uni)} live symbols")
+        st.caption(f"{len(uni)} tradable after validation")
         if dead:
-            st.caption("auto-dropped (delisted/renamed): " + ", ".join(d.replace('.NS','') for d in dead[:12]))
-    except Exception as e:
-        st.caption(f"validation pending ({e})")
+            st.caption("dropped: " + ", ".join(d.replace('.NS', '') for d in dead[:10]))
+    except Exception as ex:
+        st.caption(f"validation pending ({ex})")
     st.divider()
     st.markdown("#### Models")
-    for nm, m in (("Intraday LONG", MODEL_L), ("Intraday SHORT", MODEL_S), ("Swing LONG", MODEL_SW)):
-        if m:
-            st.caption(f"{nm}: {len(m.features)} features, n={m.n:,}")
+    for _nm, _m in (("Intraday LONG +2%", MODEL_L), ("Intraday LONG +3%", MODEL_L3),
+                    ("Intraday SHORT", MODEL_S), ("Swing LONG", MODEL_SW)):
+        if _m:
+            st.caption(f"{_nm}: {len(_m.features)} features, n={_m.n:,}")
+    st.caption(f"Confluence gate: ATR≥{CONFLUENCE_GATE['atr_pct']}% · "
+               f"ADR≥{CONFLUENCE_GATE['adr20']}% · opening range≥"
+               f"{CONFLUENCE_GATE['orb_rng_pct']}% · break within "
+               f"{CONFLUENCE_GATE['trig_min_max']} min")
 
 TABS = st.tabs(["🌅 Pre-Market (09:08)", "⚡ Live ORB", "🌙 EOD → Tomorrow",
-                "📈 Swing (Friday)", "🧠 Calibration & Learning", "📓 Journal"])
+                "📈 Swing (Friday)", "🔁 Replay", "📊 Movers", "🧠 Learning", "📓 Journal"])
 
 # ---------------------------------------------------------------- PRE-MARKET
 with TABS[0]:
     st.markdown("#### Top 1 BUY + Top 1 SELL for today")
-    st.caption("Run between 09:00 and 09:08. Uses the live NSE pre-open call auction "
-               "(indicative equilibrium price) — v20 read yesterday's daily bar here, "
-               "which made the whole pre-market engine wrong.")
-    if st.button("🌅 Run pre-market scan", type="primary", key="pm"):
+    st.caption("Run between 09:00 and 09:08. Reads the live NSE pre-open call auction. "
+               "This is a WATCHLIST, not the order — the order is the 5-min ORB break "
+               "on the Live ORB tab.")
+    if st.button("🌅 Run pre-market scan", type="primary", key="btn_pm"):
         with st.spinner("reading NSE pre-open book + building features…"):
-            st.session_state.pm = scan_premarket(capital=capital)
-    res = st.session_state.get("pm") or load_scan("premarket")
+            st.session_state.res_pm = scan_premarket(capital=capital)
+    res = st.session_state.get("res_pm") or load_scan("premarket")
     if res and not res.get("error"):
-        st.caption(f"source: {res.get('source')} • regime {res.get('regime')} • "
+        st.caption(f"source: {res.get('source')} · regime {res.get('regime')} · "
                    f"{res.get('n_candidates')} feasible names")
         if "previous close" in str(res.get("source", "")):
-            st.warning("NSE pre-open feed unavailable — gaps assumed flat. Re-run after 09:02, "
-                       "or trade the Live ORB tab instead, which never needs pre-open data.")
-        L, R = st.columns(2)
-        with L:
-            st.markdown("##### 🟢 BUY candidate")
-            for i, c in enumerate((res.get("longs") or [])[:1]):
-                r = c["row"]
-                ticket_card(c["ticket"], extra_rows=[
-                    ("Expected open", money(r.get("exp_open"))),
-                    ("Gap", pct(r.get("gap"))),
-                    ("ATR% / ADR%", f"{num(r.get('atr_pct'))} / {num(r.get('adr20'))}"),
-                    ("P(+2% | this gap bucket)", f"{num(r.get('p_up'),1)}%"),
-                    ("Days ≥2.5% in last 20", num(r.get("big20"), 0)),
-                    ("Room to next resistance", pct(r.get("room_up"))),
-                ])
-            with st.expander("next 7 long candidates"):
-                for c in (res.get("longs") or [])[1:]:
+            st.warning("NSE pre-open feed unavailable — gaps assumed flat. Re-run after "
+                       "09:02, or use the Live ORB tab, which never needs pre-open data.")
+        v = view_toggle("pm")
+        L = (res.get("longs") or []); S = (res.get("shorts") or [])
+        if v == "List":
+            recs = []
+            for lbl, arr in (("BUY", L), ("SELL", S)):
+                for i, c in enumerate(arr, 1):
                     r = c["row"]
-                    st.write(f"**{r['sym']}** {r['sector']} • gap {pct(r.get('gap'))} • "
-                             f"ATR {num(r.get('atr_pct'))}% • P(up2) {num(r.get('p_up'),1)}%")
-        with R:
-            st.markdown("##### 🔴 SELL candidate")
-            for c in (res.get("shorts") or [])[:1]:
-                r = c["row"]
-                ticket_card(c["ticket"], low_conf=True, extra_rows=[
-                    ("Expected open", money(r.get("exp_open"))),
-                    ("Gap", pct(r.get("gap"))),
-                    ("ATR% / ADR%", f"{num(r.get('atr_pct'))} / {num(r.get('adr20'))}"),
-                    ("P(−2% | this gap bucket)", f"{num(r.get('p_dn'),1)}%"),
-                    ("Room to next support", pct(r.get("room_dn"))),
-                ])
-            with st.expander("next 7 short candidates"):
-                for c in (res.get("shorts") or [])[1:]:
+                    recs.append({"#": i, "Side": lbl, "Symbol": r["sym"],
+                                 "Sector": r.get("sector"),
+                                 "Exp. open": round(r.get("exp_open") or 0, 2),
+                                 "Gap %": round(r.get("gap") or 0, 2),
+                                 "ATR %": round(r.get("atr_pct") or 0, 2),
+                                 "ADR %": round(r.get("adr20") or 0, 2),
+                                 "P(move) %": round((r.get("p_up") if lbl == "BUY"
+                                                     else r.get("p_dn")) or 0, 1),
+                                 "Days ≥2.5% / 20": r.get("big20"),
+                                 "Qty": (c.get("ticket") or {}).get("qty")})
+            D = pd.DataFrame(recs)
+            st.dataframe(D, width="stretch", hide_index=True)
+            dl(D, "premarket_watchlist.csv", "pm")
+        else:
+            cA, cB = st.columns(2)
+            with cA:
+                st.markdown("##### 🟢 BUY candidate")
+                for c in L[:1]:
                     r = c["row"]
-                    st.write(f"**{r['sym']}** {r['sector']} • gap {pct(r.get('gap'))} • "
-                             f"ATR {num(r.get('atr_pct'))}% • P(dn2) {num(r.get('p_dn'),1)}%")
-        st.info("These two names are the **watchlist**, not the order. The actual entry is the "
-                "close-confirmed 5-min ORB break in the Live ORB tab from 09:20 — that is the "
-                "step that lifted measured expectancy from −0.04% to +0.19% per trade.")
-        tb = res.get("table")
-        if isinstance(tb, pd.DataFrame):
-            with st.expander("full pre-market table"):
-                st.dataframe(tb.drop(columns=[c for c in ("near_res", "near_sup") if c in tb.columns]),
-                             use_container_width=True, height=380)
+                    ticket_card(c["ticket"], extra_rows=[
+                        ("Expected open", money(r.get("exp_open"))), ("Gap", pct(r.get("gap"))),
+                        ("ATR% / ADR%", f"{num(r.get('atr_pct'))} / {num(r.get('adr20'))}"),
+                        ("P(+2% | this gap bucket)", f"{num(r.get('p_up'), 1)}%"),
+                        ("Days ≥2.5% in last 20", num(r.get("big20"), 0)),
+                        ("Room to next resistance", pct(r.get("room_up")))])
+                with st.expander("next candidates"):
+                    for c in L[1:]:
+                        r = c["row"]
+                        st.write(f"**{r['sym']}** {r['sector']} · gap {pct(r.get('gap'))} · "
+                                 f"ATR {num(r.get('atr_pct'))}% · P {num(r.get('p_up'), 1)}%")
+            with cB:
+                st.markdown("##### 🔴 SELL candidate")
+                for c in S[:1]:
+                    r = c["row"]
+                    ticket_card(c["ticket"], low_conf=True, extra_rows=[
+                        ("Expected open", money(r.get("exp_open"))), ("Gap", pct(r.get("gap"))),
+                        ("ATR% / ADR%", f"{num(r.get('atr_pct'))} / {num(r.get('adr20'))}"),
+                        ("P(−2% | this gap bucket)", f"{num(r.get('p_dn'), 1)}%"),
+                        ("Room to next support", pct(r.get("room_dn")))])
+                with st.expander("next candidates"):
+                    for c in S[1:]:
+                        r = c["row"]
+                        st.write(f"**{r['sym']}** {r['sector']} · gap {pct(r.get('gap'))} · "
+                                 f"ATR {num(r.get('atr_pct'))}% · P {num(r.get('p_dn'), 1)}%")
+        st.info("Gaps mean-revert intraday in this data: P(+2% | gap < −2%) = 60.0% versus "
+                "P(−2%) = 33.7%. The ranking already accounts for that.")
+        dl(_clean(res.get("table")), "premarket_full.csv", "pm_full")
     else:
-        st.info("No pre-market scan yet for today.")
+        st.info("No pre-market scan yet today.")
 
 # ---------------------------------------------------------------- LIVE ORB
 with TABS[1]:
-    st.markdown("#### Close-confirmed 5-minute ORB — order tickets")
-    k1, k2, k3 = st.columns([1, 1, 2])
-    om = k1.selectbox("ORB length", [5, 15], index=0,
-                      help="5-minute measured better than 15-minute in the study")
-    maxtr = k2.number_input("Max trades today", 1, 5, CFG["MAX_TRADES_DAY"])
-    CFG["MAX_TRADES_DAY"] = int(maxtr)
-    if k3.button("⚡ Scan ORB breaks now", type="primary", key="orb"):
-        with st.spinner("pulling 5-minute bars for the liquid universe…"):
-            st.session_state.orb = scan_live_orb(capital=capital, orb_minutes=om)
-    res = st.session_state.get("orb")
+    st.markdown(f"#### The order — top {CFG['INTRADAY_TOP_N']} close-confirmed 5-min ORB break")
+    st.caption("Entry = the CLOSE of the first 5-min candle beyond the opening range. "
+               "Requiring the close instead of a touch is the single biggest lever measured "
+               "in the study. Stop is capped at 1.0%. Half off at +1%, then stop to breakeven.")
+    cc1, cc2 = st.columns([1, 3])
+    if cc1.button("⚡ Scan live ORB", type="primary", key="btn_orb"):
+        with st.spinner("pulling 5-min bars for the whole F&O list…"):
+            st.session_state.res_orb = scan_live_orb(capital=capital)
+    res = st.session_state.get("res_orb") or load_scan("live_orb")
     if res and not res.get("error"):
-        nf = res.get("nfctx", {})
-        st.caption(f"{res['n_triggers']} confirmed breaks • Nifty gap {pct(nf.get('nf_gap'))} • "
-                   f"Nifty first candle {pct(nf.get('nf_fc'))} • regime {res.get('regime')}")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Confirmed breaks", res.get("n_triggers", 0))
+        m2.metric("Passed confluence gate", res.get("n_gate_pass", 0))
+        m3.metric("Regime", res.get("regime", "—"))
+        m4.metric("Market breadth @09:20", pct(res.get("mkt_early")))
         act = res.get("actionable") or []
-        if not act:
-            st.warning("No setup currently clears the probability floor. That is a valid answer — "
-                       "the calibration says roughly 1-2 tradable ORB setups per day, not 10.")
-        for c in act[:int(maxtr)]:
-            ticket_card(c["ticket"], prob=c["p"], low_conf=c.get("low_conf"), extra_rows=[
-                ("ORB high / low", f"{num(c['orb_h'])} / {num(c['orb_l'])}"),
-                ("Break confirmed at", str(c.get("trig_time"))[11:16] + f"  (+{num(c.get('trig_min'),0)} min)"),
-                ("Last price / moved since break", f"{num(c['last'])} ({pct(c['moved'])})"),
-                ("ATR% • RVOL • gap", f"{num(c['atr_pct'])}% • {num(c['rvol'])} • {pct(c['gap'])}"),
-                ("ORB range", f"{num(c['orb_range_pct'])}%"),
-                ("Top model drivers", ", ".join(f"{a} {b:+.2f}" for a, b in (c.get("drivers") or [])[:3])),
-            ])
-        allr = res.get("all_ranked") or []
-        if allr:
-            with st.expander(f"all {len(allr)} confirmed breaks, ranked"):
-                d = pd.DataFrame(allr)[["sym", "side", "prob_pct", "entry", "sl_pct", "trig_min",
-                                        "moved", "atr_pct", "rvol", "gap", "orb_range_pct",
-                                        "sector", "passed_p", "still_valid"]]
-                st.dataframe(d.round(2), use_container_width=True, height=460, hide_index=True)
-    else:
-        if ph in ("LIVE", "POST"):
-            st.info("Press scan. Best window is 09:20–11:00 — the study shows earlier breaks win "
-                    "far more often (trigger-minute is the single strongest negative coefficient).")
+        if act:
+            st.markdown("##### ✅ Place these")
+            render_signals(act, "orb_act")
         else:
-            st.info("Market is not live. This tab needs 5-minute bars from today.")
-
-    with st.expander("The exact rule this engine implements"):
-        st.markdown(f"""
-1. Universe: F&O names with 20-day average turnover ≥ ₹{CFG['MIN_TURNOVER_CR']}cr,
-   ATR ≥ {CFG['MIN_ATR_PCT']}% and ADR ≥ {CFG['MIN_ADR_PCT']}% — a stock that never moves 2%
-   cannot be made to move 2%.
-2. Mark the 09:15–09:20 candle high and low.
-3. **Wait for a 5-minute candle to CLOSE beyond it.** No touch entries — measured
-   improvement from 28.3% to 37.5% target-hit on the top-ranked name.
-4. Entry = that confirming close. Stop = opposite ORB edge, **capped at
-   {CFG['SL_CAP_PCT']}%** and floored at {CFG['SL_FLOOR_PCT']}%.
-5. Book half at +{CFG['PARTIAL_PCT']}% and move the stop to breakeven; the rest runs to
-   +{CFG['TARGET_PCT']}%. Square off everything by {CFG['SQUARE_OFF_TIME'].strftime('%H:%M')}.
-6. Take at most {CFG['MAX_TRADES_DAY']} trades, always the highest-probability ones,
-   no new entries after {CFG['LAST_ENTRY_TIME'].strftime('%H:%M')}.
-""")
+            st.warning("Nothing passed the gate and the probability floor. That is a valid "
+                       "answer — on the walk-forward sample, forcing a trade on the days the "
+                       "gate was empty is what turned +0.32%/trade into −0.03%.")
+        with st.expander(f"every confirmed break, ranked ({res.get('n_triggers', 0)})"):
+            D = _clean(pd.DataFrame(res.get("all_ranked") or []),
+                       ["sym", "sector", "side", "prob_pct", "p3_pct", "entry", "sl_pct",
+                        "trig_min", "orb_range_pct", "atr_pct", "adr20", "gap", "sec_rel",
+                        "gate_pass", "gate_note", "moved"], SIG_NAMES)
+            st.dataframe(D, width="stretch", hide_index=True)
+            dl(D, "live_orb_all.csv", "orb_all")
+        with st.expander("rejected by the confluence gate — and exactly why"):
+            R = _clean(pd.DataFrame(res.get("rejected") or []),
+                       ["sym", "side", "prob_pct", "trig_min", "orb_range_pct",
+                        "atr_pct", "adr20", "gate_note"], SIG_NAMES)
+            st.dataframe(R, width="stretch", hide_index=True)
+            dl(R, "live_orb_rejected.csv", "orb_rej")
+        with st.expander("sector strength at 09:20 (the rotation signal)"):
+            sec = res.get("sector_early") or {}
+            SD = pd.DataFrame([{"Sector": k, "Median move %": round(v[0], 2),
+                                "Breadth % up": round(v[1], 0)}
+                               for k, v in sec.items()]).sort_values("Median move %",
+                                                                    ascending=False)
+            st.dataframe(SD, width="stretch", hide_index=True)
+            dl(SD, "sector_strength.csv", "orb_sec")
+            st.caption("From the 24–26 Aug case study: on two of the three days, sector beta "
+                       "explained more of the big movers than any company news did.")
+    else:
+        st.info("No ORB scan yet. It needs at least one completed 5-min candle (09:20).")
 
 # ---------------------------------------------------------------- EOD
 with TABS[2]:
-    st.markdown("#### Top 5 for the next session")
-    st.caption("Run after 15:40. These are the names most likely to EXPAND tomorrow — direction is "
-               "decided by tomorrow's ORB, because D-1 features predict capability, not direction "
-               "(that is the single most important finding in the whole study).")
-    if st.button("🌙 Run EOD scan", type="primary", key="eod"):
-        with st.spinner("ranking expansion candidates…"):
-            st.session_state.eod = scan_eod(capital=capital)
-    res = st.session_state.get("eod") or load_scan("eod")
+    st.markdown("#### Tomorrow's top 5 — ranked by expected-move capability")
+    st.caption("These are names capable of a 2%+ range tomorrow. Direction is decided by "
+               "tomorrow's 5-min ORB, in either direction.")
+    if st.button("🌙 Run EOD scan", type="primary", key="btn_eod"):
+        with st.spinner("ranking the F&O list on expansion capability…"):
+            st.session_state.res_eod = scan_eod(capital=capital)
+    res = st.session_state.get("res_eod") or load_scan("eod")
     if res and not res.get("error"):
-        st.caption(f"for {res.get('for_date')} • regime {res.get('regime')}")
-        for i, p in enumerate(res.get("top") or [], 1):
-            r = p["row"]
-            with st.container(border=True):
-                a, b_, c_ = st.columns([2, 3, 3])
-                a.markdown(f"### {i}. {r['sym']}")
-                a.caption(r["sector"])
-                a.metric("P(moves ≥2% tomorrow)", f"{num(r.get('p_move2'),1)}%")
-                b_.write(f"Close **{money(r.get('close'))}**")
-                b_.write(f"ATR **{num(r.get('atr_pct'))}%** • ADR **{num(r.get('adr20'))}%**")
-                b_.write(f"Days ≥2.5% (20d) **{num(r.get('big20'),0)}** • (60d) **{num(r.get('big60'),0)}**")
-                b_.write(f"RVOL **{num(r.get('rvol'))}** • ADX **{num(r.get('adx'),0)}** • RSI **{num(r.get('rsi'),0)}**")
-                c_.write(f"Prev day high **{num(r.get('pdh'))}** / low **{num(r.get('pdl'))}**")
-                c_.write(f"Trend **{'UP' if (r.get('st_dir') or 0) > 0 else 'DOWN'}** • "
-                         f"vs 20d high {pct(r.get('d_hi20'))}")
-                c_.caption(p["note"])
-                with st.expander("pivots (daily / weekly / monthly)"):
-                    pivot_table({"D": p.get("pivot_D"), "W": p.get("pivot_W"), "M": p.get("pivot_M")})
-        tb = res.get("table")
-        if isinstance(tb, pd.DataFrame):
-            with st.expander("full ranked table"):
-                st.dataframe(tb.drop(columns=[c for c in ("pivots",) if c in tb.columns]).round(2),
-                             use_container_width=True, height=420)
+        st.caption(f"for {res.get('for_date')} · regime {res.get('regime')} · "
+                   f"{res.get('n')} names screened")
+        top = res.get("top") or []
+        v = view_toggle("eod")
+        if v == "List":
+            D = pd.DataFrame([{"#": i, "Symbol": p["row"]["sym"], "Sector": p["row"]["sector"],
+                               "Close": round(p["row"].get("close") or 0, 2),
+                               "P(2% move) %": round(p["row"].get("p_move2") or 0, 1),
+                               "ATR %": round(p["row"].get("atr_pct") or 0, 2),
+                               "ADR %": round(p["row"].get("adr20") or 0, 2),
+                               "Days ≥2.5%/20": p["row"].get("big20"),
+                               "RVOL": round(p["row"].get("rvol") or 0, 2),
+                               "Pivot": round((p.get("pivot_D") or {}).get("P") or 0, 2),
+                               "R1": round((p.get("pivot_D") or {}).get("R1") or 0, 2),
+                               "S1": round((p.get("pivot_D") or {}).get("S1") or 0, 2)}
+                              for i, p in enumerate(top, 1)])
+            st.dataframe(D, width="stretch", hide_index=True)
+            dl(D, "eod_top5.csv", "eod")
+        else:
+            for p in top:
+                r = p["row"]
+                st.markdown(f"##### {r['sym']} · {r['sector']}")
+                cA, cB = st.columns([2, 3])
+                cA.metric("P(2% move tomorrow)", f"{num(r.get('p_move2'), 1)}%")
+                cA.caption(f"ATR {num(r.get('atr_pct'))}% · ADR {num(r.get('adr20'))}% · "
+                           f"RVOL {num(r.get('rvol'))}")
+                with cB:
+                    pivot_table({"D": p.get("pivot_D"), "W": p.get("pivot_W"),
+                                 "M": p.get("pivot_M")})
+                st.caption(p.get("note", ""))
+        dl(_clean(res.get("table")), "eod_full.csv", "eod_full")
     else:
-        st.info("No EOD scan stored for today yet.")
+        st.info("No EOD scan yet.")
 
 # ---------------------------------------------------------------- SWING
 with TABS[3]:
-    st.markdown("#### Weekly swing plan — LONG ONLY, Monday 1-hour ORB")
-    st.caption("Run on Friday evening or over the weekend. Refresh again at month end, when the "
-               "monthly pivot resets.")
-    if st.button("📈 Build weekly swing plan", type="primary", key="sw"):
-        with st.spinner("building weekly + monthly-pivot + sector features…"):
-            st.session_state.sw = scan_swing(capital=capital)
-    res = st.session_state.get("sw") or load_scan("swing")
+    st.markdown("#### Weekly swing plan — LONG only, Monday 1-hour ORB entry")
+    st.caption("Calibrated on 133 weeks of 60-min bars. P(+10% before a −5% stop) is 2.2% "
+               "unconditionally and 11.1% on the top-3 ranked names, so the ladder is "
+               "+3% / +5% / +10% — the 10% is the runner, not the plan.")
+    if st.button("📈 Run swing scan", type="primary", key="btn_sw"):
+        with st.spinner("building weekly features…"):
+            st.session_state.res_sw = scan_swing(capital=capital)
+    res = st.session_state.get("res_sw") or load_scan("swing")
     if res and not res.get("error"):
-        st.error("**Read this before you place a swing order.** In 3 years of hourly data, only "
-                 "**2.2%** of week-stock combinations reached +10% before a −5% stop. Even the "
-                 "single best-ranked name each week reached +10% about **13%** of the time. "
-                 "+10% is the runner, not the plan — the honest plan is +3% / +5% laddered exits "
-                 "with +10% left to run, which is what these tickets do.")
-        st.caption(f"week starting {res.get('for_week')} • regime {res.get('regime')}")
-        for i, p in enumerate(res.get("top") or [], 1):
-            r = p["row"]
-            ticket_card(p["ticket"], prob=r.get("p"), ladder=p["ticket"].get("ladder"), extra_rows=[
-                ("Sector", r.get("sector")),
-                ("ATR% (must be ≥2.2)", num(r.get("atr_pct"))),
-                ("Last week return", pct(r.get("prev_wk_ret"))),
-                ("Weekly RSI", num(r.get("w_rsi"), 0)),
-                ("Position in monthly pivot range", num(r.get("piv_pos"), 0)),
-                ("Distance from 52w high", pct(r.get("d_hi52"))),
-                ("Model drivers", ", ".join(f"{a} {b:+.2f}" for a, b in (r.get("drivers") or [])[:3])),
-            ])
-            with st.expander(f"{r['sym']} pivots"):
-                pivot_table(r.get("pivots") or {})
-        st.markdown("##### Entry rule")
-        st.code(res.get("entry_rule", ""), language=None)
-        tb = res.get("table")
-        if isinstance(tb, pd.DataFrame):
-            with st.expander("full ranked swing table"):
-                st.dataframe(tb.drop(columns=[c for c in ("pivots", "drivers") if c in tb.columns]).round(2),
-                             use_container_width=True, height=420)
+        st.caption(f"for week starting {res.get('for_week', '—')} · "
+                   f"{res.get('n', 0)} names screened")
+        picks = res.get("top") or []
+        v = view_toggle("sw")
+        if v == "List":
+            D = pd.DataFrame([{"#": i, "Symbol": p["row"]["sym"],
+                               "Sector": p["row"].get("sector"),
+                               "Close": round(p["row"].get("px") or 0, 2),
+                               "P(+7% before stop) %": round((p.get("p") or 0) * 100, 1),
+                               "ATR %": round(p["row"].get("atr_pct") or 0, 2),
+                               "Qty": (p.get("ticket") or {}).get("qty"),
+                               "Stop": (p.get("ticket") or {}).get("sl"),
+                               "Target": (p.get("ticket") or {}).get("target")}
+                              for i, p in enumerate(picks, 1)])
+            st.dataframe(D, width="stretch", hide_index=True)
+            dl(D, "swing_plan.csv", "sw")
+        else:
+            for p in picks:
+                ticket_card(p["ticket"], prob=p.get("p"), ladder=p.get("ladder"),
+                            extra_rows=[("ATR %", num(p["row"].get("atr_pct"))),
+                                        ("21d return", pct(p["row"].get("ret21"))),
+                                        ("Distance to 20d high", pct(p["row"].get("d_hi20")))])
+        dl(_clean(res.get("table")), "swing_full.csv", "sw_full")
     else:
-        st.info("No swing plan stored yet.")
+        st.info("No swing scan yet. Run it on Friday after the close or over the weekend.")
 
-# ---------------------------------------------------------------- CALIBRATION
+# ---------------------------------------------------------------- REPLAY
 with TABS[4]:
-    st.markdown("#### What the data actually says")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Names moving ≥2.5% per day", "~33", "of ~830 liquid names")
-    m2.metric("Top-1 ORB long hits +2%", "37.5%", "vs 9.6% unfiltered")
-    m3.metric("Measured expectancy", "+0.32%", "per trade, after 0.06% cost")
-    m4.metric("Swing +10% in a week", "2.2%", "top-3 ranked: 11.1%")
+    st.markdown("#### Historical replay — run today's three engines on any past session")
+    st.caption("Answers 'what would the screener have told me on that day', and then shows "
+               "what actually happened to those exact tickets. 5-minute bars are only kept "
+               "for about 60 calendar days by the data provider, so the ORB replay window "
+               "is bounded by that; the pre-market and EOD replays go back as far as the "
+               "loaded daily history.")
+    rc1, rc2, rc3 = st.columns([2, 1, 1])
+    _def = prev_trading_day()
+    rday = rc1.date_input("Session to replay", value=_def,
+                          min_value=_def - timedelta(days=400), max_value=_def,
+                          key="replay_day")
+    rtop = rc2.selectbox("Signals", [1, 2, 3], index=0, key="replay_top")
+    if rc3.button("🔁 Replay", type="primary", key="btn_replay"):
+        with st.spinner(f"replaying {rday}…"):
+            st.session_state.res_replay = replay_session(rday, capital=capital, top_n=rtop)
+    rep = st.session_state.get("res_replay")
+    if rep:
+        if rep.get("error"):
+            st.error(rep["error"])
+        else:
+            st.caption(f"{rep['day']} · {rep['n_names']} liquid names · "
+                       f"5-min bars found for {rep['n_bars']}")
+            t1, t2, t3 = st.tabs(["🌅 Pre-Market as it stood", "⚡ Live ORB", "🌙 EOD → next day"])
+            with t1:
+                pm = rep.get("premarket") or {}
+                if pm.get("error"):
+                    st.info(pm["error"])
+                else:
+                    st.caption(pm.get("source"))
+                    v = view_toggle("rep_pm")
+                    D = _clean(pd.DataFrame(pm.get("longs") or []),
+                               ["sym", "sector", "exp_open", "gap", "atr_pct", "adr20",
+                                "p_up", "big20"],
+                               {"sym": "Symbol", "sector": "Sector", "exp_open": "Open",
+                                "gap": "Gap %", "atr_pct": "ATR %", "adr20": "ADR %",
+                                "p_up": "P(+2%) %", "big20": "Days ≥2.5%/20"})
+                    D2 = _clean(pd.DataFrame(pm.get("shorts") or []),
+                                ["sym", "sector", "exp_open", "gap", "atr_pct", "adr20",
+                                 "p_dn"],
+                                {"sym": "Symbol", "sector": "Sector", "exp_open": "Open",
+                                 "gap": "Gap %", "atr_pct": "ATR %", "adr20": "ADR %",
+                                 "p_dn": "P(−2%) %"})
+                    if v == "List":
+                        st.markdown("**Top BUY candidates**")
+                        st.dataframe(D, width="stretch", hide_index=True)
+                        st.markdown("**Top SELL candidates**")
+                        st.dataframe(D2, width="stretch", hide_index=True)
+                    else:
+                        cA, cB = st.columns(2)
+                        cA.markdown("**🟢 BUY**")
+                        for _, r in D.head(3).iterrows():
+                            cA.markdown(f"**{r['Symbol']}** · {r['Sector']} · gap "
+                                        f"{r['Gap %']}% · P {r['P(+2%) %']}%")
+                        cB.markdown("**🔴 SELL**")
+                        for _, r in D2.head(3).iterrows():
+                            cB.markdown(f"**{r['Symbol']}** · {r['Sector']} · gap "
+                                        f"{r['Gap %']}% · P {r['P(−2%) %']}%")
+                    dl(D, f"replay_{rep['day']}_premarket_buy.csv", "rep_pm_b")
+                    dl(D2, f"replay_{rep['day']}_premarket_sell.csv", "rep_pm_s")
+            with t2:
+                if rep.get("orb_error"):
+                    st.warning(rep["orb_error"])
+                orb = rep.get("orb") or {}
+                act = orb.get("actionable") or []
+                if act:
+                    won = [a for a in act if a.get("rp_result") == "TARGET HIT"]
+                    q1, q2, q3 = st.columns(3)
+                    q1.metric("Signals", len(act))
+                    q2.metric("Target hit", f"{len(won)}/{len(act)}")
+                    q3.metric("Avg result", pct(np.mean([a.get("rp_pnl_pct", 0) for a in act])))
+                    render_signals(act, "rep_orb")
+                elif not rep.get("orb_error"):
+                    st.info("Nothing passed the confluence gate on that session — the "
+                            "screener would correctly have told you to stay out.")
+                if orb.get("all_ranked"):
+                    with st.expander("every confirmed break that session"):
+                        D = _clean(pd.DataFrame(orb["all_ranked"]),
+                                   ["sym", "sector", "side", "prob_pct", "p3_pct", "entry",
+                                    "sl_pct", "trig_min", "orb_range_pct", "gate_pass",
+                                    "gate_note"], SIG_NAMES)
+                        st.dataframe(D, width="stretch", hide_index=True)
+                        dl(D, f"replay_{rep['day']}_orb_all.csv", "rep_orb_all")
+            with t3:
+                eod = rep.get("eod") or {}
+                if eod.get("error"):
+                    st.info(eod["error"])
+                else:
+                    rows = []
+                    for i, p in enumerate(eod.get("top") or [], 1):
+                        nd = p.get("next_day") or {}
+                        rows.append({"#": i, "Symbol": p["row"]["sym"],
+                                     "Sector": p["row"]["sector"],
+                                     "P(2% move) %": round(p["row"].get("p_move2") or 0, 1),
+                                     "ATR %": round(p["row"].get("atr_pct") or 0, 2),
+                                     "Next session": nd.get("date"),
+                                     "Max up from open %": nd.get("up_pct"),
+                                     "Max down from open %": nd.get("dn_pct")})
+                    D = pd.DataFrame(rows)
+                    st.dataframe(D, width="stretch", hide_index=True)
+                    dl(D, f"replay_{rep['day']}_eod.csv", "rep_eod")
+                    st.caption("'Max up/down from open' is what the name actually delivered "
+                               "the next session — a direct scorecard for the EOD ranking.")
+
+# ---------------------------------------------------------------- MOVERS
+with TABS[5]:
+    st.markdown("#### Top gainers & losers — automatic and manual")
+    st.caption("Automatic: computed from the F&O price panel. Daily = intraday open-to-close, "
+               "Weekly / Monthly = period open-to-close, which is what a swing trade "
+               "actually captures. Manual: your own list, used the same way by the "
+               "learning loop.")
+    mv1, mv2 = st.tabs(["🤖 Automatic", "✍️ Manual entry"])
+    with mv1:
+        pc1, pc2, pc3 = st.columns([2, 1, 1])
+        pmap = {"Daily (intraday F&O)": "D", "Weekly (swing)": "W", "Monthly (swing)": "M"}
+        psel = pc1.selectbox("Period", list(pmap.keys()), key="mv_period")
+        pn = pc2.selectbox("Top N", [3, 5, 10], index=0, key="mv_n")
+        pback = pc3.number_input("Periods back", 0, 24, 0, key="mv_back")
+        if st.button("📊 Compute movers", type="primary", key="btn_movers"):
+            with st.spinner("ranking…"):
+                st.session_state.res_movers = top_movers(period=pmap[psel], n=int(pn),
+                                                         back=int(pback))
+        movers_block(st.session_state.get("res_movers"), "movers")
+        st.divider()
+        c_a, c_b = st.columns(2)
+        if c_a.button("💾 Capture current movers to history", key="btn_mv_cap"):
+            n = movers_capture(history=1)
+            st.success(f"{n} new rows written to the movers history")
+        hist = movers_auto_history()
+        c_b.metric("Rows in movers history", len(hist))
+        if not hist.empty:
+            with st.expander("full captured history"):
+                st.dataframe(hist.sort_values("captured_at", ascending=False),
+                             width="stretch", hide_index=True)
+                dl(hist, "movers_history.csv", "mv_hist")
+        st.markdown("##### Download accurate top-3 sets")
+        d1, d2, d3 = st.columns(3)
+        for col, (lbl, code, back_n) in zip(
+                (d1, d2, d3), (("Daily top 3 (last 20 sessions)", "D", 20),
+                               ("Weekly top 3 (last 12 weeks)", "W", 12),
+                               ("Monthly top 3 (last 12 months)", "M", 12))):
+            with col:
+                if st.button(lbl, key=f"btn_bulk_{code}", width="stretch"):
+                    frames = []
+                    for bk in range(back_n):
+                        r = top_movers(period=code, n=3, back=bk)
+                        if r.get("rows"):
+                            frames.append(pd.DataFrame(r["rows"]))
+                    if frames:
+                        st.session_state[f"bulk_{code}"] = pd.concat(frames, ignore_index=True)
+                bulk = st.session_state.get(f"bulk_{code}")
+                if bulk is not None:
+                    dl(bulk, f"top3_{code}_history.csv", f"bulk_dl_{code}",
+                       label=f"⬇ {len(bulk)} rows")
+    with mv2:
+        st.caption("Add the movers you spotted yourself. Intraday = the day's top gainer or "
+                   "loser; Weekly / Monthly = swing movers.")
+        with st.form("man_mover"):
+            f1, f2, f3 = st.columns(3)
+            mp = f1.selectbox("Period", ["D (intraday)", "W (weekly swing)",
+                                         "M (monthly swing)"])
+            mk = f2.selectbox("Type", ["GAINER", "LOSER"])
+            msym = f3.text_input("Symbol (e.g. SAIL)").strip().upper()
+            g1, g2 = st.columns([1, 3])
+            mret = g1.number_input("Move %", -50.0, 50.0, 0.0, 0.1)
+            mlabel = g2.text_input("Period label (date / 2026-W35 / 2026-08)",
+                                   value=str(session_date()))
+            mreason = st.text_input("Reason / catalyst you observed")
+            if st.form_submit_button("Add", type="primary"):
+                if msym:
+                    movers_manual_add(dict(period=mp.split()[0], period_label=mlabel,
+                                           kind=mk, sym=msym, ret_pct=mret,
+                                           reason=mreason, added_at=fmt_ist()))
+                    st.success(f"{msym} added")
+                else:
+                    st.error("symbol is required")
+        man = movers_manual()
+        if not man.empty:
+            v = view_toggle("mv_man")
+            if v == "List":
+                st.dataframe(man.sort_values("added_at", ascending=False),
+                             width="stretch", hide_index=True)
+            else:
+                for _, r in man.sort_values("added_at", ascending=False).head(30).iterrows():
+                    colr = "#0ecb81" if r["kind"] == "GAINER" else "#f6465d"
+                    st.markdown(f"<div style='background:#11141f;border-left:3px solid {colr};"
+                                f"border-radius:8px;padding:8px 12px;margin-bottom:6px'>"
+                                f"<b>{r['sym']}</b> <span style='color:{colr}'>"
+                                f"{r['ret_pct']}%</span> · {r['period']} {r['period_label']}"
+                                f"<br><span style='font-size:11px;color:#8f96b3'>"
+                                f"{r['reason']}</span></div>", unsafe_allow_html=True)
+            dl(man, "manual_movers.csv", "mv_man_dl")
+
+# ---------------------------------------------------------------- LEARNING
+with TABS[6]:
+    st.markdown("#### What actually separates the big movers — and how often this refits")
+    st.caption("Built from the 24–26 Aug case study and from every session in the sample. "
+               "The profile below is measured on the PREVIOUS day's features of names that "
+               "then ran 3%+, so it is usable before the move, not after it.")
+    lc1, lc2, lc3 = st.columns([1, 1, 2])
+    lb = lc1.selectbox("Lookback (sessions)", [20, 30, 60], index=1, key="learn_lb")
+    mm = lc2.selectbox("Define a mover as", [3.0, 4.0, 5.0], index=0, key="learn_mm")
+    if lc3.button("🧠 Rebuild the mover profile", type="primary", key="btn_learn"):
+        with st.spinner("profiling…"):
+            st.session_state.res_learn = learn_from_movers(lookback_days=int(lb),
+                                                           min_move=float(mm))
+    prof = st.session_state.get("res_learn") or learn_profile()
+    if prof and prof.get("features"):
+        st.caption(f"built {prof.get('built_at')} · {prof.get('n_sessions')} sessions · "
+                   f"mover = |move| ≥ {prof.get('min_move_pct')}%")
+        NICE = {"atr_pct": "ATR %", "adr20": "ADR 20d %", "rvol": "Volume vs 20d avg",
+                "ret1": "Prev-day return %", "ret5": "5-day return %",
+                "ret21": "21-day return %", "px_vs_e20": "Price vs EMA20 %",
+                "d_hi20": "Distance to 20d high %", "d_lo20": "Distance to 20d low %",
+                "gap": "Gap %", "vol20": "20d volatility", "bbw": "Bollinger width",
+                "big_moves_20": "Days ≥2.5% in 20", "rsi": "RSI 14",
+                "turn_ma_cr": "Turnover ₹cr"}
+        D = pd.DataFrame([{"Feature": NICE.get(k, k),
+                           "Movers (median)": v["winner_median"],
+                           "Everything else": v["rest_median"],
+                           "Difference": v.get("diff"),
+                           "Ratio": v["ratio"], "n movers": v["n_winner"]}
+                          for k, v in prof["features"].items()]).sort_values(
+            "Ratio", ascending=False, na_position="last")
+        st.caption("Ratio is left blank where the baseline median sits on zero — "
+                   "for those features read the Difference column instead. Both are "
+                   "measured on the PREVIOUS day's data.")
+        v = view_toggle("learn")
+        if v == "List":
+            st.dataframe(D, width="stretch", hide_index=True)
+        else:
+            for _, r in D.iterrows():
+                tail = (f"**{r['Ratio']}×**" if r["Ratio"] == r["Ratio"] and r["Ratio"]
+                        else f"gap **{r['Difference']:+}**")
+                st.markdown(f"**{r['Feature']}** — movers {r['Movers (median)']} vs "
+                            f"{r['Everything else']} elsewhere · {tail}")
+        dl(D, "mover_profile.csv", "learn")
+    st.divider()
+    st.markdown("##### The 24–26 August study, in numbers")
     st.markdown("""
-##### Base rates — liquid F&O universe, last 180 sessions, 148,678 stock-days
-| Event | Probability | Names per day |
-|---|---|---|
-| Travels ≥2% UP from the open | 20.7% | ~41 |
-| Travels ≥2% DOWN from the open | 22.8% | ~45 |
-| Absolute day move ≥2.5% | 16.6% | ~33 |
-| Finishes as a top-3 gainer | 1.35% | 3 |
+Your 27 matched signals versus the other 603 F&O name-days on the same three sessions,
+comparing only information available **before** the move:
 
-##### Gaps mean-revert — this is where v20 was backwards
-| Opening gap | P(+2% up during the day) | P(−2% down) | What to do |
+| Feature (previous close) | Your winners | Everything else | Ratio |
 |---|---|---|---|
-| below −2% | **60.0%** | 33.7% | look for LONGS |
-| −2% to −1% | 36.9% | 30.2% | mild long bias |
-| −0.3% to +0.3% | 22.9% | 20.9% | neutral |
-| +1% to +2% | 30.8% | 32.5% | mild short bias |
-| above +2% | 41.0% | **47.8%** | look for SHORTS |
+| 5-day return | 1.71% | 0.14% | **12.5×** |
+| Gap at open | 0.42% | 0.04% | **9.9×** |
+| Price above EMA20 | 1.04% | 0.34% | **3.05×** |
+| Opened above previous-day R1 | 14.8% of names | 5.6% | **2.63×** |
+| Opening 5-min range | 1.04% | 0.71% | **1.46×** |
+| Previous-day volume vs 20d | 1.29× | 0.82× | **1.58×** |
+| ATR % | 2.41 | 2.19 | 1.10× |
+| RSI 14 | — | — | 1.02× (no signal) |
+| Turnover | lower | higher | 0.84× |
 
-##### Which features matter (top-quintile lift for a ≥2% move)
-`atr_pct` 1.63× · `adr20` 1.56× · `vol20` 1.48× · `big_moves_60` 1.46× ·
-`big_moves_20` 1.45× · `bbw` 1.33× · `rvol` ~1.20×.
-Momentum and MACD are near 1.0× — **they do not tell you direction**.
+Realised outcome: your names had a median best-case move of **3.25%** against **0.43%**
+for everything else, reached +2% on **67%** of cases versus **4%**, and +3% on **44%**
+versus **1%**. So the selection was real, not luck — but note that RSI and liquidity
+carried no information, and ATR barely did.
 
-##### Entry-style test (walk-forward, 33 sessions, top-3 per day)
-| Entry | Exit | Target hit | Profitable trades | Expectancy |
-|---|---|---|---|---|
-| touch of ORB high | fixed +2% | 28.3% | 37.4% | +0.05% |
-| **close beyond ORB high** | fixed +2% | **29.9%** | 44.2% | **+0.17%** |
-| **close beyond ORB high** | ladder | 27.3% | **64.9%** | **+0.24%** |
-| 15-minute ORB | fixed +2% | 23.7% | 35.5% | −0.06% |
+**Confluence stacking** (full sample, longs, six conditions: ATR/ADR expansion, opening
+range width, prior-day volume expansion, 5-day momentum, above EMA20, pivot breakout):
 
-##### Honest limits
-* The short-side ORB model was flat to negative in walk-forward testing. It is included
-  but gated and flagged; do not size it like the long side.
-* The intraday walk-forward covers 33 sessions (that is all the 5-minute history a free
-  data feed will return). Treat +0.3%/trade as an estimate with wide error bars.
-* No screener can promise 2% every day. What this one does is concentrate your one or two
-  daily trades into the setups where the measured hit rate is roughly 4× the base rate.
+| Conditions aligned | Events | Reached +2% | Reached +3% |
+|---|---|---|---|
+| 0–1 | 1,384 | 4.4% | 1.1% |
+| 2–3 | 6,258 | 7.1% | 2.6% |
+| 4 | 3,130 | 8.1% | 3.5% |
+| 5 | 1,279 | 10.6% | 4.2% |
+| 6 | 107 | **16.8%** | **8.4%** |
+
+About 20 names a day reach five or six conditions, which is the pool the screener ranks.
+The short side does **not** stack this way — its numbers stay flat near 6% regardless of
+confluence, which is why shorts remain low-confidence here.
+
+**Break timing matters more than any indicator:** a break confirmed within 10 minutes of
+the open reached +2% on 14.9% of events; after 120 minutes, 4.2%. That single fact is the
+strongest coefficient in the model.
 """)
     st.divider()
-    st.markdown("##### Learning loop")
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Record today's ORB outcomes"):
-            n = record_outcomes()
-            st.success(f"{n} labelled ORB events appended")
-        if os.path.exists(F_TRAIN_INTRA):
+    st.markdown("##### News and catalysts — what the 28 signals were actually driven by")
+    st.markdown("""
+Every one of the 28 was researched individually. Only **7 (25%)** had a documented
+company-specific catalyst. **9 (32%)** were pure sector or macro beta with no company
+news at all, **1** was expiry mechanics, and **11 (39%)** had nothing findable in the
+financial press.
+
+The practical conclusions, which are built into this version:
+
+1. **Sector strength is ranked before company news.** On 24 and 26 August, sector beta
+   explained more of the movers than any filing did — HINDZINC, SAIL and VEDL on 26 August
+   were one metal theme, not three ideas. The Live ORB tab now shows sector median move and
+   breadth at 09:20, and both feed the model.
+2. **A news filter must never be a gate.** Used as a gate it would have suppressed three
+   quarters of your own winners.
+3. **Signed news, not keyword news.** VBL fell on an expansion announcement, FEDERALBNK
+   fell on an acquisition report, PREMIERENE fell on the day it disclosed a rating upgrade.
+   Keyword-presence logic gets the sign wrong.
+4. **Expiry sessions are tagged, not trusted.** 25 August was expiry, had negative breadth
+   despite closing higher, and produced the highest share of unexplainable moves.
+5. **Brokerage target changes are amplifiers, not initiators** — all four in the sample sat
+   on top of a real event.
+""")
+    st.divider()
+    st.markdown("##### Refit cadence — the answer to 'weekly or monthly?'")
+    st.markdown("""
+**Both, doing different jobs.** A single cadence is the wrong choice.
+
+| Job | Cadence | Why this cadence |
+|---|---|---|
+| Append movers + score yesterday's signals | **Daily** | Free, no refit, builds the record |
+| Refresh the mover profile and the official F&O list | **Weekly** | ~1,000 fresh events moves a median safely; F&O entries and exits happen monthly at most, so weekly always catches them |
+| Full logistic refit + monthly pivots | **Monthly** | A stable refit needs ≈1,500 labelled trigger events. The sample produces ~275 per session, so a month gives ~5,500 and a week only ~1,375 — a weekly refit would chase noise |
+
+So: **weekly for the universe and the descriptive profile, monthly for the model.** The
+automation runs all three jobs; nothing needs to be triggered by hand.
+""")
+    if st.button("♻️ Force a full model refit now", key="btn_refit"):
+        with st.spinner("refitting on recorded outcomes…"):
             try:
-                dfl = pd.read_csv(F_TRAIN_INTRA)
-                st.caption(f"training store: {len(dfl):,} events, "
-                           f"{dfl.date.nunique()} sessions, "
-                           f"win rate {100*dfl.win.mean():.1f}%")
-            except Exception:
-                pass
-        else:
-            st.caption("training store empty — it fills up automatically after each session")
-    with c2:
-        if st.button("Refit models now"):
-            st.info(refit_models())
-        st.caption("The loop appends every ORB event with its true outcome each evening and "
-                   "refits the logistic models monthly. Feature and label definitions are "
-                   "identical to the offline calibration, so the sample simply keeps growing.")
+                st.session_state.res_refit = refit_models()
+            except Exception as ex:
+                st.session_state.res_refit = dict(error=str(ex))
+    rf = st.session_state.get("res_refit")
+    if rf:
+        st.write(rf)
 
 # ---------------------------------------------------------------- JOURNAL
-with TABS[5]:
-    st.markdown("#### Trade journal")
-    with st.form("jf"):
-        j1, j2, j3, j4 = st.columns(4)
-        sym = j1.text_input("Symbol")
-        side = j2.selectbox("Side", ["BUY", "SELL"])
-        entry = j3.number_input("Entry", 0.0, step=0.05)
-        exitp = j4.number_input("Exit", 0.0, step=0.05)
-        k1, k2, k3 = st.columns(3)
-        qty = k1.number_input("Qty", 0, step=1)
-        setup = k2.selectbox("Setup", ["Intraday ORB", "Swing 1h ORB", "Other"])
-        note = k3.text_input("Note")
-        if st.form_submit_button("Save trade"):
-            if sym and entry > 0 and exitp > 0:
-                pnl = (exitp - entry) * qty * (1 if side == "BUY" else -1)
-                pnlp = (exitp / entry - 1) * 100 * (1 if side == "BUY" else -1)
-                row = pd.DataFrame([dict(ts=get_ist_now().isoformat(), symbol=sym.upper(),
-                                         side=side, entry=entry, exit=exitp, qty=qty,
-                                         pnl=round(pnl, 2), pnl_pct=round(pnlp, 3),
-                                         setup=setup, note=note)])
-                row.to_csv(F_JOURNAL, mode="a", header=not os.path.exists(F_JOURNAL), index=False)
-                st.success("saved")
-    if os.path.exists(F_JOURNAL):
-        try:
-            J = pd.read_csv(F_JOURNAL)
-            a, b_, c_, d_ = st.columns(4)
-            a.metric("Trades", len(J))
-            b_.metric("Win rate", f"{100*(J.pnl>0).mean():.1f}%")
-            c_.metric("Total P&L", money(J.pnl.sum()))
-            d_.metric("Avg per trade", f"{J.pnl_pct.mean():+.2f}%")
-            st.dataframe(J.iloc[::-1], use_container_width=True, height=380, hide_index=True)
-        except Exception as e:
-            st.caption(f"journal unreadable: {e}")
-    else:
-        st.caption("No trades logged yet.")
+with TABS[7]:
+    st.markdown("#### Journal — automatic and manual")
+    j1, j2 = st.tabs(["🤖 Automatic (every signal)", "✍️ Manual (your trades)"])
+    with j1:
+        st.caption("Every signal the screener generates is written here automatically, "
+                   "traded or not. This is what makes the hit rate on the Learning tab a "
+                   "measurement rather than a memory.")
+        A = journal_auto()
+        if A.empty:
+            st.info("No signals logged yet. Run a scan.")
+        else:
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Signals logged", len(A))
+            k2.metric("Sessions covered", A.for_date.nunique())
+            k3.metric("Gate passed", int((A.gate == "PASS").sum()))
+            scored = A[A.pnl_pct.notna() & (A.pnl_pct.astype(str) != "")]
+            if not scored.empty:
+                k4.metric("Avg result", pct(pd.to_numeric(scored.pnl_pct,
+                                                          errors="coerce").mean()))
+            v = view_toggle("j_auto")
+            show = A.sort_values("logged_at", ascending=False)
+            if v == "List":
+                st.dataframe(show, width="stretch", hide_index=True)
+            else:
+                for _, r in show.head(25).iterrows():
+                    colr = "#0ecb81" if r["side"] == "BUY" else "#f6465d"
+                    st.markdown(
+                        f"<div style='background:#11141f;border-left:3px solid {colr};"
+                        f"border-radius:8px;padding:9px 12px;margin-bottom:6px'>"
+                        f"<b>{r['sym']}</b> <span style='color:{colr};font-weight:700'>"
+                        f"{r['side']}</span> · {r['engine']} · {r['for_date']}<br>"
+                        f"<span style='font-size:11px;color:#8f96b3'>entry {r['entry']} · "
+                        f"SL {r['sl']} · target {r['target']} · qty {r['qty']} · "
+                        f"P {r['prob_pct']}% · gate {r['gate']}</span></div>",
+                        unsafe_allow_html=True)
+            dl(A, "journal_auto_signals.csv", "j_auto")
+            if st.button("🎯 Score logged signals against actual prices", key="btn_score"):
+                with st.spinner("recording outcomes…"):
+                    try:
+                        st.session_state.res_score = record_outcomes()
+                    except Exception as ex:
+                        st.session_state.res_score = dict(error=str(ex))
+            sc = st.session_state.get("res_score")
+            if sc:
+                st.write(sc)
+    with j2:
+        st.caption("Your own trades, including the ones the screener never suggested. "
+                   "Both journals are downloadable and both feed the review below.")
+        with st.form("man_trade"):
+            f1, f2, f3, f4 = st.columns(4)
+            td = f1.date_input("Date", value=session_date())
+            tsym = f2.text_input("Symbol").strip().upper()
+            tside = f3.selectbox("Side", ["BUY", "SELL"])
+            tqty = f4.number_input("Qty", 0, 1000000, 0, step=1)
+            g1, g2, g3, g4 = st.columns(4)
+            ten = g1.number_input("Entry", 0.0, 1000000.0, 0.0, 0.05)
+            tex = g2.number_input("Exit", 0.0, 1000000.0, 0.0, 0.05)
+            tsl = g3.number_input("Stop", 0.0, 1000000.0, 0.0, 0.05)
+            ttg = g4.number_input("Target", 0.0, 1000000.0, 0.0, 0.05)
+            h1, h2, h3 = st.columns(3)
+            tsetup = h1.selectbox("Setup", ["5-min ORB", "Pre-market watchlist", "EOD list",
+                                            "Swing 1h ORB", "Manual / discretionary"])
+            tfol = h2.selectbox("Followed the plan?", ["Yes", "No", "Partly"])
+            temo = h3.selectbox("State of mind", ["Calm", "Rushed", "Revenge", "FOMO",
+                                                  "Hesitant"])
+            tnotes = st.text_area("Notes")
+            if st.form_submit_button("Save trade", type="primary"):
+                if tsym and ten > 0:
+                    sgn = 1 if tside == "BUY" else -1
+                    pp = ((tex / ten - 1) * 100 * sgn) if tex > 0 else None
+                    rec_ = dict(trade_date=str(td), sym=tsym, side=tside, entry=ten,
+                                  exit_px=tex, qty=tqty, sl=tsl, target=ttg,
+                                  pnl_pct=round(pp, 3) if pp is not None else None,
+                                  pnl_rs=round((tex - ten) * tqty * sgn, 2) if tex > 0 else None,
+                                  setup=tsetup, followed_plan=tfol, emotion=temo,
+                                  notes=tnotes)
+                    journal_manual_add(rec_)
+                    st.success(f"{tsym} saved")
+                else:
+                    st.error("symbol and entry price are required")
+        M = journal_manual()
+        if M.empty:
+            st.info("No manual trades yet.")
+        else:
+            pn_ = pd.to_numeric(M.pnl_pct, errors="coerce").dropna()
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Trades", len(M))
+            if len(pn_):
+                k2.metric("Win rate", f"{100 * (pn_ > 0).mean():.0f}%")
+                k3.metric("Average", pct(pn_.mean()))
+                k4.metric("Total", pct(pn_.sum()))
+            v = view_toggle("j_man")
+            show = M.sort_values("trade_date", ascending=False)
+            if v == "List":
+                st.dataframe(show, width="stretch", hide_index=True)
+            else:
+                for _, r in show.head(25).iterrows():
+                    p_ = pd.to_numeric(pd.Series([r["pnl_pct"]]), errors="coerce").iloc[0]
+                    colr = "#0ecb81" if (p_ == p_ and p_ > 0) else "#f6465d"
+                    st.markdown(
+                        f"<div style='background:#11141f;border-left:3px solid {colr};"
+                        f"border-radius:8px;padding:9px 12px;margin-bottom:6px'>"
+                        f"<b>{r['sym']}</b> {r['side']} · {r['trade_date']} "
+                        f"<span style='color:{colr};font-weight:700;float:right'>"
+                        f"{pct(r['pnl_pct'])}</span><br>"
+                        f"<span style='font-size:11px;color:#8f96b3'>{r['setup']} · "
+                        f"plan: {r['followed_plan']} · {r['emotion']}<br>{r['notes']}"
+                        f"</span></div>", unsafe_allow_html=True)
+            dl(M, "journal_manual_trades.csv", "j_man")
+            if len(pn_) >= 5:
+                st.markdown("##### Review")
+                by = M.copy()
+                by["p"] = pd.to_numeric(by.pnl_pct, errors="coerce")
+                agg = by.groupby("setup").p.agg(["count", "mean"]).round(3) \
+                        .rename(columns={"count": "trades", "mean": "avg %"})
+                st.dataframe(agg, width="stretch")
+                fp = by.groupby("followed_plan").p.mean().round(3)
+                if "Yes" in fp and "No" in fp:
+                    st.caption(f"When you followed the plan: {fp['Yes']:+.2f}% average. "
+                               f"When you did not: {fp['No']:+.2f}%.")
 
 st.divider()
-st.caption("QUANT-EDGE v21 • For research and personal use. Every probability shown is an "
-           "out-of-sample estimate from historical data, not a forecast. Position sizing assumes "
-           "you can lose the full stop distance on every trade.")
+st.caption("QUANT-EDGE v22 · For research and personal use. Every probability shown is a "
+           "walk-forward measurement on 59 sessions of the official F&O list, not a "
+           "promise. Top-1 long hit its +2% target on 33.3% of sessions — the other "
+           "two thirds ended at breakeven or the 1% stop. Position size accordingly.")
