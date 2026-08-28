@@ -109,11 +109,18 @@ def _xlate_width(kw):
     return kw
 
 def _compat_wrap(fn):
+    # Idempotent: st.dataframe and DeltaGenerator.dataframe are the same
+    # underlying function object, so patching both layers wrapped it five deep
+    # (visible as "Previous line repeated 2 more times" in tracebacks). One
+    # wrap is enough; the sentinel makes re-patching a no-op.
+    if getattr(fn, "_qe_compat", False):
+        return fn
+
     def inner(*a, **kw):
         try:
             return fn(*a, **_xlate_width(dict(kw)))
         except TypeError as ex:
-            msg = str(ex)
+            msg = str(ex)  # noqa: F841  (inspected below)
             kw2 = dict(kw)
             # last-resort: flip to the other spelling, then drop it entirely
             if "width" in msg and "width" in kw2:
@@ -133,6 +140,8 @@ def _compat_wrap(fn):
                 return fn(*a, **_xlate_width(kw2))
             raise
     inner.__name__ = getattr(fn, "__name__", "wrapped")
+    inner.__doc__ = getattr(fn, "__doc__", None)
+    inner._qe_compat = True
     return inner
 
 _COMPAT_FNS = ("button", "download_button", "form_submit_button", "link_button",
@@ -2812,6 +2821,43 @@ def pivot_table(piv):
 # =============================================================================
 # v22 UI HELPERS — list/card view, downloads, compact signal rendering
 # =============================================================================
+def _shade(D, col, lo_rgb=(233, 245, 235), hi_rgb=(35, 134, 54)):
+    """Green intensity ramp on one numeric column, WITHOUT matplotlib.
+
+    pandas' Styler.background_gradient imports matplotlib lazily, so on a host
+    that has pandas but not matplotlib (Streamlit Community Cloud by default)
+    every call raises ImportError and takes the whole page down. This computes
+    the same effect as plain inline CSS, so the app has no optional plotting
+    dependency at all. Falls back to an unstyled frame if anything goes wrong —
+    a cosmetic feature must never be able to crash a trading screen.
+    """
+    try:
+        if D is None or getattr(D, "empty", True) or col not in D.columns:
+            return D
+        v = pd.to_numeric(D[col], errors="coerce")
+        good = v[np.isfinite(v)] if hasattr(np, "isfinite") else v.dropna()
+        if len(good) == 0:
+            return D
+        lo, hi = float(good.min()), float(good.max())
+        rng = (hi - lo) or 1.0
+
+        def _css(x):
+            try:
+                x = float(x)
+            except (TypeError, ValueError):
+                return ""
+            if x != x:
+                return ""
+            t = max(0.0, min(1.0, (x - lo) / rng))
+            r, g, b = (int(round(a + (c - a) * t)) for a, c in zip(lo_rgb, hi_rgb))
+            fg = "#ffffff" if t > 0.55 else "#0b1220"
+            return f"background-color: rgb({r},{g},{b}); color: {fg};"
+
+        return D.style.map(_css, subset=[col])
+    except Exception:
+        return D
+
+
 def view_toggle(key, default="List"):
     """List / Card switch. Present on every tab; List is the default because it
     is the fastest thing to scan when you only want the order."""
@@ -2874,9 +2920,7 @@ def signal_list(rows, key, qty=True):
     for c in D.columns:
         if pd.api.types.is_numeric_dtype(D[c]):
             D[c] = D[c].astype(float).round(2)
-    styler = D.style.background_gradient(subset=[c for c in ["P(+2%) %"] if c in D.columns],
-                                         cmap="Greens")
-    st.dataframe(styler, width="stretch", hide_index=True)
+    st.dataframe(_shade(D, "P(+2%) %"), width="stretch", hide_index=True)
     dl(D, f"{key}.csv", key)
 
 
@@ -2960,9 +3004,10 @@ ptxt, pkind = PHASE_TXT.get(ph, (ph, "neutral"))
 
 st.markdown("<div class='main-header'>⚡ QUANT-EDGE v22 — Institutional ORB Terminal</div>",
             unsafe_allow_html=True)
-st.markdown("<div class='sub-caption'>Official NSE F&O universe · 16,280 close-confirmed "
-            "5-min ORB events · sequential win/stop labels · 33-session walk-forward: "
-            "top-1 long hits +2% on 33.3% of days at +0.32%/trade</div>",
+st.markdown("<div class='sub-caption'>Point-in-time NSE F&amp;O universe (295 names, 56 "
+            "monthly snapshots) · 269,147 close-confirmed 5-min ORB events over 1,147 "
+            "sessions · corrected sequential win/stop labels · real 5-min volume "
+            "(99.96% coverage) · walk-forward expectancy shown below, unretouched</div>",
             unsafe_allow_html=True)
 c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
 c1.markdown(chip(ptxt, pkind), unsafe_allow_html=True)
@@ -2979,7 +3024,7 @@ with st.sidebar:
                                           CFG["RISK_PER_TRADE_PCT"], 0.25)
     CFG["INTRADAY_TOP_N"] = st.selectbox(
         "Intraday signals per day", [1, 2, 3], index=0,
-        help="Walk-forward expectancy: top-1 +0.32%/trade, top-2 +0.10%, top-3 +0.07%. "
+        help="Walk-forward expectancy on 1,026 sessions: top-1 -0.137%/trade, top-2 -0.155%, top-3 -0.153%, top-5 -0.131%. All negative; k=1 is simply the least bad. The earlier +0.32% figure came from 33 sessions and has been retracted. "
              "1 is the default because the edge is concentrated in the single best name.")
     CFG["SHORT_TOP_N"] = 1 if st.checkbox("Show the short side too", value=True,
                                           help="Short ORB expectancy was -0.03%/trade "
@@ -3044,27 +3089,64 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 if CFG.get("PAPER_MODE", True):
     _ev = EVIDENCE
-    st.error(
-        f"**PAPER MODE — signals only, do not place these as orders.**  "
-        f"Re-measured on {_ev['sessions_tested']:,} sessions "
-        f"({_ev['data'].split(', ')[-1]}), {_ev['universe']}.\n\n"
-        f"· Intraday LONG: **{_ev['intraday_long']['status']}** — "
-        f"{_ev['intraday_long']['avg_pct']:+.3f}%/trade, hit "
-        f"{100*_ev['intraday_long']['hit']:.1f}%, positive in "
-        f"{_ev['intraday_long']['years_positive']} years "
-        f"({_ev['intraday_long']['note']}).\n"
-        f"· Intraday SHORT: **{_ev['intraday_short']['status']}** — "
-        f"{_ev['intraday_short']['avg_pct']:+.3f}%/trade, "
-        f"{_ev['intraday_short']['years_positive']} years "
-        f"({_ev['intraday_short']['note']}).\n"
-        f"· Swing LONG: **{_ev['swing_long']['status']}** — "
-        f"{_ev['swing_long']['avg_pct']:+.3f}%/trade, hit "
-        f"{100*_ev['swing_long']['hit']:.1f}%, "
-        f"{_ev['swing_long']['years_positive']} years "
-        f"({_ev['swing_long']['note']}).\n\n"
-        f"Break-even at 2:1 reward:risk needs 34.6%. Every signal below is "
-        f"logged automatically to the Journal so forward results accumulate. "
-        f"Set `CFG['PAPER_MODE'] = False` only once a configuration has earned it.")
+    _COL = {"NO EDGE": "#f85149", "MARGINAL": "#d29922", "WEAK": "#d29922",
+            "VALIDATED": "#3fb950"}
+
+    def _chip(k, label):
+        b = _ev[k]
+        c = _COL.get(b["status"], "#8b949e")
+        return (
+            f"<div class='qe-chip'>"
+            f"<div class='qe-chip-h'>{label}"
+            f"<span class='qe-badge' style='background:{c}22;color:{c};"
+            f"border:1px solid {c}55'>{b['status']}</span></div>"
+            f"<div class='qe-chip-n' style='color:"
+            f"{'#3fb950' if b['avg_pct'] > 0 else '#f85149'}'>"
+            f"{b['avg_pct']:+.3f}%<span class='qe-chip-u'>per trade</span></div>"
+            f"<div class='qe-chip-s'>hit {100*b['hit']:.1f}% · "
+            f"positive {b['years_positive']} years</div>"
+            f"<div class='qe-chip-f'>{b['note']}</div></div>")
+
+    st.markdown("""<style>
+    .qe-paper{border:1px solid #30363d;border-left:3px solid #d29922;
+      background:#12161c;border-radius:10px;padding:14px 16px;margin:2px 0 14px}
+    .qe-paper-t{font:600 13px/1.3 -apple-system,Segoe UI,Roboto,sans-serif;
+      color:#e6edf3;letter-spacing:.02em}
+    .qe-paper-d{font:12px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;
+      color:#8b949e;margin-top:3px}
+    .qe-grid{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+    .qe-chip{flex:1 1 210px;background:#0d1117;border:1px solid #21262d;
+      border-radius:8px;padding:10px 12px}
+    .qe-chip-h{font:600 11px/1.2 -apple-system,Segoe UI,sans-serif;color:#8b949e;
+      text-transform:uppercase;letter-spacing:.06em;display:flex;
+      justify-content:space-between;align-items:center;gap:8px}
+    .qe-badge{font-size:9px;font-weight:700;padding:2px 6px;border-radius:20px;
+      letter-spacing:.04em;white-space:nowrap}
+    .qe-chip-n{font:700 20px/1.1 -apple-system,Segoe UI,sans-serif;margin-top:7px}
+    .qe-chip-u{font:400 10px/1 -apple-system,sans-serif;color:#6e7681;
+      margin-left:5px;letter-spacing:.04em}
+    .qe-chip-s{font:11px/1.4 -apple-system,sans-serif;color:#8b949e;margin-top:5px}
+    .qe-chip-f{font:10px/1.4 -apple-system,sans-serif;color:#6e7681;margin-top:4px}
+    .qe-paper-x{font:11px/1.5 -apple-system,sans-serif;color:#8b949e;
+      margin-top:11px;padding-top:9px;border-top:1px solid #21262d}
+    </style>""", unsafe_allow_html=True)
+
+    st.markdown(
+        "<div class='qe-paper'>"
+        "<div class='qe-paper-t'>PAPER MODE — signals are shown and logged, "
+        "not placed as orders</div>"
+        f"<div class='qe-paper-d'>Calibrated on {_ev['sessions_tested']:,} "
+        f"sessions, {_ev['data'].split(', ')[-1]}, {_ev['universe']}. "
+        f"This panel is a status summary, not an error.</div>"
+        "<div class='qe-grid'>"
+        + _chip("intraday_long", "Intraday long")
+        + _chip("intraday_short", "Intraday short")
+        + _chip("swing_long", "Swing long")
+        + "</div><div class='qe-paper-x'>Break-even at 2:1 reward-to-risk needs a "
+          "34.6% hit rate. Every signal below is written to the Journal "
+          "automatically, so forward results accumulate from today. Flip "
+          "<code>CFG['PAPER_MODE'] = False</code> once a configuration has "
+          "earned it.</div></div>", unsafe_allow_html=True)
 
 TABS = st.tabs(["🌅 Pre-Market (09:08)", "⚡ Live ORB", "🌙 EOD → Tomorrow",
                 "📈 Swing (Friday)", "🔁 Replay", "📊 Movers", "🧠 Learning", "📓 Journal"])
@@ -3166,7 +3248,8 @@ with TABS[1]:
         else:
             st.warning("Nothing passed the gate and the probability floor. That is a valid "
                        "answer — on the walk-forward sample, forcing a trade on the days the "
-                       "gate was empty is what turned +0.32%/trade into −0.03%.")
+                       "gate was empty was measured on 33 sessions and did not survive "
+                       "re-measurement on 1,026. See V23_VERIFICATION.md.")
         with st.expander(f"every confirmed break, ranked ({res.get('n_triggers', 0)})"):
             D = _clean(pd.DataFrame(res.get("all_ranked") or []),
                        ["sym", "sector", "side", "prob_pct", "p3_pct", "entry", "sl_pct",
@@ -3727,5 +3810,6 @@ with TABS[7]:
 st.divider()
 st.caption("QUANT-EDGE v22 · For research and personal use. Every probability shown is a "
            "walk-forward measurement on 59 sessions of the official F&O list, not a "
-           "promise. Top-1 long hit its +2% target on 33.3% of sessions — the other "
+           "promise. On 1,026 walk-forward sessions top-1 long hit its +2% target on "
+           "27.2% of sessions, short of the 34.6% break-even — the other "
            "two thirds ended at breakeven or the 1% stop. Position size accordingly.")
