@@ -71,11 +71,88 @@ try:
 except Exception:
     HAS_AUTOREFRESH = False
 
+# =============================================================================
+# STREAMLIT VERSION COMPATIBILITY SHIM
+# -----------------------------------------------------------------------------
+# `width="stretch"` / `width="content"` only exist on Streamlit >= 1.49.
+# Older builds want `use_container_width=True/False` and raise TypeError on
+# `width`. Newer builds deprecate `use_container_width`. This shim translates
+# in whichever direction the installed version needs, so the app runs on any
+# Streamlit from 1.30 upward instead of dying at the first widget.
+# =============================================================================
+def _sv_tuple(v):
+    out = []
+    for part in str(v).split(".")[:3]:
+        num = ""
+        for ch in part:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        out.append(int(num) if num else 0)
+    while len(out) < 3:
+        out.append(0)
+    return tuple(out)
+
+ST_VER = _sv_tuple(getattr(st, "__version__", "0.0.0"))
+ST_NEW_WIDTH = ST_VER >= (1, 49, 0)
+
+def _xlate_width(kw):
+    """Normalise the width/use_container_width kwargs for the installed build."""
+    w = kw.get("width", None)
+    if isinstance(w, str):                      # "stretch" / "content"
+        if not ST_NEW_WIDTH:
+            kw.pop("width")
+            kw["use_container_width"] = (w == "stretch")
+    elif "use_container_width" in kw and ST_NEW_WIDTH:
+        kw["width"] = "stretch" if kw.pop("use_container_width") else "content"
+    return kw
+
+def _compat_wrap(fn):
+    def inner(*a, **kw):
+        try:
+            return fn(*a, **_xlate_width(dict(kw)))
+        except TypeError as ex:
+            msg = str(ex)
+            kw2 = dict(kw)
+            # last-resort: flip to the other spelling, then drop it entirely
+            if "width" in msg and "width" in kw2:
+                w = kw2.pop("width")
+                if isinstance(w, str):
+                    kw2["use_container_width"] = (w == "stretch")
+                try:
+                    return fn(*a, **kw2)
+                except TypeError:
+                    kw2.pop("use_container_width", None)
+                    return fn(*a, **kw2)
+            if "use_container_width" in msg and "use_container_width" in kw2:
+                kw2.pop("use_container_width")
+                return fn(*a, **kw2)
+            if "hide_index" in msg and "hide_index" in kw2:
+                kw2.pop("hide_index")
+                return fn(*a, **_xlate_width(kw2))
+            raise
+    inner.__name__ = getattr(fn, "__name__", "wrapped")
+    return inner
+
+_COMPAT_FNS = ("button", "download_button", "form_submit_button", "link_button",
+               "dataframe", "data_editor", "table", "plotly_chart",
+               "altair_chart", "vega_lite_chart", "line_chart", "bar_chart",
+               "area_chart", "pyplot")
 try:
-    from fyers_apiv3 import fyersModel
-    HAS_FYERS = True
+    # patch the class so column / container / sidebar handles are covered too
+    from streamlit.delta_generator import DeltaGenerator as _DG
+    for _f in _COMPAT_FNS:
+        _orig = getattr(_DG, _f, None)
+        if callable(_orig):
+            setattr(_DG, _f, _compat_wrap(_orig))
 except Exception:
-    HAS_FYERS = False
+    pass
+for _f in _COMPAT_FNS:
+    # module-level st.* names are bound at import, so patch them separately
+    _orig = getattr(st, _f, None)
+    if callable(_orig):
+        setattr(st, _f, _compat_wrap(_orig))
 
 st.set_page_config(page_title="QUANT-EDGE v22 — Institutional ORB Terminal",
                    page_icon="⚡", layout="wide", initial_sidebar_state="expanded")
@@ -141,10 +218,17 @@ CFG = dict(
     PARTIAL_PCT          = 1.00,   # book half here, stop to breakeven
     USE_PARTIAL          = True,
     MAX_TRADES_DAY       = 2,
-    INTRADAY_TOP_N       = 1,      # walk-forward: top-1 +0.318%/trade, top-2 +0.098%,
-                                   # top-3 +0.073%. The edge is concentrated; k=1 is
-                                   # the default because k>1 dilutes it.
-    SHORT_TOP_N          = 1,      # shown, never recommended: -0.026%/trade
+    # ---- CALIBRATION CORRECTED 2026-08-28 -----------------------------------
+    # The earlier note here claimed top-1 = +0.318%/trade. That was measured on
+    # 33 sessions and did not survive re-measurement. On 1,026 walk-forward
+    # sessions (2022-01..2026-08, fixed labeller, real volume, point-in-time
+    # F&O universe) top-1 LONG is -0.137%/trade and negative in all five years.
+    # 34 stop/target geometries were swept; all 34 lose on the long side.
+    # Raising the probability floor does not help: the top-25 highest-conviction
+    # picks hit 24.0% versus 27.2% for all 1,026, so conviction has no
+    # resolution at the top end. See V23_VERIFICATION.md.
+    INTRADAY_TOP_N       = 1,
+    SHORT_TOP_N          = 1,      # +0.035%/trade, positive 2022-25, negative 2026
     COST_PCT             = 0.06,   # round-trip cost assumption
     LAST_ENTRY_TIME      = dtime(13, 0),
     SQUARE_OFF_TIME      = dtime(15, 10),
@@ -158,7 +242,29 @@ CFG = dict(
     SWING_MIN_ATR_PCT    = 2.2,
     RISK_PER_TRADE_PCT   = 1.0,    # position sizing on account equity
     DEFAULT_CAPITAL      = 500000,
+    # PAPER_MODE: signals are displayed and logged, never presented as an
+    # instruction to place an order. On by default because the measured
+    # out-of-sample expectancy of the intraday system is negative. Turn it off
+    # only after a configuration has been shown to make money forward.
+    PAPER_MODE           = True,
 )
+
+# Honest, machine-readable record of what has and has not been validated, so the
+# UI can never again show a confidence claim the evidence does not support.
+EVIDENCE = {
+    "as_of": "2026-08-28",
+    "sessions_tested": 1147,
+    "intraday_long": dict(status="NO EDGE", avg_pct=-0.137, hit=0.272,
+                          years_positive="0/5", note="all 34 geometries lose"),
+    "intraday_short": dict(status="MARGINAL", avg_pct=+0.035, hit=0.276,
+                           years_positive="4/5", note="2026 negative"),
+    "swing_long": dict(status="WEAK", avg_pct=+0.160, hit=0.109,
+                       years_positive="3/4",
+                       note="4.4x lift is real and permutation-verified, but "
+                            "+10%/week is only a 2.44% event"),
+    "data": "Upstox 5-min, real volume 99.96%, 2022-01-03..2026-08-26",
+    "universe": "point-in-time NSE F&O membership, monthly, 295 distinct names",
+}
 
 # =============================================================================
 # UNIVERSE  —  NSE F&O + high-velocity movers.
@@ -692,16 +798,31 @@ def download(tickers, period=None, interval="1d", start=None, end=None,
 # UNIVERSE VALIDATION  (v20 bug #11: LTIM.NS, PEL.NS, TATAMOTORS.NS are dead)
 # =============================================================================
 def validated_universe(force=False, max_age_days=7):
+    """Tradable universe = the OFFICIAL NSE F&O list, nothing else.
+
+    BUGFIX 2026-08-27: this used to build from UNIVERSE_RAW (a 265-name legacy
+    watchlist) while FNO_STATIC was only printed in the sidebar. The F&O-only
+    requirement was therefore never enforced on the scan, and non-F&O names
+    (e.g. HFCL) could be issued as orders. The F&O list is now the sole source
+    of the universe; UNIVERSE_RAW is kept only to supply the RENAMES fixups.
+    """
     if not force and os.path.exists(F_UNIVERSE_OK):
         try:
             j = json.load(open(F_UNIVERSE_OK))
             age = (get_ist_now() - datetime.fromisoformat(j["ts"]).replace(tzinfo=IST)).days
-            if age <= max_age_days and j.get("ok"):
+            if age <= max_age_days and j.get("ok") and j.get("src") == "fno":
                 return j["ok"], j.get("dead", [])
         except Exception:
             pass
+    try:
+        fno, _src = fetch_fno_universe()
+    except Exception:
+        fno = list(FNO_STATIC)
+    if len(fno) < 150:
+        fno = list(FNO_STATIC)
     raw = []
-    for t in UNIVERSE_RAW:
+    for s in fno:
+        t = s if s.endswith(".NS") else s + ".NS"
         r = RENAMES.get(t, t)
         if r:
             raw.append(r)
@@ -710,7 +831,8 @@ def validated_universe(force=False, max_age_days=7):
     ok = sorted([t for t in raw if t in data and len(data[t]) >= 3])
     dead = sorted([t for t in raw if t not in ok])
     try:
-        json.dump({"ts": get_ist_now().isoformat(), "ok": ok, "dead": dead},
+        json.dump({"ts": get_ist_now().isoformat(), "ok": ok, "dead": dead,
+                   "src": "fno", "n_fno": len(fno)},
                   open(F_UNIVERSE_OK, "w"))
     except Exception:
         pass
@@ -2916,6 +3038,33 @@ with st.sidebar:
                f"ADR≥{CONFLUENCE_GATE['adr20']}% · opening range≥"
                f"{CONFLUENCE_GATE['orb_rng_pct']}% · break within "
                f"{CONFLUENCE_GATE['trig_min_max']} min")
+
+# ---------------------------------------------------------------------------
+# PAPER MODE BANNER — the evidence, stated up front, on every screen.
+# ---------------------------------------------------------------------------
+if CFG.get("PAPER_MODE", True):
+    _ev = EVIDENCE
+    st.error(
+        f"**PAPER MODE — signals only, do not place these as orders.**  "
+        f"Re-measured on {_ev['sessions_tested']:,} sessions "
+        f"({_ev['data'].split(', ')[-1]}), {_ev['universe']}.\n\n"
+        f"· Intraday LONG: **{_ev['intraday_long']['status']}** — "
+        f"{_ev['intraday_long']['avg_pct']:+.3f}%/trade, hit "
+        f"{100*_ev['intraday_long']['hit']:.1f}%, positive in "
+        f"{_ev['intraday_long']['years_positive']} years "
+        f"({_ev['intraday_long']['note']}).\n"
+        f"· Intraday SHORT: **{_ev['intraday_short']['status']}** — "
+        f"{_ev['intraday_short']['avg_pct']:+.3f}%/trade, "
+        f"{_ev['intraday_short']['years_positive']} years "
+        f"({_ev['intraday_short']['note']}).\n"
+        f"· Swing LONG: **{_ev['swing_long']['status']}** — "
+        f"{_ev['swing_long']['avg_pct']:+.3f}%/trade, hit "
+        f"{100*_ev['swing_long']['hit']:.1f}%, "
+        f"{_ev['swing_long']['years_positive']} years "
+        f"({_ev['swing_long']['note']}).\n\n"
+        f"Break-even at 2:1 reward:risk needs 34.6%. Every signal below is "
+        f"logged automatically to the Journal so forward results accumulate. "
+        f"Set `CFG['PAPER_MODE'] = False` only once a configuration has earned it.")
 
 TABS = st.tabs(["🌅 Pre-Market (09:08)", "⚡ Live ORB", "🌙 EOD → Tomorrow",
                 "📈 Swing (Friday)", "🔁 Replay", "📊 Movers", "🧠 Learning", "📓 Journal"])
