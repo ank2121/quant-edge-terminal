@@ -256,6 +256,9 @@ CFG = dict(
     # out-of-sample expectancy of the intraday system is negative. Turn it off
     # only after a configuration has been shown to make money forward.
     PAPER_MODE           = True,
+    MULTI_TF_ORB         = True,   # 5m + 15m ORB both
+    ORB_CUTOFF_TIME      = dtime(10, 0),  # No new ORB after this
+    MOMENTUM_START_TIME  = dtime(12, 30), # Momentum scan after this
 )
 
 # Honest, machine-readable record of what has and has not been validated, so the
@@ -1201,6 +1204,7 @@ def orb_from_bars(g, minutes=5):
     rest = g.iloc[nbars:]
     day_vol = float(g.Volume.sum())
     r = dict(orb_h=oh, orb_l=ol, orb_o=oo, orb_c=oc,
+             orb_minutes=minutes,
              orb_range_pct=(oh - ol) / oo * 100,
              fc_body=(oc - oo) / oo * 100,
              fc_vol_share=(float(fc.Volume.sum()) / day_vol) if day_vol > 0 else np.nan,
@@ -1227,6 +1231,65 @@ def orb_from_bars(g, minutes=5):
         r["S_trig_min"] = int((rest.index[i] - t0).total_seconds() // 60) + 5
         r["S_trig_time"] = rest.index[i]
     return r
+
+
+def scan_momentum_stocks(bundle, capital, day, nfctx, top_n=5):
+    """Scan for momentum stocks after 12:30 PM - high volume, strong trend continuation."""
+    names = liquid_names(bundle)
+    intraday = download(names, period="1d", interval="5m", ttl=45)
+    cands = []
+    for t, d in intraday.items():
+        try:
+            g = d.copy()
+            g.index = pd.DatetimeIndex(g.index)
+            if g.index.tz is not None:
+                g.index = g.index.tz_convert(IST)
+            g = g[g.index.date == day]
+            g = g[(g.index.time >= MKT_OPEN) & (g.index.time <= MKT_CLOSE)]
+            if len(g) < 50:
+                continue
+            # Volume-weighted momentum
+            vol = g.Volume.rolling(20).mean().iloc[-1]
+            price_change = (g.Close.iloc[-1] / g.Open.iloc[0] - 1) * 100
+            vwap = (g.Close * g.Volume).sum() / g.Volume.sum()
+            dist_vwap = (g.Close.iloc[-1] / vwap - 1) * 100
+            rvol = g.Volume.iloc[-1] / vol if vol > 0 else 0
+            
+            base = bundle["snap"].get(t, {}) or {}
+            atr_pct = base.get("atr_pct", 0)
+            adr20 = base.get("adr20", 0)
+            
+            if rvol < 1.5 or abs(price_change) < 1.0:
+                continue
+                
+            side = "BUY" if price_change > 0 else "SELL"
+            entry = float(g.Close.iloc[-1])
+            sl_pct = min(max(atr_pct * 0.5, 0.5), 1.5)
+            
+            cands.append(dict(
+                ticker=t, sym=t.replace(".NS", ""), sector=sector_of(t),
+                side=side, p=min(0.6 + abs(price_change) * 0.05, 0.85),
+                prob_pct=min(60 + abs(price_change) * 5, 85),
+                entry=entry, level=entry, sl_pct=sl_pct,
+                trig_min=None, trig_time=get_ist_now(),
+                last=entry, moved=price_change,
+                gap=base.get("gap"), atr_pct=atr_pct, adr20=adr20,
+                rvol=rvol, turn=base.get("turn_ma_cr"),
+                vwap_dist=dist_vwap, momentum_score=abs(price_change) * rvol,
+                still_valid=True,
+                drivers=[("Momentum", price_change), ("RVOL", rvol), ("VWAP Dist", dist_vwap)],
+                ticket=build_ticket(t, side, entry, sl_pct, capital),
+                low_conf=False,
+                passed_p=True,
+                scan_type="MOMENTUM"
+            ))
+        except Exception:
+            continue
+    D = pd.DataFrame(cands)
+    if D.empty:
+        return []
+    D = D.sort_values("momentum_score", ascending=False).head(top_n)
+    return D.to_dict("records")
 
 def orb_model_features(base, orb, pdh, pdl, pdc, nfctx, side):
     """Assemble the exact feature vector the intraday models expect."""
@@ -1738,77 +1801,6 @@ def scan_premarket(capital=None, bundle=None, use_nse=True):
 # ENGINE 2 — LIVE 5-MIN ORB  (09:20 onward). The money engine.
 # Close-confirmed break + capped stop + model ranking.
 # =============================================================================
-def scan_live_orb(capital=None, bundle=None, watch=None, orb_minutes=None):
-    capital = capital or CFG["DEFAULT_CAPITAL"]
-    om = orb_minutes or CFG["ORB_MINUTES"]
-    b = bundle or load_bundle()
-    if not b:
-        return dict(error="no data")
-    names = watch or liquid_names(b)
-    names = [t for t in names if feasible(b["snap"].get(t, {}), "L")[0]]
-    intraday = download(names, period="1d", interval="5m", ttl=45)
-    nf5 = download([NIFTY], period="1d", interval="5m", ttl=45).get(NIFTY)
-    nfctx = nifty_context(nf5, b["nfd"])
-    today = get_ist_now().date()
-    cands = []
-    for t, d in intraday.items():
-        try:
-            g = d.copy()
-            g.index = pd.DatetimeIndex(g.index)
-            if g.index.tz is not None:
-                g.index = g.index.tz_convert(IST)
-            g = g[g.index.date == today]
-            g = g[(g.index.time >= MKT_OPEN) & (g.index.time <= MKT_CLOSE)]
-            if len(g) < 1:
-                continue
-            orb = orb_from_bars(g, om)
-            if not orb:
-                continue
-            base = b["snap"].get(t, {})
-            pdh, pdl = b["prev"]["pdh"].get(t), b["prev"]["pdl"].get(t)
-            pdc = b["prev"]["pdc"].get(t)
-            for side, mdl, minp in (("L", MODEL_L, CFG["MIN_P_LONG"]),
-                                    ("S", MODEL_S, CFG["MIN_P_SHORT"])):
-                if not orb[f"{side}_trig"] or mdl is None:
-                    continue
-                fv = orb_model_features(base, orb, pdh, pdl, pdc, nfctx, side)
-                p = mdl.prob(fv)
-                entry = orb["orb_h"] if side == "L" else orb["orb_l"]
-                conf_entry = orb[f"{side}_entry"]        # actual confirmed close
-                opp = orb["orb_l"] if side == "L" else orb["orb_h"]
-                sl_pct = float(np.clip(abs(conf_entry - opp) / conf_entry * 100,
-                                       CFG["SL_FLOOR_PCT"], CFG["SL_CAP_PCT"]))
-                trig_min = orb[f"{side}_trig_min"]
-                moved = ((orb["last"] / conf_entry - 1) * 100) * (1 if side == "L" else -1)
-                cands.append(dict(
-                    ticker=t, sym=t.replace(".NS", ""), sector=sector_of(t),
-                    side="BUY" if side == "L" else "SELL", p=p, prob_pct=p * 100,
-                    orb_h=orb["orb_h"], orb_l=orb["orb_l"], orb_range_pct=orb["orb_range_pct"],
-                    entry=conf_entry, level=entry, sl_pct=sl_pct, trig_min=trig_min,
-                    trig_time=orb[f"{side}_trig_time"], last=orb["last"], moved=moved,
-                    gap=fv.get("gap_today"), atr_pct=base.get("atr_pct"),
-                    adr20=base.get("adr20"), rvol=base.get("rvol"),
-                    fc_vol_share=orb["fc_vol_share"], turn=base.get("turn_ma_cr"),
-                    still_valid=bool(moved < CFG["TARGET_PCT"] * 0.6 and moved > -sl_pct),
-                    drivers=mdl.top_drivers(fv, 4),
-                    ticket=build_ticket(t, "BUY" if side == "L" else "SELL",
-                                        conf_entry, sl_pct, capital),
-                    low_conf=(side == "S"),
-                    passed_p=bool(p >= minp),
-                ))
-        except Exception:
-            continue
-    D = pd.DataFrame(cands)
-    out = dict(ts=get_ist_now().isoformat(), regime=nfctx["regime"], nfctx=nfctx,
-               orb_minutes=om, n_triggers=int(len(D)), table=D, actionable=[])
-    if not D.empty:
-        act = D[(D.passed_p) & (D.still_valid)].copy()
-        act = act.sort_values(["p"], ascending=False).head(CFG["MAX_TRADES_DAY"] * 2)
-        out["actionable"] = act.to_dict("records")
-        out["all_ranked"] = D.sort_values("p", ascending=False).to_dict("records")
-    save_scan("live_orb", out)
-    return out
-
 # =============================================================================
 # ENGINE 3 — EOD  (after 15:40). TOP 5 for tomorrow, with tomorrow's plan.
 # =============================================================================
@@ -2115,7 +2107,7 @@ def _auto_loop():
                 scan_premarket(bundle=b)
                 _log("pre-market scan stored")
             elif ph in ("LIVE",) and now.time() <= CFG["LAST_ENTRY_TIME"]:
-                scan_live_orb(bundle=b)
+                scan_live_orb(bundle=b, as_of=now.date())
                 _log("live ORB refresh")
             elif ph == "POST" and dtime(15, 45) <= now.time() <= dtime(16, 30):
                 scan_eod(bundle=b)
@@ -2430,7 +2422,9 @@ def learn_profile():
 
 
 # =============================================================================
-# ENGINE 2 (v22) — LIVE 5-MIN ORB with the confluence gate. Overrides p3_scan.
+# ENGINE 2 (v22) — LIVE 5-MIN/15-MIN ORB with the confluence gate.
+# Time rules: No new ORB after 10:00 AM. After 12:30 PM -> Momentum scan.
+# Multi-timeframe: Daily (macro) + 1H (context) + 5m/15m ORB (execution)
 # =============================================================================
 def scan_live_orb(capital=None, bundle=None, watch=None, orb_minutes=None,
                   top_n=None, bars=None, as_of=None, log=True):
@@ -2443,7 +2437,15 @@ def scan_live_orb(capital=None, bundle=None, watch=None, orb_minutes=None,
     day = as_of or get_ist_now().date()
     if isinstance(day, str):
         day = pd.Timestamp(day).date()
-
+    
+    now = get_ist_now()
+    current_time = now.time()
+    
+    # Time-based logic
+    is_live = as_of is None and market_phase() in ("ORB", "LIVE")
+    no_new_orb = current_time >= dtime(10, 0)
+    momentum_time = current_time >= dtime(12, 30)
+    
     if bars is None:
         names = watch or liquid_names(b)
         intraday = download(names, period="1d", interval="5m", ttl=45)
@@ -2451,9 +2453,14 @@ def scan_live_orb(capital=None, bundle=None, watch=None, orb_minutes=None,
         intraday = bars
     nf5 = download([NIFTY], period="1d" if as_of is None else "5d", interval="5m", ttl=45).get(NIFTY)
     nfctx = nifty_context(nf5, b["nfd"])
+    
+    # Fetch 1-hour data for context
+    hourly = download(names if bars is None else list(bars.keys()), 
+                      period="10d", interval="60m", ttl=300)
 
     # --- pass 1: opening candle of every name -> sector strength context -------
     orbs, early = {}, {}
+    orb_timeframes = [5, 15] if CFG.get("MULTI_TF_ORB", True) else [om]
     for t, d in intraday.items():
         try:
             g = d.copy()
@@ -2464,70 +2471,104 @@ def scan_live_orb(capital=None, bundle=None, watch=None, orb_minutes=None,
             g = g[(g.index.time >= MKT_OPEN) & (g.index.time <= MKT_CLOSE)]
             if len(g) < 1:
                 continue
-            o = orb_from_bars(g, om)
-            if not o:
-                continue
-            orbs[t] = o
+            # Compute ORB for each timeframe
+            tf_orbs = {}
+            for tf in orb_timeframes:
+                o = orb_from_bars(g, tf)
+                if o:
+                    tf_orbs[tf] = o
+            if tf_orbs:
+                orbs[t] = tf_orbs
             pdc = b["prev"]["pdc"].get(t)
-            if pdc:
-                early[t.replace(".NS", "")] = (o["orb_c"] / pdc - 1) * 100
+            if pdc and om in tf_orbs:
+                early[t.replace(".NS", "")] = (tf_orbs[om]["orb_c"] / pdc - 1) * 100
         except Exception:
             continue
     sec_ctx = sector_early_context(early)
 
     # --- pass 2: score every confirmed break ---------------------------------
     cands = []
-    for t, orb in orbs.items():
-        base = b["snap"].get(t, {}) or {}
-        prev = dict(pdh=b["prev"]["pdh"].get(t), pdl=b["prev"]["pdl"].get(t),
-                    pdc=b["prev"]["pdc"].get(t))
-        piv_d = (b["piv"].get(t, {}) or {}).get("D", {}) or {}
-        sym = t.replace(".NS", "")
-        for side, mdl, mdl3, minp in (("L", MODEL_L, MODEL_L3, CFG["MIN_P_LONG"]),
-                                      ("S", MODEL_S, MODEL_S3, CFG["MIN_P_SHORT"])):
-            if not orb.get(f"{side}_trig") or mdl is None:
-                continue
-            gate_ok, gate_why = passes_confluence_gate(base, orb, side)
-            fv = v22_features(base, orb, prev, piv_d, side, sec_ctx, sym)
-            p = mdl.prob(fv)
-            p3 = mdl3.prob(fv) if mdl3 else np.nan
-            conf_entry = orb[f"{side}_entry"]
-            sl_pct = fv["sl_pct"]
-            moved = ((orb["last"] / conf_entry - 1) * 100) * (1 if side == "L" else -1)
-            cands.append(dict(
-                ticker=t, sym=sym, sector=sector_of(t),
-                side="BUY" if side == "L" else "SELL", p=p, prob_pct=p * 100,
-                p3=p3, p3_pct=(p3 * 100 if p3 == p3 else np.nan),
-                orb_h=orb["orb_h"], orb_l=orb["orb_l"],
-                orb_range_pct=orb["orb_range_pct"], entry=conf_entry,
-                level=orb["orb_h"] if side == "L" else orb["orb_l"],
-                sl_pct=sl_pct, trig_min=orb.get(f"{side}_trig_min"),
-                trig_time=orb.get(f"{side}_trig_time"), last=orb["last"], moved=moved,
-                gap=fv["gap"], atr_pct=base.get("atr_pct"), adr20=base.get("adr20"),
-                rvol=base.get("rvol"), turn=base.get("turn_ma_cr"),
-                sec_early=fv["sec_early"], sec_rel=fv["sec_rel"],
-                sec_breadth=fv["sec_breadth"], stk_rel=fv["stk_rel"],
-                orb_h_R1=fv["orb_h_R1"], above_R1=fv["above_R1"],
-                below_S1=fv["below_S1"],
-                gate_pass=gate_ok, gate_note="; ".join(gate_why),
-                still_valid=bool(moved < CFG["TARGET_PCT"] * 0.6 and moved > -sl_pct),
-                drivers=mdl.top_drivers(fv, 5),
-                ticket=build_ticket(t, "BUY" if side == "L" else "SELL",
-                                    conf_entry, sl_pct, capital),
-                low_conf=(side == "S"),
-                passed_p=bool(p >= minp),
-            ))
+    gen_time = get_ist_now()
+    
+    if not no_new_orb and not momentum_time:
+        # Normal ORB scan
+        for t, tf_orbs in orbs.items():
+            base = b["snap"].get(t, {}) or {}
+            prev = dict(pdh=b["prev"]["pdh"].get(t), pdl=b["prev"]["pdl"].get(t),
+                        pdc=b["prev"]["pdc"].get(t))
+            piv_d = (b["piv"].get(t, {}) or {}).get("D", {}) or {}
+            sym = t.replace(".NS", "")
+            
+            # Add 1-hour context
+            h1_ctx = {}
+            if t in hourly:
+                h1 = hourly[t]
+                if len(h1) > 20:
+                    h1_close = h1.Close.iloc[-1]
+                    h1_ema20 = h1.Close.ewm(span=20).mean().iloc[-1]
+                    h1_rsi = _rsi_df(h1.Close).iloc[-1]
+                    h1_trend = 1 if h1_close > h1_ema20 else -1
+                    h1_ctx = dict(h1_trend=h1_trend, h1_rsi=h1_rsi, 
+                                 h1_vs_ema20=((h1_close/h1_ema20)-1)*100)
+            
+            for tf, orb in tf_orbs.items():
+                for side, mdl, mdl3, minp in (("L", MODEL_L, MODEL_L3, CFG["MIN_P_LONG"]),
+                                              ("S", MODEL_S, MODEL_S3, CFG["MIN_P_SHORT"])):
+                    if not orb.get(f"{side}_trig") or mdl is None:
+                        continue
+                    gate_ok, gate_why = passes_confluence_gate(base, orb, side)
+                    fv = v22_features(base, orb, prev, piv_d, side, sec_ctx, sym)
+                    fv.update(h1_ctx)
+                    p = mdl.prob(fv)
+                    p3 = mdl3.prob(fv) if mdl3 else np.nan
+                    conf_entry = orb[f"{side}_entry"]
+                    sl_pct = fv["sl_pct"]
+                    moved = ((orb["last"] / conf_entry - 1) * 100) * (1 if side == "L" else -1)
+                    cands.append(dict(
+                        ticker=t, sym=sym, sector=sector_of(t),
+                        side="BUY" if side == "L" else "SELL", p=p, prob_pct=p * 100,
+                        p3=p3, p3_pct=(p3 * 100 if p3 == p3 else np.nan),
+                        orb_h=orb["orb_h"], orb_l=orb["orb_l"],
+                        orb_minutes=orb["orb_minutes"],
+                        orb_range_pct=orb["orb_range_pct"], entry=conf_entry,
+                        level=orb["orb_h"] if side == "L" else orb["orb_l"],
+                        sl_pct=sl_pct, trig_min=orb.get(f"{side}_trig_min"),
+                        trig_time=orb.get(f"{side}_trig_time"), last=orb["last"], moved=moved,
+                        gap=fv["gap"], atr_pct=base.get("atr_pct"), adr20=base.get("adr20"),
+                        rvol=base.get("rvol"), turn=base.get("turn_ma_cr"),
+                        sec_early=fv["sec_early"], sec_rel=fv["sec_rel"],
+                        sec_breadth=fv["sec_breadth"], stk_rel=fv["stk_rel"],
+                        h1_trend=h1_ctx.get("h1_trend"), h1_rsi=h1_ctx.get("h1_rsi"),
+                        h1_vs_ema20=h1_ctx.get("h1_vs_ema20"),
+                        gate_pass=gate_ok, gate_note="; ".join(gate_why),
+                        still_valid=bool(moved < CFG["TARGET_PCT"] * 0.6 and moved > -sl_pct),
+                        drivers=mdl.top_drivers(fv, 5),
+                        ticket=build_ticket(t, "BUY" if side == "L" else "SELL",
+                                            conf_entry, sl_pct, capital),
+                        low_conf=(side == "S"),
+                        passed_p=bool(p >= minp),
+                        gen_time=gen_time,
+                        scan_type="ORB"
+                    ))
+    elif momentum_time:
+        # After 12:30 PM - momentum scan
+        mom_signals = scan_momentum_stocks(b, capital, day, nfctx, top_n)
+        cands.extend(mom_signals)
+    
     D = pd.DataFrame(cands)
     out = dict(ts=fmt_ist(), for_date=str(day), regime=nfctx["regime"], nfctx=nfctx,
                orb_minutes=om, n_triggers=int(len(D)), top_n=top_n,
                sector_early=sec_ctx[1], mkt_early=sec_ctx[0],
+               scan_mode="ORB" if not no_new_orb and not momentum_time 
+                         else ("MOMENTUM" if momentum_time else "ORB_ENDED"),
                table=D, actionable=[], rejected=[])
-    # `still_valid` only makes sense while the market is actually open: it asks
-    # "has price already run away from the confirmed break?". Post-close and in
-    # replay, `last` is the day's close, so enforcing it would reject everything
-    # and the tab would look empty for the wrong reason.
+    
     live_now = (as_of is None and market_phase() in ("ORB", "LIVE"))
     out["valid_enforced"] = bool(live_now)
+    out["orb_allowed"] = not no_new_orb
+    out["momentum_mode"] = momentum_time
+    out["current_time"] = fmt_time(now)
+    
     if not D.empty:
         sel = D.gate_pass & D.passed_p
         if live_now:
@@ -2574,6 +2615,116 @@ def _replay_bars(day_str, tickers):
         except Exception:
             continue
     return out
+
+
+def run_backtest(start_date, end_date, capital=None, bundle=None, top_n=None, 
+                 orb_minutes=5, use_multi_tf=True):
+    """
+    Comprehensive backtest across multiple sessions.
+    Returns aggregated statistics for strategy validation.
+    """
+    capital = capital or CFG["DEFAULT_CAPITAL"]
+    b = bundle or load_bundle(days="500d")
+    if not b:
+        return dict(error="no data")
+    
+    C = b["px"]["Close"]
+    dates = [x.date() for x in pd.DatetimeIndex(C.index)]
+    
+    # Filter trading days in range
+    trading_days = [d for d in dates 
+                    if start_date <= d <= end_date and is_trading_day(d)]
+    
+    if not trading_days:
+        return dict(error="no trading days in range")
+    
+    all_results = []
+    all_trades = []
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, day in enumerate(trading_days):
+        status_text.text(f"Backtesting {day}... ({i+1}/{len(trading_days)})")
+        progress_bar.progress((i + 1) / len(trading_days))
+        
+        pos = dates.index(day)
+        snap_prev = snapshot(b["F"], when=pos - 1)
+        bb = dict(b)
+        bb["snap"] = snap_prev
+        O, H, L = b["px"]["Open"], b["px"]["High"], b["px"]["Low"]
+        bb["prev"] = dict(pdh={t: float(H[t].iloc[pos - 1]) for t in C.columns},
+                          pdl={t: float(L[t].iloc[pos - 1]) for t in C.columns},
+                          pdc={t: float(C[t].iloc[pos - 1]) for t in C.columns})
+        
+        names = [t for t in C.columns
+                 if (snap_prev.get(t, {}) or {}).get("turn_ma_cr", 0) >= CFG["MIN_TURNOVER_CR"]]
+        
+        bars = _replay_bars(str(day), names)
+        if not bars:
+            continue
+            
+        res = scan_live_orb(capital=capital, bundle=bb, orb_minutes=orb_minutes,
+                            top_n=top_n, bars=bars, as_of=day, log=False)
+        
+        for r in res.get("actionable", []):
+            g = bars.get(r["ticker"])
+            if g is None:
+                continue
+            outcome = _replay_outcome(g, r)
+            r.update(outcome)
+            r["date"] = str(day)
+            all_trades.append(r)
+        
+        all_results.append(dict(
+            date=str(day),
+            n_signals=len(res.get("actionable", [])),
+            regime=res.get("regime"),
+            scan_mode=res.get("scan_mode")
+        ))
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    if not all_trades:
+        return dict(error="no trades generated", days_tested=len(trading_days))
+    
+    # Aggregate statistics
+    df = pd.DataFrame(all_trades)
+    df["pnl_pct"] = pd.to_numeric(df.get("rp_pnl_pct", 0), errors="coerce").fillna(0)
+    df["mfe_pct"] = pd.to_numeric(df.get("rp_mfe_pct", 0), errors="coerce").fillna(0)
+    df["result"] = df.get("rp_result", "unknown")
+    
+    wins = df[df["pnl_pct"] > 0]
+    losses = df[df["pnl_pct"] <= 0]
+    
+    stats = dict(
+        total_days=len(trading_days),
+        total_trades=len(df),
+        win_rate=len(wins) / len(df) * 100 if len(df) > 0 else 0,
+        avg_win=wins["pnl_pct"].mean() if len(wins) > 0 else 0,
+        avg_loss=losses["pnl_pct"].mean() if len(losses) > 0 else 0,
+        expectancy=df["pnl_pct"].mean(),
+        total_pnl=df["pnl_pct"].sum(),
+        avg_mfe=df["mfe_pct"].mean(),
+        max_dd=df["pnl_pct"].min(),
+        max_runup=df["pnl_pct"].max(),
+        profit_factor=abs(wins["pnl_pct"].sum() / losses["pnl_pct"].sum()) if losses["pnl_pct"].sum() != 0 else float('inf'),
+        by_result=df["result"].value_counts().to_dict(),
+        by_side=df["side"].value_counts().to_dict(),
+        by_orb_tf=df.get("orb_minutes", pd.Series()).value_counts().to_dict() if "orb_minutes" in df.columns else {},
+        trades=df.to_dict("records"),
+        daily=all_results
+    )
+    
+    # Save backtest results
+    try:
+        bt_path = os.path.join(DIRS["perf"], f"backtest_{start_date}_{end_date}.json")
+        json.dump(_json_safe(stats), open(bt_path, "w"), indent=1)
+    except Exception:
+        pass
+    
+    return stats
 
 
 def replay_session(day, capital=None, bundle=None, top_n=None):
@@ -2728,11 +2879,19 @@ def chip(txt, kind="neutral"):
 
 def money(x):
     try:
-        return f"₹{float(x):,.2f}"
+        v = float(x)
+        if not np.isfinite(v):
+            return "—"
+        if v >= 10000000:
+            return f"₹{v/10000000:.2f}Cr"
+        elif v >= 100000:
+            return f"₹{v/100000:.2f}L"
+        else:
+            return f"₹{v:,.0f}"
     except Exception:
         return "—"
 
-def pct(x, d=2):
+def pct(x, d=1):
     try:
         v = float(x)
         if not np.isfinite(v):
@@ -2741,33 +2900,96 @@ def pct(x, d=2):
     except Exception:
         return "—"
 
-def num(x, d=2):
+def num(x, d=1):
     try:
         v = float(x)
-        return "—" if not np.isfinite(v) else f"{v:.{d}f}"
+        if not np.isfinite(v):
+            return "—"
+        if abs(v) >= 10000000:
+            return f"{v/10000000:.2f}Cr"
+        elif abs(v) >= 100000:
+            return f"{v/100000:.2f}L"
+        else:
+            return f"{v:.{d}f}"
     except Exception:
         return "—"
 
-def ticket_card(tk, prob=None, extra_rows=None, low_conf=False, ladder=None):
+def fmt_time(dt=None):
+    """Format time as HH:MM:SS"""
+    if dt is None:
+        dt = get_ist_now()
+    if isinstance(dt, str):
+        try:
+            dt = pd.Timestamp(dt)
+        except Exception:
+            return dt
+    return dt.strftime("%H:%M:%S")
+
+def fmt_dt(dt=None):
+    """Format datetime as DD Mon HH:MM:SS"""
+    if dt is None:
+        dt = get_ist_now()
+    if isinstance(dt, str):
+        try:
+            dt = pd.Timestamp(dt)
+        except Exception:
+            return dt
+    return dt.strftime("%d %b %H:%M:%S")
+
+def tooltip(text, label=None):
+    """Create a tooltip-enabled span"""
+    if label:
+        return f"<span title='{text}' style='cursor:help;border-bottom:1px dotted #888'>{label}</span>"
+    return f"<span title='{text}' style='cursor:help'>ℹ️</span>"
+
+def colored_dot(color, size=10):
+    """Return a colored dot HTML"""
+    return f"<span style='display:inline-block;width:{size}px;height:{size}px;border-radius:50%;background:{color};margin-right:6px;vertical-align:middle'></span>"
+
+def regime_badge(regime):
+    """Return colored regime badge"""
+    colors = {"BULL": "#0ecb81", "BEAR": "#f6465d", "NEUTRAL": "#f0b90b"}
+    c = colors.get(regime, "#8f96b3")
+    return f"<span style='background:{c}22;border:1px solid {c}66;color:{c};padding:2px 10px;border-radius:20px;font-size:11px;font-weight:700'>{regime}</span>"
+
+def side_badge(side):
+    """Return colored side badge"""
+    if side == "BUY":
+        return f"{colored_dot('#0ecb81', 8)}<span style='color:#0ecb81;font-weight:700'>BUY</span>"
+    elif side == "SELL":
+        return f"{colored_dot('#f6465d', 8)}<span style='color:#f6465d;font-weight:700'>SELL</span>"
+    return side
+
+def ticket_card(tk, prob=None, extra_rows=None, low_conf=False, ladder=None, gen_time=None, sl_hit_time=None, tg_hit_time=None):
     side = tk["side"]
     accent = "#0ecb81" if side == "BUY" else "#f6465d"
     warn = ("<div style='margin-top:8px;font-size:11px;color:#f0b90b'>"
             "⚠ LOW-CONFIDENCE SIDE — short ORB showed no reliable edge in "
             "walk-forward testing. Half size or skip.</div>") if low_conf else ""
-    pr = (f"<div style='font-size:12px;color:#8f96b3'>model probability of hitting target "
+    pr = (f"<div style='font-size:12px;color:#8f96b3'>Model Probability: "
           f"<b style='color:#e2e4ef'>{prob*100:.1f}%</b></div>") if prob is not None else ""
+    rr = tk.get('rr', 0)
+    rr_color = "#0ecb81" if rr >= 2 else "#f0b90b" if rr >= 1.5 else "#f6465d"
     rows = ""
     for k, v in (extra_rows or []):
         rows += (f"<div style='display:flex;justify-content:space-between;font-size:12px;"
-                 f"padding:2px 0'><span style='color:#8f96b3'>{k}</span>"
+                 f"padding:2px 0'><span style='color:#8f96b3'>{tooltip(k)}</span>"
                  f"<span style='color:#e2e4ef;font-weight:600'>{v}</span></div>")
     lad = ""
     if ladder:
-        lad = "<div style='margin-top:8px;font-size:12px;color:#8f96b3'>Exit ladder</div>"
-        for _lg in ladder:  # never name this 'st' — it shadows streamlit
+        lad = "<div style='margin-top:8px;font-size:12px;color:#8f96b3'>Exit Ladder</div>"
+        for _lg in ladder:
             lad += (f"<div style='display:flex;justify-content:space-between;font-size:12px'>"
                     f"<span style='color:#8f96b3'>+{_lg['pct']:.0f}% → book {_lg['book']}</span>"
                     f"<span style='color:#0ecb81;font-weight:700'>{money(_lg['px'])}</span></div>")
+    time_rows = ""
+    if gen_time:
+        time_rows += f"<div style='display:flex;justify-content:space-between;font-size:11px;padding:2px 0'><span style='color:#8f96b3'>{tooltip('Signal generation time', 'Generated')}</span><span style='color:#e2e4ef;font-weight:600'>{fmt_time(gen_time)}</span></div>"
+    if sl_hit_time:
+        time_rows += f"<div style='display:flex;justify-content:space-between;font-size:11px;padding:2px 0'><span style='color:#f6465d'>{tooltip('Stop loss hit time', 'SL Hit')}</span><span style='color:#f6465d;font-weight:600'>{fmt_time(sl_hit_time)}</span></div>"
+    if tg_hit_time:
+        time_rows += f"<div style='display:flex;justify-content:space-between;font-size:11px;padding:2px 0'><span style='color:#0ecb81'>{tooltip('Target hit time', 'Target Hit')}</span><span style='color:#0ecb81;font-weight:600'>{fmt_time(tg_hit_time)}</span></div>"
+    t2_label = f"Target 2 ({tk['target_pct']:.0f}%)"
     st.markdown(f"""
 <div style="background:linear-gradient(145deg,#11141f,#0d1018);border:1px solid {accent}55;
      border-left:4px solid {accent};border-radius:14px;padding:16px 18px;margin-bottom:12px">
@@ -2775,7 +2997,7 @@ def ticket_card(tk, prob=None, extra_rows=None, low_conf=False, ladder=None):
     <div>
       <span style="font-size:20px;font-weight:800;color:#fff">{tk['symbol']}</span>
       <span style="background:{accent};color:#06070d;padding:2px 10px;border-radius:6px;
-            font-size:12px;font-weight:800;margin-left:8px">{side}</span>
+            font-size:12px;font-weight:800;margin-left:8px">{side_badge(side)}</span>
     </div>
     <div style="text-align:right">
       <div style="font-size:11px;color:#8f96b3">QTY</div>
@@ -2784,21 +3006,22 @@ def ticket_card(tk, prob=None, extra_rows=None, low_conf=False, ladder=None):
   </div>
   {pr}
   <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:12px">
-    <div><div style="font-size:10px;color:#8f96b3">ENTRY</div>
+    <div><div style="font-size:10px;color:#8f96b3">{tooltip('Entry price', 'ENTRY')}</div>
          <div style="font-size:16px;font-weight:700;color:#fff;font-family:JetBrains Mono,monospace">{money(tk['entry'])}</div></div>
-    <div><div style="font-size:10px;color:#f6465d">STOP LOSS</div>
+    <div><div style="font-size:10px;color:#f6465d">{tooltip('Stop loss price', 'STOP LOSS')}</div>
          <div style="font-size:16px;font-weight:700;color:#f6465d;font-family:JetBrains Mono,monospace">{money(tk['sl'])}</div>
-         <div style="font-size:10px;color:#8f96b3">−{tk['sl_pct']}%</div></div>
-    <div><div style="font-size:10px;color:#0ecb81">TARGET 1 (book 50%)</div>
+         <div style="font-size:10px;color:#8f96b3">−{tk['sl_pct']:.1f}%</div></div>
+    <div><div style="font-size:10px;color:#0ecb81">{tooltip('Target 1 - book 50%', 'TARGET 1')}</div>
          <div style="font-size:16px;font-weight:700;color:#0ecb81;font-family:JetBrains Mono,monospace">{money(tk['t1'])}</div></div>
-    <div><div style="font-size:10px;color:#0ecb81">TARGET 2 ({tk['target_pct']}%)</div>
+    <div><div style="font-size:10px;color:#0ecb81">{tooltip(t2_label, 'TARGET 2')}</div>
          <div style="font-size:16px;font-weight:700;color:#0ecb81;font-family:JetBrains Mono,monospace">{money(tk['t2'])}</div></div>
   </div>
   <div style="display:flex;gap:18px;margin-top:10px;font-size:11px;color:#8f96b3">
-    <span>Risk {money(tk['risk_rs'])}</span><span>Reward {money(tk['reward_rs'])}</span>
-    <span>R:R 1:{tk['rr']}</span>
+    <span>Risk {money(tk['risk_rs'])}</span>
+    <span>Reward {money(tk['reward_rs'])}</span>
+    <span style="color:{rr_color};font-weight:700">R:R 1:{rr:.1f}</span>
   </div>
-  {rows}{lad}{warn}
+  {rows}{lad}{time_rows}{warn}
 </div>""", unsafe_allow_html=True)
 
 def pivot_table(piv):
@@ -2893,13 +3116,25 @@ def _clean(df, cols=None, rename=None, r=2):
 
 SIG_COLS = ["sym", "sector", "side", "entry", "sl_pct", "prob_pct", "p3_pct",
             "trig_min", "orb_range_pct", "atr_pct", "adr20", "gap", "sec_rel",
-            "sec_breadth", "moved", "last"]
+            "sec_breadth", "moved", "last", "rr", "gen_time", "sl_hit_time", "tg_hit_time"]
 SIG_NAMES = {"sym": "Symbol", "sector": "Sector", "side": "Side", "entry": "Entry",
              "sl_pct": "SL %", "prob_pct": "P(+2%) %", "p3_pct": "P(+3%) %",
              "trig_min": "Break @min", "orb_range_pct": "ORB range %",
              "atr_pct": "ATR %", "adr20": "ADR %", "gap": "Gap %",
              "sec_rel": "Sector vs mkt %", "sec_breadth": "Sector breadth %",
-             "moved": "Moved since %", "last": "Last"}
+             "moved": "Moved since %", "last": "Last", "rr": "R:R",
+             "gen_time": "Gen Time", "sl_hit_time": "SL Hit", "tg_hit_time": "TG Hit"}
+SIG_TOOLTIPS = {
+    "sym": "Trading symbol", "sector": "Sector classification", "side": "Trade direction (BUY/SELL)",
+    "entry": "Entry price", "sl_pct": "Stop loss percentage from entry",
+    "prob_pct": "Model probability of hitting +2% target", "p3_pct": "Model probability of hitting +3% target",
+    "trig_min": "Minutes after open when break confirmed", "orb_range_pct": "Opening range width %",
+    "atr_pct": "ATR as % of price", "adr20": "20-day ADR %", "gap": "Gap at open %",
+    "sec_rel": "Sector strength vs market", "sec_breadth": "% of sector stocks up",
+    "moved": "Price moved since entry %", "last": "Last traded price",
+    "rr": "Risk:Reward ratio", "gen_time": "Signal generation time",
+    "sl_hit_time": "Stop loss hit time", "tg_hit_time": "Target hit time"
+}
 
 
 def signal_list(rows, key, qty=True):
@@ -2915,12 +3150,23 @@ def signal_list(rows, key, qty=True):
             d["Qty"] = tk.get("qty")
             d["Stop"] = tk.get("sl")
             d["Target"] = tk.get("target")
+        # Add R:R if available
+        d["R:R"] = tk.get("rr", r.get("rr", 0))
+        # Add timestamps
+        d["Gen Time"] = fmt_time(r.get("gen_time") or r.get("trig_time"))
+        d["SL Hit"] = fmt_time(r.get("sl_hit_time"))
+        d["TG Hit"] = fmt_time(r.get("tg_hit_time"))
         recs.append(d)
     D = pd.DataFrame(recs)
     for c in D.columns:
         if pd.api.types.is_numeric_dtype(D[c]):
             D[c] = D[c].astype(float).round(2)
-    st.dataframe(_shade(D, "P(+2%) %"), width="stretch", hide_index=True)
+    # Apply tooltips to column headers via markdown
+    col_config = {}
+    for c in D.columns:
+        if c in SIG_TOOLTIPS:
+            col_config[c] = st.column_config.Column(SIG_TOOLTIPS[c], help=SIG_TOOLTIPS[c])
+    st.dataframe(_shade(D, "P(+2%) %"), width="stretch", hide_index=True, column_config=col_config)
     dl(D, f"{key}.csv", key)
 
 
@@ -2929,6 +3175,9 @@ def signal_cards(rows, capital_note=True):
         st.caption("nothing to show")
         return
     for r in rows:
+        gen_time = r.get("gen_time") or r.get("trig_time")
+        sl_hit_time = r.get("sl_hit_time")
+        tg_hit_time = r.get("tg_hit_time")
         extra = [("Model P(+2%)", f"{num(r.get('prob_pct'), 1)}%"),
                  ("Model P(+3%)", f"{num(r.get('p3_pct'), 1)}%"),
                  ("Break confirmed at", f"+{num(r.get('trig_min'), 0)} min"),
@@ -2937,12 +3186,14 @@ def signal_cards(rows, capital_note=True):
                  ("Gap", pct(r.get("gap"))),
                  ("Sector vs market", pct(r.get("sec_rel"))),
                  ("Sector breadth (up names)", f"{num(r.get('sec_breadth'), 0)}%"),
-                 ("Moved since entry", pct(r.get("moved")))]
+                 ("Moved since entry", pct(r.get("moved"))),
+                 ("R:R Ratio", f"1:{num(r.get('rr', r.get('ticket', {}).get('rr', 0)))}")]
         if r.get("rp_result"):
             extra.append(("REPLAY RESULT", f"{r['rp_result']} · "
                                            f"{pct(r.get('rp_pnl_pct'))} · MFE {num(r.get('rp_mfe_pct'))}%"))
         ticket_card(r["ticket"], prob=r.get("p"), extra_rows=extra,
-                    low_conf=bool(r.get("low_conf")))
+                    low_conf=bool(r.get("low_conf")), gen_time=gen_time,
+                    sl_hit_time=sl_hit_time, tg_hit_time=tg_hit_time)
         drv = r.get("drivers") or []
         if drv:
             st.caption("why this name ranked here: " +
@@ -3004,14 +3255,14 @@ ptxt, pkind = PHASE_TXT.get(ph, (ph, "neutral"))
 
 st.markdown("<div class='main-header'>⚡ QUANT-EDGE v22 — Institutional ORB Terminal</div>",
             unsafe_allow_html=True)
-st.markdown("<div class='sub-caption'>Point-in-time NSE F&amp;O universe (295 names, 56 "
-            "monthly snapshots) · 269,147 close-confirmed 5-min ORB events over 1,147 "
-            "sessions · corrected sequential win/stop labels · real 5-min volume "
-            "(99.96% coverage) · walk-forward expectancy shown below, unretouched</div>",
+st.markdown("<div class='sub-caption'>Multi-TF: Daily (macro) + 1H (context) + 5m/15m ORB (execution) · "
+            "Point-in-time NSE F&O universe · Walk-forward expectancy shown · Paper mode</div>",
             unsafe_allow_html=True)
 c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
-c1.markdown(chip(ptxt, pkind), unsafe_allow_html=True)
-c2.markdown(f"<div class='last-updated'>{fmt_ist()}</div>", unsafe_allow_html=True)
+c1.markdown(f"**Market Phase:** {chip(ptxt, pkind)}", unsafe_allow_html=True)
+c2.markdown(f"**Regime:** {regime_badge('NEUTRAL')}", unsafe_allow_html=True)
+c3.markdown(f"**Time:** {fmt_time(get_ist_now())}")
+c4.markdown(f"<div class='last-updated'>{fmt_ist()}</div>", unsafe_allow_html=True)
 
 # =============================================================================
 # SIDEBAR
@@ -3029,6 +3280,15 @@ with st.sidebar:
     CFG["SHORT_TOP_N"] = 1 if st.checkbox("Show the short side too", value=True,
                                           help="Short ORB expectancy was -0.03%/trade "
                                                "in walk-forward. Shown, never recommended.") else 0
+    
+    # Multi-timeframe settings
+    st.divider()
+    st.markdown("#### Multi-Timeframe")
+    CFG["MULTI_TF_ORB"] = st.checkbox("5-min + 15-min ORB (both)", value=CFG.get("MULTI_TF_ORB", True),
+                                       help="Scan both 5-min and 15-min ORB for intraday")
+    st.caption("Intraday: Daily (macro) + 1H (context) + 5m/15m ORB (entry)")
+    st.caption("Swing: Daily (full-day) + 1H/2H ORB (entry)")
+    
     st.divider()
     st.markdown("#### Automation")
     a1, a2 = st.columns(2)
@@ -3155,15 +3415,15 @@ TABS = st.tabs(["🌅 Pre-Market (09:08)", "⚡ Live ORB", "🌙 EOD → Tomorro
 with TABS[0]:
     st.markdown("#### Top 1 BUY + Top 1 SELL for today")
     st.caption("Run between 09:00 and 09:08. Reads the live NSE pre-open call auction. "
-               "This is a WATCHLIST, not the order — the order is the 5-min ORB break "
-               "on the Live ORB tab.")
+               "This is a WATCHLIST, not the order — the order is the 5-min/15-min ORB break "
+               "on the Live ORB tab. Multi-TF: Daily (macro) + 1H (context) + 5m/15m ORB (execution)")
     if st.button("🌅 Run pre-market scan", type="primary", key="btn_pm"):
         with st.spinner("reading NSE pre-open book + building features…"):
             st.session_state.res_pm = scan_premarket(capital=capital)
     res = st.session_state.get("res_pm") or load_scan("premarket")
     if res and not res.get("error"):
-        st.caption(f"source: {res.get('source')} · regime {res.get('regime')} · "
-                   f"{res.get('n_candidates')} feasible names")
+        st.caption(f"source: {res.get('source')} · {regime_badge(res.get('regime', '—'))} · "
+                   f"{res.get('n_candidates')} feasible names", unsafe_allow_html=True)
         if "previous close" in str(res.get("source", "")):
             st.warning("NSE pre-open feed unavailable — gaps assumed flat. Re-run after "
                        "09:02, or use the Live ORB tab, which never needs pre-open data.")
@@ -3174,14 +3434,13 @@ with TABS[0]:
             for lbl, arr in (("BUY", L), ("SELL", S)):
                 for i, c in enumerate(arr, 1):
                     r = c["row"]
-                    recs.append({"#": i, "Side": lbl, "Symbol": r["sym"],
+                    recs.append({"#": i, "Side": side_badge(lbl), "Symbol": r["sym"],
                                  "Sector": r.get("sector"),
-                                 "Exp. open": round(r.get("exp_open") or 0, 2),
-                                 "Gap %": round(r.get("gap") or 0, 2),
-                                 "ATR %": round(r.get("atr_pct") or 0, 2),
-                                 "ADR %": round(r.get("adr20") or 0, 2),
-                                 "P(move) %": round((r.get("p_up") if lbl == "BUY"
-                                                     else r.get("p_dn")) or 0, 1),
+                                 "Exp. open": money(r.get("exp_open") or 0),
+                                 "Gap %": pct(r.get("gap") or 0),
+                                 "ATR %": num(r.get("atr_pct") or 0, 1),
+                                 "ADR %": num(r.get("adr20") or 0, 1),
+                                 "P(move) %": f"{num((r.get('p_up') if lbl == 'BUY' else r.get('p_dn')) or 0, 1)}%",
                                  "Days ≥2.5% / 20": r.get("big20"),
                                  "Qty": (c.get("ticket") or {}).get("qty")})
             D = pd.DataFrame(recs)
@@ -3226,35 +3485,64 @@ with TABS[0]:
 
 # ---------------------------------------------------------------- LIVE ORB
 with TABS[1]:
-    st.markdown(f"#### The order — top {CFG['INTRADAY_TOP_N']} close-confirmed 5-min ORB break")
-    st.caption("Entry = the CLOSE of the first 5-min candle beyond the opening range. "
+    st.markdown(f"#### The order — top {CFG['INTRADAY_TOP_N']} close-confirmed 5-min/15-min ORB break")
+    st.caption("Entry = the CLOSE of the first 5-min/15-min candle beyond the opening range. "
                "Requiring the close instead of a touch is the single biggest lever measured "
-               "in the study. Stop is capped at 1.0%. Half off at +1%, then stop to breakeven.")
+               "in the study. Stop is capped at 1.0%. Half off at +1%, then stop to breakeven. "
+               "⏰ No new ORB after 10:00 AM · 📈 Momentum scan after 12:30 PM")
+    
+    # Time status indicator
+    now = get_ist_now()
+    current_time = now.time()
+    orb_allowed = current_time < dtime(10, 0)
+    momentum_mode = current_time >= dtime(12, 30)
+    
+    tcol1, tcol2, tcol3 = st.columns([1, 1, 2])
+    with tcol1:
+        st.markdown(f"**Mode:** {regime_badge('ORB' if orb_allowed and not momentum_mode else 'MOMENTUM' if momentum_mode else 'CLOSED')}")
+    with tcol2:
+        st.markdown(f"**Time:** {fmt_time(now)}")
+    with tcol3:
+        if not orb_allowed and not momentum_mode:
+            st.warning("⏰ ORB window closed (10:00 AM). Waiting for momentum window (12:30 PM).")
+        elif momentum_mode:
+            st.info("📈 Momentum mode active - scanning for high-volume trend continuation")
+        else:
+            st.success("✅ ORB window active - scanning for breakouts")
+    
     cc1, cc2 = st.columns([1, 3])
     if cc1.button("⚡ Scan live ORB", type="primary", key="btn_orb"):
-        with st.spinner("pulling 5-min bars for the whole F&O list…"):
+        with st.spinner("pulling 5-min/15-min bars + 1H context for the whole F&O list…"):
             st.session_state.res_orb = scan_live_orb(capital=capital)
     res = st.session_state.get("res_orb") or load_scan("live_orb")
     if res and not res.get("error"):
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Confirmed breaks", res.get("n_triggers", 0))
         m2.metric("Passed confluence gate", res.get("n_gate_pass", 0))
-        m3.metric("Regime", res.get("regime", "—"))
+        m3.metric("Regime", regime_badge(res.get("regime", "—")), unsafe_allow_html=True)
         m4.metric("Market breadth @09:20", pct(res.get("mkt_early")))
         act = res.get("actionable") or []
         if act:
             st.markdown("##### ✅ Place these")
             render_signals(act, "orb_act")
         else:
-            st.warning("Nothing passed the gate and the probability floor. That is a valid "
-                       "answer — on the walk-forward sample, forcing a trade on the days the "
-                       "gate was empty was measured on 33 sessions and did not survive "
-                       "re-measurement on 1,026. See V23_VERIFICATION.md.")
+            mode = res.get("scan_mode", "ORB")
+            if mode == "MOMENTUM":
+                st.info("📈 Momentum scan complete - no qualifying momentum stocks found.")
+            elif mode == "ORB_ENDED":
+                st.warning("⏰ ORB window closed. Momentum scan starts at 12:30 PM.")
+            else:
+                st.warning("Nothing passed the gate and the probability floor. That is a valid "
+                           "answer — on the walk-forward sample, forcing a trade on the days the "
+                           "gate was empty was measured on 33 sessions and did not survive "
+                           "re-measurement on 1,026. See V23_VERIFICATION.md.")
         with st.expander(f"every confirmed break, ranked ({res.get('n_triggers', 0)})"):
             D = _clean(pd.DataFrame(res.get("all_ranked") or []),
-                       ["sym", "sector", "side", "prob_pct", "p3_pct", "entry", "sl_pct",
+                       ["sym", "sector", "side", "orb_minutes", "prob_pct", "p3_pct", "entry", "sl_pct",
                         "trig_min", "orb_range_pct", "atr_pct", "adr20", "gap", "sec_rel",
-                        "gate_pass", "gate_note", "moved"], SIG_NAMES)
+                        "h1_trend", "h1_rsi", "gate_pass", "gate_note", "moved", "scan_type"],
+                       {**SIG_NAMES, "orb_minutes": "ORB TF", "h1_trend": "1H Trend", 
+                        "h1_rsi": "1H RSI", "scan_type": "Type"})
             st.dataframe(D, width="stretch", hide_index=True)
             dl(D, "live_orb_all.csv", "orb_all")
         with st.expander("rejected by the confluence gate — and exactly why"):
@@ -3268,7 +3556,7 @@ with TABS[1]:
             SD = pd.DataFrame([{"Sector": k, "Median move %": round(v[0], 2),
                                 "Breadth % up": round(v[1], 0)}
                                for k, v in sec.items()]).sort_values("Median move %",
-                                                                    ascending=False)
+                                                                      ascending=False)
             st.dataframe(SD, width="stretch", hide_index=True)
             dl(SD, "sector_strength.csv", "orb_sec")
             st.caption("From the 24–26 Aug case study: on two of the three days, sector beta "
@@ -3280,27 +3568,27 @@ with TABS[1]:
 with TABS[2]:
     st.markdown("#### Tomorrow's top 5 — ranked by expected-move capability")
     st.caption("These are names capable of a 2%+ range tomorrow. Direction is decided by "
-               "tomorrow's 5-min ORB, in either direction.")
+               "tomorrow's 5-min/15-min ORB, in either direction. Multi-TF: Daily (macro) + 1H (context) + 5m/15m ORB (execution)")
     if st.button("🌙 Run EOD scan", type="primary", key="btn_eod"):
         with st.spinner("ranking the F&O list on expansion capability…"):
             st.session_state.res_eod = scan_eod(capital=capital)
     res = st.session_state.get("res_eod") or load_scan("eod")
     if res and not res.get("error"):
-        st.caption(f"for {res.get('for_date')} · regime {res.get('regime')} · "
-                   f"{res.get('n')} names screened")
+        st.caption(f"for {res.get('for_date')} · {regime_badge(res.get('regime', '—'))} · "
+                   f"{res.get('n')} names screened", unsafe_allow_html=True)
         top = res.get("top") or []
         v = view_toggle("eod")
         if v == "List":
             D = pd.DataFrame([{"#": i, "Symbol": p["row"]["sym"], "Sector": p["row"]["sector"],
-                               "Close": round(p["row"].get("close") or 0, 2),
-                               "P(2% move) %": round(p["row"].get("p_move2") or 0, 1),
-                               "ATR %": round(p["row"].get("atr_pct") or 0, 2),
-                               "ADR %": round(p["row"].get("adr20") or 0, 2),
+                               "Close": money(p["row"].get("close") or 0),
+                               "P(2% move) %": f"{num(p['row'].get('p_move2') or 0, 1)}%",
+                               "ATR %": num(p["row"].get("atr_pct") or 0, 1),
+                               "ADR %": num(p["row"].get("adr20") or 0, 1),
                                "Days ≥2.5%/20": p["row"].get("big20"),
-                               "RVOL": round(p["row"].get("rvol") or 0, 2),
-                               "Pivot": round((p.get("pivot_D") or {}).get("P") or 0, 2),
-                               "R1": round((p.get("pivot_D") or {}).get("R1") or 0, 2),
-                               "S1": round((p.get("pivot_D") or {}).get("S1") or 0, 2)}
+                               "RVOL": num(p["row"].get("rvol") or 0, 1),
+                               "Pivot": num((p.get("pivot_D") or {}).get("P") or 0, 1),
+                               "R1": num((p.get("pivot_D") or {}).get("R1") or 0, 1),
+                               "S1": num((p.get("pivot_D") or {}).get("S1") or 0, 1)}
                               for i, p in enumerate(top, 1)])
             st.dataframe(D, width="stretch", hide_index=True)
             dl(D, "eod_top5.csv", "eod")
@@ -3322,28 +3610,28 @@ with TABS[2]:
 
 # ---------------------------------------------------------------- SWING
 with TABS[3]:
-    st.markdown("#### Weekly swing plan — LONG only, Monday 1-hour ORB entry")
+    st.markdown("#### Weekly swing plan — LONG only, Monday 1-hour/2-hour ORB entry")
     st.caption("Calibrated on 133 weeks of 60-min bars. P(+10% before a −5% stop) is 2.2% "
                "unconditionally and 11.1% on the top-3 ranked names, so the ladder is "
-               "+3% / +5% / +10% — the 10% is the runner, not the plan.")
+               "+3% / +5% / +10% — the 10% is the runner, not the plan. Multi-TF: Daily (full-day) + 1H/2H ORB (execution)")
     if st.button("📈 Run swing scan", type="primary", key="btn_sw"):
         with st.spinner("building weekly features…"):
             st.session_state.res_sw = scan_swing(capital=capital)
     res = st.session_state.get("res_sw") or load_scan("swing")
     if res and not res.get("error"):
         st.caption(f"for week starting {res.get('for_week', '—')} · "
-                   f"{res.get('n', 0)} names screened")
+                   f"{regime_badge(res.get('regime', '—'))} · {res.get('n', 0)} names screened", unsafe_allow_html=True)
         picks = res.get("top") or []
         v = view_toggle("sw")
         if v == "List":
             D = pd.DataFrame([{"#": i, "Symbol": p["row"]["sym"],
                                "Sector": p["row"].get("sector"),
-                               "Close": round(p["row"].get("px") or 0, 2),
-                               "P(+7% before stop) %": round((p.get("p") or 0) * 100, 1),
-                               "ATR %": round(p["row"].get("atr_pct") or 0, 2),
+                               "Close": money(p["row"].get("px") or 0),
+                               "P(+7% before stop) %": f"{num((p.get('p') or 0) * 100, 1)}%",
+                               "ATR %": num(p["row"].get("atr_pct") or 0, 1),
                                "Qty": (p.get("ticket") or {}).get("qty"),
-                               "Stop": (p.get("ticket") or {}).get("sl"),
-                               "Target": (p.get("ticket") or {}).get("target")}
+                               "Stop": money((p.get("ticket") or {}).get("sl")),
+                               "Target": money((p.get("ticket") or {}).get("target"))}
                               for i, p in enumerate(picks, 1)])
             st.dataframe(D, width="stretch", hide_index=True)
             dl(D, "swing_plan.csv", "sw")
@@ -3359,108 +3647,188 @@ with TABS[3]:
 
 # ---------------------------------------------------------------- REPLAY
 with TABS[4]:
-    st.markdown("#### Historical replay — run today's three engines on any past session")
-    st.caption("Answers 'what would the screener have told me on that day', and then shows "
-               "what actually happened to those exact tickets. 5-minute bars are only kept "
-               "for about 60 calendar days by the data provider, so the ORB replay window "
-               "is bounded by that; the pre-market and EOD replays go back as far as the "
-               "loaded daily history.")
-    rc1, rc2, rc3 = st.columns([2, 1, 1])
-    _def = prev_trading_day()
-    rday = rc1.date_input("Session to replay", value=_def,
-                          min_value=_def - timedelta(days=400), max_value=_def,
-                          key="replay_day")
-    rtop = rc2.selectbox("Signals", [1, 2, 3], index=0, key="replay_top")
-    if rc3.button("🔁 Replay", type="primary", key="btn_replay"):
-        with st.spinner(f"replaying {rday}…"):
-            st.session_state.res_replay = replay_session(rday, capital=capital, top_n=rtop)
-    rep = st.session_state.get("res_replay")
-    if rep:
-        if rep.get("error"):
-            st.error(rep["error"])
-        else:
-            st.caption(f"{rep['day']} · {rep['n_names']} liquid names · "
-                       f"5-min bars found for {rep['n_bars']}")
-            t1, t2, t3 = st.tabs(["🌅 Pre-Market as it stood", "⚡ Live ORB", "🌙 EOD → next day"])
-            with t1:
-                pm = rep.get("premarket") or {}
-                if pm.get("error"):
-                    st.info(pm["error"])
-                else:
-                    st.caption(pm.get("source"))
-                    v = view_toggle("rep_pm")
-                    D = _clean(pd.DataFrame(pm.get("longs") or []),
-                               ["sym", "sector", "exp_open", "gap", "atr_pct", "adr20",
-                                "p_up", "big20"],
-                               {"sym": "Symbol", "sector": "Sector", "exp_open": "Open",
-                                "gap": "Gap %", "atr_pct": "ATR %", "adr20": "ADR %",
-                                "p_up": "P(+2%) %", "big20": "Days ≥2.5%/20"})
-                    D2 = _clean(pd.DataFrame(pm.get("shorts") or []),
-                                ["sym", "sector", "exp_open", "gap", "atr_pct", "adr20",
-                                 "p_dn"],
-                                {"sym": "Symbol", "sector": "Sector", "exp_open": "Open",
-                                 "gap": "Gap %", "atr_pct": "ATR %", "adr20": "ADR %",
-                                 "p_dn": "P(−2%) %"})
-                    if v == "List":
-                        st.markdown("**Top BUY candidates**")
-                        st.dataframe(D, width="stretch", hide_index=True)
-                        st.markdown("**Top SELL candidates**")
-                        st.dataframe(D2, width="stretch", hide_index=True)
+    st.markdown("#### Historical Replay & Backtesting")
+    st.caption("Single-day replay shows what the screener would have generated. Multi-day backtest aggregates statistics for strategy validation.")
+    
+    rep_tab1, rep_tab2 = st.tabs(["📅 Single-Day Replay", "📊 Multi-Day Backtest"])
+    
+    with rep_tab1:
+        st.markdown("#### Historical replay — run today's three engines on any past session")
+        st.caption("Answers 'what would the screener have told me on that day', and then shows "
+                   "what actually happened to those exact tickets. 5-minute bars are only kept "
+                   "for about 60 calendar days by the data provider, so the ORB replay window "
+                   "is bounded by that; the pre-market and EOD replays go back as far as the "
+                   "loaded daily history.")
+        rc1, rc2, rc3 = st.columns([2, 1, 1])
+        _def = prev_trading_day()
+        rday = rc1.date_input("Session to replay", value=_def,
+                              min_value=_def - timedelta(days=400), max_value=_def,
+                              key="replay_day")
+        rtop = rc2.selectbox("Signals", [1, 2, 3], index=0, key="replay_top")
+        if rc3.button("🔁 Replay", type="primary", key="btn_replay"):
+            with st.spinner(f"replaying {rday}…"):
+                st.session_state.res_replay = replay_session(rday, capital=capital, top_n=rtop)
+        rep = st.session_state.get("res_replay")
+        if rep:
+            if rep.get("error"):
+                st.error(rep["error"])
+            else:
+                st.caption(f"{rep['day']} · {rep['n_names']} liquid names · "
+                           f"5-min bars found for {rep['n_bars']}")
+                t1, t2, t3 = st.tabs(["🌅 Pre-Market as it stood", "⚡ Live ORB", "🌙 EOD → next day"])
+                with t1:
+                    pm = rep.get("premarket") or {}
+                    if pm.get("error"):
+                        st.info(pm["error"])
                     else:
-                        cA, cB = st.columns(2)
-                        cA.markdown("**🟢 BUY**")
-                        for _, r in D.head(3).iterrows():
-                            cA.markdown(f"**{r['Symbol']}** · {r['Sector']} · gap "
-                                        f"{r['Gap %']}% · P {r['P(+2%) %']}%")
-                        cB.markdown("**🔴 SELL**")
-                        for _, r in D2.head(3).iterrows():
-                            cB.markdown(f"**{r['Symbol']}** · {r['Sector']} · gap "
-                                        f"{r['Gap %']}% · P {r['P(−2%) %']}%")
-                    dl(D, f"replay_{rep['day']}_premarket_buy.csv", "rep_pm_b")
-                    dl(D2, f"replay_{rep['day']}_premarket_sell.csv", "rep_pm_s")
-            with t2:
-                if rep.get("orb_error"):
-                    st.warning(rep["orb_error"])
-                orb = rep.get("orb") or {}
-                act = orb.get("actionable") or []
-                if act:
-                    won = [a for a in act if a.get("rp_result") == "TARGET HIT"]
-                    q1, q2, q3 = st.columns(3)
-                    q1.metric("Signals", len(act))
-                    q2.metric("Target hit", f"{len(won)}/{len(act)}")
-                    q3.metric("Avg result", pct(np.mean([a.get("rp_pnl_pct", 0) for a in act])))
-                    render_signals(act, "rep_orb")
-                elif not rep.get("orb_error"):
-                    st.info("Nothing passed the confluence gate on that session — the "
-                            "screener would correctly have told you to stay out.")
-                if orb.get("all_ranked"):
-                    with st.expander("every confirmed break that session"):
-                        D = _clean(pd.DataFrame(orb["all_ranked"]),
-                                   ["sym", "sector", "side", "prob_pct", "p3_pct", "entry",
-                                    "sl_pct", "trig_min", "orb_range_pct", "gate_pass",
-                                    "gate_note"], SIG_NAMES)
+                        st.caption(pm.get("source"))
+                        v = view_toggle("rep_pm")
+                        D = _clean(pd.DataFrame(pm.get("longs") or []),
+                                   ["sym", "sector", "exp_open", "gap", "atr_pct", "adr20",
+                                    "p_up", "big20"],
+                                   {"sym": "Symbol", "sector": "Sector", "exp_open": "Open",
+                                    "gap": "Gap %", "atr_pct": "ATR %", "adr20": "ADR %",
+                                    "p_up": "P(+2%) %", "big20": "Days ≥2.5%/20"})
+                        D2 = _clean(pd.DataFrame(pm.get("shorts") or []),
+                                    ["sym", "sector", "exp_open", "gap", "atr_pct", "adr20",
+                                     "p_dn"],
+                                    {"sym": "Symbol", "sector": "Sector", "exp_open": "Open",
+                                     "gap": "Gap %", "atr_pct": "ATR %", "adr20": "ADR %",
+                                     "p_dn": "P(−2%) %"})
+                        if v == "List":
+                            st.markdown("**Top BUY candidates**")
+                            st.dataframe(D, width="stretch", hide_index=True)
+                            st.markdown("**Top SELL candidates**")
+                            st.dataframe(D2, width="stretch", hide_index=True)
+                        else:
+                            cA, cB = st.columns(2)
+                            cA.markdown("**🟢 BUY**")
+                            for _, r in D.head(3).iterrows():
+                                cA.markdown(f"**{r['Symbol']}** · {r['Sector']} · gap "
+                                            f"{r['Gap %']}% · P {r['P(+2%) %']}%")
+                            cB.markdown("**🔴 SELL**")
+                            for _, r in D2.head(3).iterrows():
+                                cB.markdown(f"**{r['Symbol']}** · {r['Sector']} · gap "
+                                            f"{r['Gap %']}% · P {r['P(−2%) %']}%")
+                        dl(D, f"replay_{rep['day']}_premarket_buy.csv", "rep_pm_b")
+                        dl(D2, f"replay_{rep['day']}_premarket_sell.csv", "rep_pm_s")
+                with t2:
+                    if rep.get("orb_error"):
+                        st.warning(rep["orb_error"])
+                    orb = rep.get("orb") or {}
+                    act = orb.get("actionable") or []
+                    if act:
+                        won = [a for a in act if a.get("rp_result") == "TARGET HIT"]
+                        q1, q2, q3 = st.columns(3)
+                        q1.metric("Signals", len(act))
+                        q2.metric("Target hit", f"{len(won)}/{len(act)}")
+                        q3.metric("Avg result", pct(np.mean([a.get("rp_pnl_pct", 0) for a in act])))
+                        render_signals(act, "rep_orb")
+                    elif not rep.get("orb_error"):
+                        st.info("Nothing passed the confluence gate on that session — the "
+                                "screener would correctly have told you to stay out.")
+                    if orb.get("all_ranked"):
+                        with st.expander("every confirmed break that session"):
+                            D = _clean(pd.DataFrame(orb["all_ranked"]),
+                                       ["sym", "sector", "side", "prob_pct", "p3_pct", "entry",
+                                        "sl_pct", "trig_min", "orb_range_pct", "gate_pass",
+                                        "gate_note"], SIG_NAMES)
+                            st.dataframe(D, width="stretch", hide_index=True)
+                            dl(D, f"replay_{rep['day']}_orb_all.csv", "rep_orb_all")
+                with t3:
+                    eod = rep.get("eod") or {}
+                    if eod.get("error"):
+                        st.info(eod["error"])
+                    else:
+                        rows = []
+                        for i, p in enumerate(eod.get("top") or [], 1):
+                            nd = p.get("next_day") or {}
+                            rows.append({"#": i, "Symbol": p["row"]["sym"],
+                                         "Sector": p["row"]["sector"],
+                                         "P(2% move) %": round(p["row"].get("p_move2") or 0, 1),
+                                         "ATR %": round(p["row"].get("atr_pct") or 0, 2),
+                                         "Next session": nd.get("date"),
+                                         "Max up from open %": nd.get("up_pct"),
+                                         "Max down from open %": nd.get("dn_pct")})
+                        D = pd.DataFrame(rows)
                         st.dataframe(D, width="stretch", hide_index=True)
-                        dl(D, f"replay_{rep['day']}_orb_all.csv", "rep_orb_all")
-            with t3:
-                eod = rep.get("eod") or {}
-                if eod.get("error"):
-                    st.info(eod["error"])
-                else:
-                    rows = []
-                    for i, p in enumerate(eod.get("top") or [], 1):
-                        nd = p.get("next_day") or {}
-                        rows.append({"#": i, "Symbol": p["row"]["sym"],
-                                     "Sector": p["row"]["sector"],
-                                     "P(2% move) %": round(p["row"].get("p_move2") or 0, 1),
-                                     "ATR %": round(p["row"].get("atr_pct") or 0, 2),
-                                     "Next session": nd.get("date"),
-                                     "Max up from open %": nd.get("up_pct"),
-                                     "Max down from open %": nd.get("dn_pct")})
-                    D = pd.DataFrame(rows)
-                    st.dataframe(D, width="stretch", hide_index=True)
-                    dl(D, f"replay_{rep['day']}_eod.csv", "rep_eod")
-                    st.caption("'Max up/down from open' is what the name actually delivered "
-                               "the next session — a direct scorecard for the EOD ranking.")
+                        dl(D, f"replay_{rep['day']}_eod.csv", "rep_eod")
+                        st.caption("'Max up/down from open' is what the name actually delivered "
+                                   "the next session — a direct scorecard for the EOD ranking.")
+    
+    with rep_tab2:
+        st.markdown("#### Multi-Day Backtest")
+        st.caption("Run the complete strategy across multiple sessions for statistical validation. "
+                   "Fetches 5-min bars, applies confluence gate, models, and simulates execution with partials + trailing.")
+        bc1, bc2, bc3 = st.columns([2, 1, 1])
+        _def = prev_trading_day()
+        bt_start = bc1.date_input("Start date", value=_def - timedelta(days=30),
+                                  min_value=_def - timedelta(days=400), max_value=_def,
+                                  key="bt_start")
+        bt_end = bc2.date_input("End date", value=_def,
+                                min_value=_def - timedelta(days=400), max_value=_def,
+                                key="bt_end")
+        btop = bc3.selectbox("Top N", [1, 2, 3], index=0, key="bt_top")
+        borb = st.selectbox("ORB Timeframe", [5, 15], index=0, key="bt_orb")
+        
+        if st.button("📊 Run Backtest", type="primary", key="btn_backtest"):
+            if bt_start > bt_end:
+                st.error("Start date must be before end date")
+            else:
+                with st.spinner("Running comprehensive backtest..."):
+                    st.session_state.res_backtest = run_backtest(
+                        bt_start, bt_end, capital=capital, top_n=btop, orb_minutes=borb
+                    )
+        
+        bt_res = st.session_state.get("res_backtest")
+        if bt_res:
+            if bt_res.get("error"):
+                st.error(bt_res["error"])
+            else:
+                # Summary metrics
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Days Tested", bt_res["total_days"])
+                c2.metric("Total Trades", bt_res["total_trades"])
+                c3.metric("Win Rate", f"{bt_res['win_rate']:.1f}%")
+                c4.metric("Expectancy", f"{bt_res['expectancy']:.2f}%")
+                c5.metric("Profit Factor", f"{bt_res['profit_factor']:.2f}")
+                
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Avg Win", f"{bt_res['avg_win']:.2f}%")
+                c2.metric("Avg Loss", f"{bt_res['avg_loss']:.2f}%")
+                c3.metric("Total P&L", f"{bt_res['total_pnl']:.2f}%")
+                c4.metric("Max DD", f"{bt_res['max_dd']:.2f}%")
+                
+                # Breakdown by result
+                with st.expander("Trade Outcomes"):
+                    res_df = pd.DataFrame(list(bt_res["by_result"].items()), 
+                                          columns=["Outcome", "Count"])
+                    st.dataframe(res_df, width="stretch", hide_index=True)
+                
+                # Breakdown by side
+                with st.expander("By Side"):
+                    side_df = pd.DataFrame(list(bt_res["by_side"].items()), 
+                                           columns=["Side", "Count"])
+                    st.dataframe(side_df, width="stretch", hide_index=True)
+                
+                # Breakdown by ORB timeframe
+                if bt_res.get("by_orb_tf"):
+                    with st.expander("By ORB Timeframe"):
+                        tf_df = pd.DataFrame(list(bt_res["by_orb_tf"].items()), 
+                                             columns=["Timeframe", "Count"])
+                        st.dataframe(tf_df, width="stretch", hide_index=True)
+                
+# All trades
+                with st.expander("All Trades"):
+                    trades_df = pd.DataFrame(bt_res["trades"])
+                    if not trades_df.empty:
+                        show_cols = ["date", "sym", "side", "orb_minutes", "entry", "sl_pct", 
+                                    "rp_result", "rp_pnl_pct", "rp_mfe_pct"]
+                        show_cols = [c for c in show_cols if c in trades_df.columns]
+                        st.dataframe(_clean(trades_df[show_cols]), width="stretch", hide_index=True)
+                        dl(trades_df, f"backtest_{bt_start}_{bt_end}.csv", "bt_trades")
+                
+                st.success("Backtest complete! Results saved to data/performance/")
 
 # ---------------------------------------------------------------- MOVERS
 with TABS[5]:
