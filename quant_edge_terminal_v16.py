@@ -3519,7 +3519,7 @@ with TABS[1]:
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Confirmed breaks", res.get("n_triggers", 0))
         m2.metric("Passed confluence gate", res.get("n_gate_pass", 0))
-        m3.metric("Regime", regime_badge(res.get("regime", "—")), unsafe_allow_html=True)
+        m3.markdown(f"**Regime**  \n{regime_badge(res.get('regime', '—'))}", unsafe_allow_html=True)
         m4.metric("Market breadth @09:20", pct(res.get("mkt_early")))
         act = res.get("actionable") or []
         if act:
