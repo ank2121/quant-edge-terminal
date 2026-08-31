@@ -874,6 +874,79 @@ class TTLCache:
 CACHE = TTLCache()
 DL_LOCK = threading.Semaphore(4)   # be polite to the data provider
 
+# =============================================================================
+# BACKGROUND SCAN JOBS  (fixes: "running one scan freezes every other tab")
+# -----------------------------------------------------------------------------
+# Streamlit runs the whole script on ONE thread per rerun. A button that does
+# `with st.spinner(): heavy_work()` therefore blocks the ENTIRE page — every
+# other tab, every other button — until heavy_work() returns, because nothing
+# re-renders until the script finishes.
+#
+# Fix: start each scan in its own background thread and return control to
+# Streamlit immediately. Progress/results live in this module-level dict
+# (shared across reruns and across tabs, guarded by a lock). A small
+# st_autorefresh timer polls it every 2s ONLY while something is running, so
+# the page keeps updating itself without the user having to click anything,
+# and every other button stays clickable the whole time.
+# =============================================================================
+SCAN_JOBS = {}
+SCAN_JOBS_LOCK = threading.Lock()
+
+def scan_job_start(key, fn, *args, **kwargs):
+    """Kick off fn(*args, **kwargs) in a background thread under `key`.
+    Returns False (no-op) if a job with this key is already running."""
+    with SCAN_JOBS_LOCK:
+        existing = SCAN_JOBS.get(key)
+        if existing and existing.get("status") == "running":
+            return False
+        SCAN_JOBS[key] = {"status": "running", "result": None, "error_msg": None,
+                          "started": time.time(), "finished": None}
+
+    def _worker():
+        try:
+            result = fn(*args, **kwargs)
+            with SCAN_JOBS_LOCK:
+                SCAN_JOBS[key]["status"] = "done"
+                SCAN_JOBS[key]["result"] = result
+                SCAN_JOBS[key]["finished"] = time.time()
+        except Exception as e:
+            with SCAN_JOBS_LOCK:
+                SCAN_JOBS[key]["status"] = "error"
+                SCAN_JOBS[key]["error_msg"] = f"{type(e).__name__}: {e}"
+                SCAN_JOBS[key]["finished"] = time.time()
+
+    threading.Thread(target=_worker, daemon=True, name=f"scan-{key}").start()
+    return True
+
+def scan_job_get(key):
+    with SCAN_JOBS_LOCK:
+        j = SCAN_JOBS.get(key)
+        return dict(j) if j else {"status": "idle"}
+
+def scan_job_any_running():
+    with SCAN_JOBS_LOCK:
+        return any(j.get("status") == "running" for j in SCAN_JOBS.values())
+
+def scan_button(label, key, fn, *args, help_running="scanning…", **kwargs):
+    """Drop-in replacement for the old `if st.button(...): with st.spinner(...): ...`
+    pattern. Renders the button (disabled while its own job is running so it
+    can't be double-clicked), starts the job in the background on click, and
+    returns the finished result dict once ready (or None). Never blocks other
+    tabs/buttons — that is the whole point."""
+    job = scan_job_get(key)
+    running = job.get("status") == "running"
+    clicked = st.button(label, type="primary", key=f"btn_{key}", disabled=running)
+    if clicked and not running:
+        scan_job_start(key, fn, *args, **kwargs)
+        st.rerun()
+    if running:
+        elapsed = int(time.time() - job.get("started", time.time()))
+        st.info(f"⏳ {help_running} ({elapsed}s) — other tabs/scans keep working, "
+                f"this box will update on its own.")
+    elif job.get("status") == "error":
+        st.error(f"Scan failed: {job.get('error_msg')}")
+    return job.get("result") if job.get("status") == "done" else None
+
 def _norm_cols(df, tickers):
     """yfinance returns (Field, Ticker) columns unless group_by='ticker'.
     v20 bug #2: fetch_live_prices indexed df[t]['Close'] on a (Field,Ticker)
@@ -2282,6 +2355,65 @@ def scan_swing(capital=None, bundle=None, top_n=None, orb_minutes=None, profile=
     return out
 
 # =============================================================================
+# ENGINE 5 — AGGRESSIVE MOVERS  (4-5% F&O gainers/losers, fixed 1:2 R:R)
+# -----------------------------------------------------------------------------
+# Same feature family as the calibrated EOD engine (ATR%, ADR20, 20-day volume
+# expansion, count of big moves, RVOL) but ranks only the TOP DECILE instead of
+# the top ~20%, aiming at the handful of names that actually run 4-5% on a
+# given day. Every ticket is forced to a hard 1% risk : 2% reward, as asked.
+#
+# IMPORTANT — UNLIKE the rest of this app, this engine has NOT been
+# walk-forward validated at the 4-5% threshold (only the ~2% target was
+# calibrated on real data). It reuses proven capability features but the
+# threshold itself is a reasonable extrapolation, not a measured result.
+# Treat it as PAPER-TRADE ONLY until you have logged real outcomes for it
+# in the Journal tab and it has a track record of its own.
+# =============================================================================
+def scan_aggressive_movers(capital=None, bundle=None, decile=0.10, min_names=3):
+    capital = capital or CFG["DEFAULT_CAPITAL"]
+    b = bundle or load_bundle()
+    if not b:
+        return dict(error="no data")
+    names = liquid_names(b)
+    rows = []
+    for t in names:
+        f = b["snap"].get(t, {})
+        okL, _ = feasible(f, "L")
+        if not okL:
+            continue
+        atrp = f.get("atr_pct", 0) or 0
+        adr = f.get("adr20", 0) or 0
+        vol20 = f.get("vol20", 0) or 0
+        big20 = f.get("big_moves_60", 0) or 0
+        rvol = f.get("rvol", 1) or 1
+        px = f.get("px")
+        if not px:
+            continue
+        score = (0.30 * min(atrp / 4.0, 2.0) + 0.25 * min(adr / 4.5, 2.0)
+                 + 0.20 * min(vol20 / 4.0, 2.0) + 0.15 * min(big20 / 10.0, 2.0)
+                 + 0.10 * min(rvol / 2.0, 2.0))
+        rows.append(dict(ticker=t, sym=t.replace(".NS", ""), sector=sector_of(t),
+                         score=round(score, 3), atr_pct=atrp, adr20=adr, vol20=vol20,
+                         big20=big20, rvol=rvol, px=px))
+    if not rows:
+        return dict(error="no candidates passed the volatility floor")
+    D = pd.DataFrame(rows).sort_values("score", ascending=False)
+    cut = max(min_names, int(len(D) * decile))
+    top_rows = D.head(cut).to_dict("records")
+    out_top = []
+    for r in top_rows:
+        entry = r["px"]
+        tk_long = build_ticket(r["ticker"], "BUY", entry, sl_pct=1.0, target_pct=2.0,
+                               capital=capital, setup="Aggressive (unvalidated)", tf="Day")
+        tk_short = build_ticket(r["ticker"], "SELL", entry, sl_pct=1.0, target_pct=2.0,
+                                capital=capital, setup="Aggressive (unvalidated)", tf="Day")
+        out_top.append(dict(row=r, ticket=tk_long, ticket_short=tk_short))
+    out = dict(ts=get_ist_now().isoformat(), generated_at=fmt_ist(get_ist_now()),
+              n_candidates=int(len(D)), top=out_top, table=D)
+    save_scan("aggressive", out)
+    return out
+
+# =============================================================================
 # STORAGE
 # =============================================================================
 def _json_safe(o):
@@ -3441,15 +3573,62 @@ def ticket_card(tk, prob=None, extra_rows=None, low_conf=False, ladder=None):
     <div><div style="font-size:10px;color:#0ecb81">TARGET 2 ({tk['target_pct']}%)</div>
          <div style="font-size:16px;font-weight:700;color:#0ecb81;font-family:JetBrains Mono,monospace">{money(tk['t2'])}</div></div>
   </div>
-  <div style="display:flex;gap:18px;margin-top:10px;font-size:11px;color:#8f96b3;flex-wrap:wrap">
+  <div style="display:flex;gap:18px;margin-top:10px;font-size:11px;color:#8f96b3;flex-wrap:wrap;align-items:center">
     <span>Risk <b style='color:#f6465d'>{money(tk['risk_rs'])}</b></span>
     <span>Reward <b style='color:#0ecb81'>{money(tk['reward_rs'])}</b></span>
-    <span title="Reward divided by risk. 2 means you are seeking 2 rupees for every 1 risked."
-          style="color:#4f8cff;font-weight:700;cursor:help">R:R 1:{tk['rr']} ⓘ</span>
     <span>risk/share {money(tk.get('risk_per_share'))}</span>
+  </div>
+  <div title="Reward divided by risk. 2 means you are seeking 2 rupees for every 1 risked."
+       style="display:inline-block;margin-top:10px;padding:4px 14px;border-radius:20px;
+       cursor:help;font-weight:800;font-size:13px;
+       background:{'rgba(14,203,129,0.18)' if tk['rr']>=2 else 'rgba(240,185,11,0.18)' if tk['rr']>=1.5 else 'rgba(246,70,93,0.18)'};
+       color:{'#0ecb81' if tk['rr']>=2 else '#f0b90b' if tk['rr']>=1.5 else '#f6465d'};
+       border:1px solid {'rgba(14,203,129,0.4)' if tk['rr']>=2 else 'rgba(240,185,11,0.4)' if tk['rr']>=1.5 else 'rgba(246,70,93,0.4)'}">
+    ⚖ R:R 1:{tk['rr']} ⓘ
   </div>
   {rows}{lad}{warn}
 </div>""", unsafe_allow_html=True)
+
+def render_aggressive_tab(capital):
+    """🔥 Aggressive sub-tab: widened-volatility scanner aimed at the 4-5%
+    F&O gainers/losers, fixed 1% risk : 2% reward. See scan_aggressive_movers
+    docstring — this is unvalidated at the 4-5% threshold, paper-trade only."""
+    tab_header("🔥 Aggressive — hunting the 4–5% F&O movers", "agg",
+              "Same capability features as EOD, top decile only · fixed 1% risk : 2% reward")
+    st.warning("⚠ Experimental. Every other tab in this app is walk-forward tested on a "
+              "~2% target (see the calibration notes at the top of the file). This tab "
+              "reuses the same proven features (ATR%, ADR20, volume expansion, RVOL) but "
+              "pushes the threshold further to chase bigger moves — that wider threshold "
+              "itself has NOT been backtested yet. Paper-trade it and track results in the "
+              "Journal tab before risking real money on it.")
+    st.caption("Direction still needs the opening-range confirmation on the Live screener "
+              "tab — this is the SHORTLIST to watch pre-market and at EOD, not the order.")
+    out = scan_button("🔥 Run aggressive scan", "agg", scan_aggressive_movers,
+                      help_running="ranking the F&O list on widened volatility filters…",
+                      capital=capital)
+    if out is not None:
+        st.session_state.res_agg = out
+    res = st.session_state.get("res_agg") or load_scan("aggressive")
+    if res and not res.get("error"):
+        st.caption(f"generated {res.get('generated_at')} · "
+                  f"{res.get('n_candidates')} names screened · "
+                  f"top {len(res.get('top') or [])} shown (top decile by expansion score)")
+        for p in res.get("top") or []:
+            r = p["row"]
+            st.markdown(f"##### {r['sym']} · {r.get('sector')}")
+            st.caption(f"ATR {num(r.get('atr_pct'))}% · ADR {num(r.get('adr20'))}% · "
+                      f"Vol20 {num(r.get('vol20'))}% · RVOL {num(r.get('rvol'))} · "
+                      f"big moves (60d) {r.get('big20')} · score {r.get('score')}")
+            cA, cB = st.columns(2)
+            with cA:
+                st.markdown("**If it breaks up**")
+                ticket_card(p["ticket"])
+            with cB:
+                st.markdown("**If it breaks down**")
+                ticket_card(p["ticket_short"], low_conf=True)
+        dl(_clean(res.get("table")), "aggressive_full.csv", "agg_full")
+    else:
+        st.info("No aggressive scan yet.")
 
 def pivot_table(piv):
     if not piv:
@@ -4126,275 +4305,285 @@ if CFG.get("PAPER_MODE", True):
           "<code>CFG['PAPER_MODE'] = False</code> once a configuration has "
           "earned it.</div></div>", unsafe_allow_html=True)
 
-TABS = st.tabs(["🌅 Pre-Market", "⚡ Live screener", "🌙 EOD → Tomorrow",
-                "📈 Swing", "🔁 Replay / backtest", "📊 Movers", "🧠 Learning", "📓 Journal"])
+colI, colS = st.columns(2, gap="large")
 
-# ---------------------------------------------------------------- PRE-MARKET
-with TABS[0]:
-    tab_header("🌅 Pre-market watchlist", "pm",
-               f"Run 09:00–09:08 · profile {MTF_PROFILE} · entry on the "
-               f"{ORB_TF_LABEL.get(CFG['ORB_MINUTES'], CFG['ORB_MINUTES'])}")
-    st.caption("This is a WATCHLIST, not the order. The order is the opening-range break "
-               "on the Live screener tab, and only before "
-               f"{CFG['ORB_CUTOFF_TIME'].strftime('%H:%M')}.")
-    if st.button("🌅 Run pre-market scan", type="primary", key="btn_pm"):
-        with st.spinner("reading NSE pre-open book + daily / 1-hour context…"):
-            st.session_state.res_pm = scan_premarket(capital=capital,
-                                                     orb_minutes=CFG["ORB_MINUTES"],
-                                                     profile=MTF_PROFILE)
-    res = st.session_state.get("res_pm") or load_scan("premarket")
-    if res and not res.get("error"):
-        st.caption(f"generated {res.get('generated_at') or res.get('ts')} · "
-                   f"regime {regime_dot(res.get('regime'))} · "
-                   f"{res.get('n_candidates')} feasible names · "
-                   f"{res.get('orb_minutes', CFG['ORB_MINUTES'])}-min entry range · "
-                   f"{res.get('history_sessions') or '—'} sessions of history")
-        if "previous close" in str(res.get("source", "")):
-            st.warning("NSE pre-open feed unavailable — gaps assumed flat. Re-run after "
-                       "09:02, or use the Live ORB tab, which never needs pre-open data.")
-        v = view_toggle("pm")
-        L = (res.get("longs") or []); S = (res.get("shorts") or [])
-        if v == "List":
-            recs = []
-            for lbl, arr in (("BUY", L), ("SELL", S)):
-                for i, c in enumerate(arr, 1):
-                    r = c["row"]
-                    tk = c.get("ticket") or {}
-                    recs.append({"#": i, "Side": side_dot(lbl), "Symbol": r["sym"],
-                                 "Sector": r.get("sector"),
-                                 "Signal time": r.get("signal_time") or res.get("signal_time"),
-                                 "MTF": mtf_dot(r.get("mtf")),
-                                 "Exp. open": nz(r.get("exp_open")),
-                                 "Gap %": nz(r.get("gap")),
-                                 "ATR %": nz(r.get("atr_pct")),
-                                 "ADR %": nz(r.get("adr20")),
-                                 "P(move) %": nz((r.get("p_up") if lbl == "BUY"
-                                                  else r.get("p_dn")), 1),
-                                 "Days ≥2.5% / 20": r.get("big20"),
-                                 "Entry": nz(tk.get("entry")), "Stop": nz(tk.get("sl")),
-                                 "Target": nz(tk.get("target")),
-                                 "R:R": f"1:{tk.get('rr')}" if tk.get("rr") else "—",
-                                 "Qty": tk.get("qty")})
-            show_df(pd.DataFrame(recs), key="pm",
-                    help_map={"Days ≥2.5% / 20": "Sessions in the last 20 that moved at "
-                                                 "least 2.5% — proof the stock can travel."})
-        else:
-            cA, cB = st.columns(2)
-            with cA:
-                st.markdown("##### 🟢 BUY candidate")
-                for c in L[:1]:
-                    r = c["row"]
-                    ticket_card(c["ticket"], extra_rows=[
-                        ("Expected open", money(r.get("exp_open"))), ("Gap", pct(r.get("gap"))),
-                        ("ATR% / ADR%", f"{num(r.get('atr_pct'))} / {num(r.get('adr20'))}"),
-                        ("P(+2% | this gap bucket)", f"{num(r.get('p_up'), 1)}%"),
-                        ("Days ≥2.5% in last 20", num(r.get("big20"), 0)),
-                        ("Room to next resistance", pct(r.get("room_up")))])
-                with st.expander("next candidates"):
-                    for c in L[1:]:
+with colI:
+    st.markdown("## ⚡ INTRADAY")
+    _ilabels = [("pm", "Pre-Market"), ("orb", "Live"), ("eod", "EOD"), ("agg", "Aggressive")]
+    _ijobs = {k: scan_job_get(k) for k, _ in _ilabels}
+    _idots = {"running": "🟡 running", "done": "🟢 ready", "error": "🔴 error", "idle": "⚪ idle"}
+    st.caption("  ·  ".join(f"{lbl} {_idots.get(_ijobs[k]['status'], '⚪ idle')}" for k, lbl in _ilabels))
+    if any(j['status'] == 'running' for j in _ijobs.values()):
+        st.caption("⏳ scanning in the background — switch sub-tabs freely, nothing here is blocked")
+    sub = st.tabs(["🌅 Pre-Market", "⚡ Live screener", "🌙 EOD → Tomorrow", "🔥 Aggressive"])
+    with sub[0]:
+        tab_header("🌅 Pre-market watchlist", "pm",
+                   f"Run 09:00–09:08 · profile {MTF_PROFILE} · entry on the "
+                   f"{ORB_TF_LABEL.get(CFG['ORB_MINUTES'], CFG['ORB_MINUTES'])}")
+        st.caption("This is a WATCHLIST, not the order. The order is the opening-range break "
+                   "on the Live screener tab, and only before "
+                   f"{CFG['ORB_CUTOFF_TIME'].strftime('%H:%M')}.")
+        _pm_out = scan_button("🌅 Run pre-market scan", "pm", scan_premarket,
+                              help_running="reading NSE pre-open book + daily / 1-hour context…",
+                              capital=capital, orb_minutes=CFG["ORB_MINUTES"], profile=MTF_PROFILE)
+        if _pm_out is not None:
+            st.session_state.res_pm = _pm_out
+        res = st.session_state.get("res_pm") or load_scan("premarket")
+        if res and not res.get("error"):
+            st.caption(f"generated {res.get('generated_at') or res.get('ts')} · "
+                       f"regime {regime_dot(res.get('regime'))} · "
+                       f"{res.get('n_candidates')} feasible names · "
+                       f"{res.get('orb_minutes', CFG['ORB_MINUTES'])}-min entry range · "
+                       f"{res.get('history_sessions') or '—'} sessions of history")
+            if "previous close" in str(res.get("source", "")):
+                st.warning("NSE pre-open feed unavailable — gaps assumed flat. Re-run after "
+                           "09:02, or use the Live ORB tab, which never needs pre-open data.")
+            v = view_toggle("pm")
+            L = (res.get("longs") or []); S = (res.get("shorts") or [])
+            if v == "List":
+                recs = []
+                for lbl, arr in (("BUY", L), ("SELL", S)):
+                    for i, c in enumerate(arr, 1):
                         r = c["row"]
-                        st.write(f"**{r['sym']}** {r['sector']} · gap {pct(r.get('gap'))} · "
-                                 f"ATR {num(r.get('atr_pct'))}% · P {num(r.get('p_up'), 1)}%")
-            with cB:
-                st.markdown("##### 🔴 SELL candidate")
-                for c in S[:1]:
-                    r = c["row"]
-                    ticket_card(c["ticket"], low_conf=True, extra_rows=[
-                        ("Expected open", money(r.get("exp_open"))), ("Gap", pct(r.get("gap"))),
-                        ("ATR% / ADR%", f"{num(r.get('atr_pct'))} / {num(r.get('adr20'))}"),
-                        ("P(−2% | this gap bucket)", f"{num(r.get('p_dn'), 1)}%"),
-                        ("Room to next support", pct(r.get("room_dn")))])
-                with st.expander("next candidates"):
-                    for c in S[1:]:
+                        tk = c.get("ticket") or {}
+                        recs.append({"#": i, "Side": side_dot(lbl), "Symbol": r["sym"],
+                                     "Sector": r.get("sector"),
+                                     "Signal time": r.get("signal_time") or res.get("signal_time"),
+                                     "MTF": mtf_dot(r.get("mtf")),
+                                     "Exp. open": nz(r.get("exp_open")),
+                                     "Gap %": nz(r.get("gap")),
+                                     "ATR %": nz(r.get("atr_pct")),
+                                     "ADR %": nz(r.get("adr20")),
+                                     "P(move) %": nz((r.get("p_up") if lbl == "BUY"
+                                                      else r.get("p_dn")), 1),
+                                     "Days ≥2.5% / 20": r.get("big20"),
+                                     "Entry": nz(tk.get("entry")), "Stop": nz(tk.get("sl")),
+                                     "Target": nz(tk.get("target")),
+                                     "R:R": f"1:{tk.get('rr')}" if tk.get("rr") else "—",
+                                     "Qty": tk.get("qty")})
+                show_df(pd.DataFrame(recs), key="pm",
+                        help_map={"Days ≥2.5% / 20": "Sessions in the last 20 that moved at "
+                                                     "least 2.5% — proof the stock can travel."})
+            else:
+                cA, cB = st.columns(2)
+                with cA:
+                    st.markdown("##### 🟢 BUY candidate")
+                    for c in L[:1]:
                         r = c["row"]
-                        st.write(f"**{r['sym']}** {r['sector']} · gap {pct(r.get('gap'))} · "
-                                 f"ATR {num(r.get('atr_pct'))}% · P {num(r.get('p_dn'), 1)}%")
-        st.info("Gaps mean-revert intraday in this data: P(+2% | gap < −2%) = 60.0% versus "
-                "P(−2%) = 33.7%. The ranking already accounts for that.")
-        dl(_clean(res.get("table")), "premarket_full.csv", "pm_full")
-    else:
-        st.info("No pre-market scan yet today.")
-
-# ---------------------------------------------------------------- LIVE ORB
-with TABS[1]:
-    _nowt = get_ist_now().time()
-    _win = ("ORB WINDOW OPEN" if _nowt < CFG["ORB_CUTOFF_TIME"] else
-            ("MOMENTUM WINDOW" if _nowt >= CFG["MOMENTUM_START_TIME"] else "STAND ASIDE"))
-    _winkind = {"ORB WINDOW OPEN": "bull", "MOMENTUM WINDOW": "info",
-                "STAND ASIDE": "warn"}[_win]
-    tab_header("⚡ Live screener", "orb")
-    st.markdown(
-        chip(_win, _winkind) + "  " +
-        chip(f"now {_nowt.strftime('%H:%M')} IST", "neutral") + "  " +
-        chip(f"ORB cut-off {CFG['ORB_CUTOFF_TIME'].strftime('%H:%M')}", "neutral") + "  " +
-        chip(f"momentum from {CFG['MOMENTUM_START_TIME'].strftime('%H:%M')}", "neutral") +
-        "  " + info_badge(
-            "Before 10:00 — opening-range breaks only, entry on the CLOSE of the first "
-            "candle beyond the range. 10:00 to 12:30 — nothing is issued. "
-            "After 12:30 — momentum names only: above VWAP, at the top of the day range, "
-            "real relative volume, higher timeframes agreeing."),
-        unsafe_allow_html=True)
-    st.caption(f"Entry range: {ORB_TF_LABEL.get(CFG['ORB_MINUTES'], CFG['ORB_MINUTES'])} · "
-               f"profile {MTF_PROFILE} · stop capped at {CFG['SL_CAP_PCT']}% · "
-               f"half booked at +{CFG['PARTIAL_PCT']}% then stop to breakeven")
-    if st.button("⚡ Run live screener", type="primary", key="btn_orb"):
-        with st.spinner("pulling intraday bars for the whole F&O list…"):
-            st.session_state.res_orb = scan_live_orb(
-                capital=capital, orb_minutes=CFG["ORB_MINUTES"], profile=MTF_PROFILE,
-                enforce_time_gates=CFG["ENFORCE_TIME_GATES"],
-                require_mtf=CFG["MTF_REQUIRE_ALIGN"])
-    res = st.session_state.get("res_orb") or load_scan("live_orb")
-    if res and not res.get("error"):
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Confirmed breaks", res.get("n_triggers", 0),
-                  help="Names that closed a candle beyond their opening range.")
-        m2.metric("Cleared all filters", res.get("n_gate_pass", 0),
-                  help="Confluence gate + time gate + higher-timeframe check.")
-        m3.metric("Regime", regime_dot(res.get("regime", "—")),
-                  help="Nifty trend context. \U0001F7E2 BULL, \U0001F534 BEAR, ⚪ NEUTRAL.")
-        m4.metric("Breadth (early)", pct(res.get("mkt_early")),
-                  help="Median early move across the liquid F&O list.")
-        if res.get("gate_message"):
-            st.warning("⏱ " + res["gate_message"])
-        if res.get("n_late_break"):
-            st.caption(f"🕒 {res['n_late_break']} break(s) were dropped for confirming after "
-                       f"{res.get('orb_cutoff', '10:00')}.")
-        act = res.get("actionable") or []
-        if act:
-            st.markdown("##### ✅ Place these")
-            render_signals(act, "orb_act")
-        elif not res.get("orb_suppressed"):
-            st.warning("Nothing passed the gate and the probability floor. That is a valid "
-                       "answer — on the walk-forward sample, forcing a trade on the days the "
-                       "gate was empty was measured on 33 sessions and did not survive "
-                       "re-measurement on 1,026. See V23_VERIFICATION.md.")
-        # ---- v22 (7) momentum block, only after 12:30 ------------------------
-        mom = res.get("momentum") or []
-        if mom:
-            st.markdown("##### 🚀 Momentum names (post-12:30)" + " " + info_badge(
-                "Not an opening-range trade. These are names still trending late in the "
-                "session: holding above (or below) VWAP, sitting in the top (or bottom) "
-                f"{int((1 - CFG['MOMENTUM_MIN_POS']) * 100)}% of the day's range, at least "
-                f"{CFG['MOMENTUM_MIN_MOVE']}% from the open, with the daily and 1-hour "
-                f"charts agreeing. Target {CFG['MOMENTUM_TARGET_PCT']}%, stop at VWAP "
-                f"capped at {CFG['MOMENTUM_SL_PCT']}%."), unsafe_allow_html=True)
-            render_signals(mom, "mom_act")
-        elif res.get("mode") == "MOMENTUM":
-            st.info("No name met the momentum standard. Quality over quantity — an empty "
-                    "list is the correct output on a directionless afternoon.")
-        if res.get("momentum_error"):
-            st.caption(f"momentum scan unavailable ({res['momentum_error']})")
-        with st.expander(f"every confirmed break, ranked ({res.get('n_triggers', 0)})"):
-            _AR = pd.DataFrame(res.get("all_ranked") or [])
-            if len(_AR):
-                if "side" in _AR:
-                    _AR["side"] = _AR["side"].map(side_dot)
-                if "mtf" in _AR:
-                    _AR["mtf"] = _AR["mtf"].map(mtf_dot)
-                if "gate_pass" in _AR:
-                    _AR["gate_pass"] = _AR["gate_pass"].map(gate_dot)
-            D = _clean(_AR,
-                       ["sym", "sector", "side", "trig_clock", "prob_pct", "p3_pct",
-                        "entry", "sl_pct", "rr", "mtf", "trig_min", "orb_range_pct",
-                        "atr_pct", "adr20", "gap", "sec_rel", "gate_pass", "gate_note",
-                        "moved"],
-                       dict(SIG_NAMES, trig_clock="Break time", gate_pass="Gate",
-                            gate_note="Why"))
-            show_df(D, key="orb_all")
-        with st.expander("rejected — and exactly why"):
-            _RJ = pd.DataFrame(res.get("rejected") or [])
-            if len(_RJ) and "side" in _RJ:
-                _RJ["side"] = _RJ["side"].map(side_dot)
-            R = _clean(_RJ,
-                       ["sym", "side", "trig_clock", "prob_pct", "trig_min",
-                        "orb_range_pct", "atr_pct", "adr20", "gate_note"],
-                       dict(SIG_NAMES, trig_clock="Break time", gate_note="Why"))
-            show_df(R, key="orb_rej")
-        with st.expander("sector strength (the rotation signal)"):
-            sec = res.get("sector_early") or {}
-            SD = pd.DataFrame([{"Sector": k, "Median move %": nz(v[0]),
-                                "Breadth % up": nz(v[1], 0)}
-                               for k, v in sec.items()]).sort_values("Median move %",
-                                                                    ascending=False)
-            show_df(SD, key="orb_sec",
-                    help_map={"Median move %": "Median early move of the names in that sector.",
-                              "Breadth % up": "Percent of the sector's names trading up."})
-            st.caption("From the 24–26 Aug case study: on two of the three days, sector beta "
-                       "explained more of the big movers than any company news did.")
-    else:
-        st.info(f"No scan yet. The opening range needs at least one completed "
-                f"{CFG['ORB_MINUTES']}-minute candle.")
-
-# ---------------------------------------------------------------- EOD
-with TABS[2]:
-    tab_header("🌙 Tomorrow's shortlist", "eod",
-               f"Ranked on expected-move capability · profile {MTF_PROFILE} · plan assumes "
-               f"the {ORB_TF_LABEL.get(CFG['ORB_MINUTES'], CFG['ORB_MINUTES'])}")
-    st.caption("Names capable of a 2%+ range tomorrow. Direction is decided by tomorrow's "
-               "opening-range break, in either direction, and only before "
-               f"{CFG['ORB_CUTOFF_TIME'].strftime('%H:%M')}.")
-    if st.button("🌙 Run EOD scan", type="primary", key="btn_eod"):
-        with st.spinner("ranking the F&O list on expansion capability + daily/1-hour context…"):
-            st.session_state.res_eod = scan_eod(capital=capital,
-                                                orb_minutes=CFG["ORB_MINUTES"],
-                                                profile=MTF_PROFILE)
-    res = st.session_state.get("res_eod") or load_scan("eod")
-    if res and not res.get("error"):
-        st.caption(f"for {res.get('for_date')} · generated "
-                   f"{res.get('generated_at') or res.get('ts')} · "
-                   f"regime {regime_dot(res.get('regime'))} · "
-                   f"{res.get('n')} names screened · "
-                   f"{res.get('history_sessions') or '—'} sessions of history")
-        top = res.get("top") or []
-        v = view_toggle("eod")
-        if v == "List":
-            D = pd.DataFrame([{"#": i, "Symbol": p["row"]["sym"], "Sector": p["row"]["sector"],
-                               "Signal time": p.get("signal_time"),
-                               "MTF": mtf_dot(p["row"].get("mtf")),
-                               "Close": nz(p["row"].get("close")),
-                               "P(move) %": nz(p["row"].get("p_move2"), 1),
-                               "ATR %": nz(p["row"].get("atr_pct")),
-                               "ADR %": nz(p["row"].get("adr20")),
-                               "Days ≥2.5%/20": p["row"].get("big20"),
-                               "RVOL": nz(p["row"].get("rvol")),
-                               "R:R": f"1:{p.get('rr')}" if p.get("rr") else "—",
-                               "Pivot": nz((p.get("pivot_D") or {}).get("P")),
-                               "R1": nz((p.get("pivot_D") or {}).get("R1")),
-                               "S1": nz((p.get("pivot_D") or {}).get("S1"))}
-                              for i, p in enumerate(top, 1)])
-            show_df(D, key="eod",
-                    help_map={"R1": "First resistance pivot — the long's first obstacle.",
-                              "S1": "First support pivot — the short's first obstacle.",
-                              "Days ≥2.5%/20": "Sessions out of the last 20 that moved ≥2.5%."})
-            if top:
-                st.caption("ⓘ Hover any column header for what it means. " + top[0].get("note", ""))
-        else:
-            for p in top:
-                r = p["row"]
-                st.markdown(f"##### {r['sym']} · {r['sector']} · {mtf_dot(r.get('mtf'))}")
-                cA, cB = st.columns([2, 3])
-                cA.metric("P(2% move tomorrow)", f"{num(r.get('p_move2'), 1)}%",
-                          help="Base-rate probability the stock travels 2% intraday.")
-                cA.caption(f"ATR {num(r.get('atr_pct'))}% · ADR {num(r.get('adr20'))}% · "
-                           f"RVOL {num(r.get('rvol'))} · R:R 1:{p.get('rr')}")
+                        ticket_card(c["ticket"], extra_rows=[
+                            ("Expected open", money(r.get("exp_open"))), ("Gap", pct(r.get("gap"))),
+                            ("ATR% / ADR%", f"{num(r.get('atr_pct'))} / {num(r.get('adr20'))}"),
+                            ("P(+2% | this gap bucket)", f"{num(r.get('p_up'), 1)}%"),
+                            ("Days ≥2.5% in last 20", num(r.get("big20"), 0)),
+                            ("Room to next resistance", pct(r.get("room_up")))])
+                    with st.expander("next candidates"):
+                        for c in L[1:]:
+                            r = c["row"]
+                            st.write(f"**{r['sym']}** {r['sector']} · gap {pct(r.get('gap'))} · "
+                                     f"ATR {num(r.get('atr_pct'))}% · P {num(r.get('p_up'), 1)}%")
                 with cB:
-                    pivot_table({"D": p.get("pivot_D"), "W": p.get("pivot_W"),
-                                 "M": p.get("pivot_M")})
-                st.caption(p.get("note", ""))
-                with st.expander(f"planned tickets for {r['sym']} — both directions"):
-                    kA, kB = st.columns(2)
-                    with kA:
-                        if p.get("ticket"):
-                            ticket_card(p["ticket"])
-                    with kB:
-                        if p.get("ticket_short"):
-                            ticket_card(p["ticket_short"], low_conf=True)
-        dl(_clean(res.get("table")), "eod_full.csv", "eod_full")
-    else:
-        st.info("No EOD scan yet.")
+                    st.markdown("##### 🔴 SELL candidate")
+                    for c in S[:1]:
+                        r = c["row"]
+                        ticket_card(c["ticket"], low_conf=True, extra_rows=[
+                            ("Expected open", money(r.get("exp_open"))), ("Gap", pct(r.get("gap"))),
+                            ("ATR% / ADR%", f"{num(r.get('atr_pct'))} / {num(r.get('adr20'))}"),
+                            ("P(−2% | this gap bucket)", f"{num(r.get('p_dn'), 1)}%"),
+                            ("Room to next support", pct(r.get("room_dn")))])
+                    with st.expander("next candidates"):
+                        for c in S[1:]:
+                            r = c["row"]
+                            st.write(f"**{r['sym']}** {r['sector']} · gap {pct(r.get('gap'))} · "
+                                     f"ATR {num(r.get('atr_pct'))}% · P {num(r.get('p_dn'), 1)}%")
+            st.info("Gaps mean-revert intraday in this data: P(+2% | gap < −2%) = 60.0% versus "
+                    "P(−2%) = 33.7%. The ranking already accounts for that.")
+            dl(_clean(res.get("table")), "premarket_full.csv", "pm_full")
+        else:
+            st.info("No pre-market scan yet today.")
 
-# ---------------------------------------------------------------- SWING
-with TABS[3]:
+    with sub[1]:
+        _nowt = get_ist_now().time()
+        _win = ("ORB WINDOW OPEN" if _nowt < CFG["ORB_CUTOFF_TIME"] else
+                ("MOMENTUM WINDOW" if _nowt >= CFG["MOMENTUM_START_TIME"] else "STAND ASIDE"))
+        _winkind = {"ORB WINDOW OPEN": "bull", "MOMENTUM WINDOW": "info",
+                    "STAND ASIDE": "warn"}[_win]
+        tab_header("⚡ Live screener", "orb")
+        st.markdown(
+            chip(_win, _winkind) + "  " +
+            chip(f"now {_nowt.strftime('%H:%M')} IST", "neutral") + "  " +
+            chip(f"ORB cut-off {CFG['ORB_CUTOFF_TIME'].strftime('%H:%M')}", "neutral") + "  " +
+            chip(f"momentum from {CFG['MOMENTUM_START_TIME'].strftime('%H:%M')}", "neutral") +
+            "  " + info_badge(
+                "Before 10:00 — opening-range breaks only, entry on the CLOSE of the first "
+                "candle beyond the range. 10:00 to 12:30 — nothing is issued. "
+                "After 12:30 — momentum names only: above VWAP, at the top of the day range, "
+                "real relative volume, higher timeframes agreeing."),
+            unsafe_allow_html=True)
+        st.caption(f"Entry range: {ORB_TF_LABEL.get(CFG['ORB_MINUTES'], CFG['ORB_MINUTES'])} · "
+                   f"profile {MTF_PROFILE} · stop capped at {CFG['SL_CAP_PCT']}% · "
+                   f"half booked at +{CFG['PARTIAL_PCT']}% then stop to breakeven")
+        _orb_out = scan_button("⚡ Run live screener", "orb", scan_live_orb,
+                               help_running="pulling intraday bars for the whole F&O list…",
+                               capital=capital, orb_minutes=CFG["ORB_MINUTES"], profile=MTF_PROFILE,
+                               enforce_time_gates=CFG["ENFORCE_TIME_GATES"],
+                               require_mtf=CFG["MTF_REQUIRE_ALIGN"])
+        if _orb_out is not None:
+            st.session_state.res_orb = _orb_out
+        res = st.session_state.get("res_orb") or load_scan("live_orb")
+        if res and not res.get("error"):
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Confirmed breaks", res.get("n_triggers", 0),
+                      help="Names that closed a candle beyond their opening range.")
+            m2.metric("Cleared all filters", res.get("n_gate_pass", 0),
+                      help="Confluence gate + time gate + higher-timeframe check.")
+            m3.metric("Regime", regime_dot(res.get("regime", "—")),
+                      help="Nifty trend context. \U0001F7E2 BULL, \U0001F534 BEAR, ⚪ NEUTRAL.")
+            m4.metric("Breadth (early)", pct(res.get("mkt_early")),
+                      help="Median early move across the liquid F&O list.")
+            if res.get("gate_message"):
+                st.warning("⏱ " + res["gate_message"])
+            if res.get("n_late_break"):
+                st.caption(f"🕒 {res['n_late_break']} break(s) were dropped for confirming after "
+                           f"{res.get('orb_cutoff', '10:00')}.")
+            act = res.get("actionable") or []
+            if act:
+                st.markdown("##### ✅ Place these")
+                render_signals(act, "orb_act")
+            elif not res.get("orb_suppressed"):
+                st.warning("Nothing passed the gate and the probability floor. That is a valid "
+                           "answer — on the walk-forward sample, forcing a trade on the days the "
+                           "gate was empty was measured on 33 sessions and did not survive "
+                           "re-measurement on 1,026. See V23_VERIFICATION.md.")
+            # ---- v22 (7) momentum block, only after 12:30 ------------------------
+            mom = res.get("momentum") or []
+            if mom:
+                st.markdown("##### 🚀 Momentum names (post-12:30)" + " " + info_badge(
+                    "Not an opening-range trade. These are names still trending late in the "
+                    "session: holding above (or below) VWAP, sitting in the top (or bottom) "
+                    f"{int((1 - CFG['MOMENTUM_MIN_POS']) * 100)}% of the day's range, at least "
+                    f"{CFG['MOMENTUM_MIN_MOVE']}% from the open, with the daily and 1-hour "
+                    f"charts agreeing. Target {CFG['MOMENTUM_TARGET_PCT']}%, stop at VWAP "
+                    f"capped at {CFG['MOMENTUM_SL_PCT']}%."), unsafe_allow_html=True)
+                render_signals(mom, "mom_act")
+            elif res.get("mode") == "MOMENTUM":
+                st.info("No name met the momentum standard. Quality over quantity — an empty "
+                        "list is the correct output on a directionless afternoon.")
+            if res.get("momentum_error"):
+                st.caption(f"momentum scan unavailable ({res['momentum_error']})")
+            with st.expander(f"every confirmed break, ranked ({res.get('n_triggers', 0)})"):
+                _AR = pd.DataFrame(res.get("all_ranked") or [])
+                if len(_AR):
+                    if "side" in _AR:
+                        _AR["side"] = _AR["side"].map(side_dot)
+                    if "mtf" in _AR:
+                        _AR["mtf"] = _AR["mtf"].map(mtf_dot)
+                    if "gate_pass" in _AR:
+                        _AR["gate_pass"] = _AR["gate_pass"].map(gate_dot)
+                D = _clean(_AR,
+                           ["sym", "sector", "side", "trig_clock", "prob_pct", "p3_pct",
+                            "entry", "sl_pct", "rr", "mtf", "trig_min", "orb_range_pct",
+                            "atr_pct", "adr20", "gap", "sec_rel", "gate_pass", "gate_note",
+                            "moved"],
+                           dict(SIG_NAMES, trig_clock="Break time", gate_pass="Gate",
+                                gate_note="Why"))
+                show_df(D, key="orb_all")
+            with st.expander("rejected — and exactly why"):
+                _RJ = pd.DataFrame(res.get("rejected") or [])
+                if len(_RJ) and "side" in _RJ:
+                    _RJ["side"] = _RJ["side"].map(side_dot)
+                R = _clean(_RJ,
+                           ["sym", "side", "trig_clock", "prob_pct", "trig_min",
+                            "orb_range_pct", "atr_pct", "adr20", "gate_note"],
+                           dict(SIG_NAMES, trig_clock="Break time", gate_note="Why"))
+                show_df(R, key="orb_rej")
+            with st.expander("sector strength (the rotation signal)"):
+                sec = res.get("sector_early") or {}
+                SD = pd.DataFrame([{"Sector": k, "Median move %": nz(v[0]),
+                                    "Breadth % up": nz(v[1], 0)}
+                                   for k, v in sec.items()]).sort_values("Median move %",
+                                                                        ascending=False)
+                show_df(SD, key="orb_sec",
+                        help_map={"Median move %": "Median early move of the names in that sector.",
+                                  "Breadth % up": "Percent of the sector's names trading up."})
+                st.caption("From the 24–26 Aug case study: on two of the three days, sector beta "
+                           "explained more of the big movers than any company news did.")
+        else:
+            st.info(f"No scan yet. The opening range needs at least one completed "
+                    f"{CFG['ORB_MINUTES']}-minute candle.")
+
+    with sub[2]:
+        tab_header("🌙 Tomorrow's shortlist", "eod",
+                   f"Ranked on expected-move capability · profile {MTF_PROFILE} · plan assumes "
+                   f"the {ORB_TF_LABEL.get(CFG['ORB_MINUTES'], CFG['ORB_MINUTES'])}")
+        st.caption("Names capable of a 2%+ range tomorrow. Direction is decided by tomorrow's "
+                   "opening-range break, in either direction, and only before "
+                   f"{CFG['ORB_CUTOFF_TIME'].strftime('%H:%M')}.")
+        _eod_out = scan_button("🌙 Run EOD scan", "eod", scan_eod,
+                               help_running="ranking the F&O list on expansion capability + "
+                                            "daily/1-hour context…",
+                               capital=capital, orb_minutes=CFG["ORB_MINUTES"], profile=MTF_PROFILE)
+        if _eod_out is not None:
+            st.session_state.res_eod = _eod_out
+        res = st.session_state.get("res_eod") or load_scan("eod")
+        if res and not res.get("error"):
+            st.caption(f"for {res.get('for_date')} · generated "
+                       f"{res.get('generated_at') or res.get('ts')} · "
+                       f"regime {regime_dot(res.get('regime'))} · "
+                       f"{res.get('n')} names screened · "
+                       f"{res.get('history_sessions') or '—'} sessions of history")
+            top = res.get("top") or []
+            v = view_toggle("eod")
+            if v == "List":
+                D = pd.DataFrame([{"#": i, "Symbol": p["row"]["sym"], "Sector": p["row"]["sector"],
+                                   "Signal time": p.get("signal_time"),
+                                   "MTF": mtf_dot(p["row"].get("mtf")),
+                                   "Close": nz(p["row"].get("close")),
+                                   "P(move) %": nz(p["row"].get("p_move2"), 1),
+                                   "ATR %": nz(p["row"].get("atr_pct")),
+                                   "ADR %": nz(p["row"].get("adr20")),
+                                   "Days ≥2.5%/20": p["row"].get("big20"),
+                                   "RVOL": nz(p["row"].get("rvol")),
+                                   "R:R": f"1:{p.get('rr')}" if p.get("rr") else "—",
+                                   "Pivot": nz((p.get("pivot_D") or {}).get("P")),
+                                   "R1": nz((p.get("pivot_D") or {}).get("R1")),
+                                   "S1": nz((p.get("pivot_D") or {}).get("S1"))}
+                                  for i, p in enumerate(top, 1)])
+                show_df(D, key="eod",
+                        help_map={"R1": "First resistance pivot — the long's first obstacle.",
+                                  "S1": "First support pivot — the short's first obstacle.",
+                                  "Days ≥2.5%/20": "Sessions out of the last 20 that moved ≥2.5%."})
+                if top:
+                    st.caption("ⓘ Hover any column header for what it means. " + top[0].get("note", ""))
+            else:
+                for p in top:
+                    r = p["row"]
+                    st.markdown(f"##### {r['sym']} · {r['sector']} · {mtf_dot(r.get('mtf'))}")
+                    cA, cB = st.columns([2, 3])
+                    cA.metric("P(2% move tomorrow)", f"{num(r.get('p_move2'), 1)}%",
+                              help="Base-rate probability the stock travels 2% intraday.")
+                    cA.caption(f"ATR {num(r.get('atr_pct'))}% · ADR {num(r.get('adr20'))}% · "
+                               f"RVOL {num(r.get('rvol'))} · R:R 1:{p.get('rr')}")
+                    with cB:
+                        pivot_table({"D": p.get("pivot_D"), "W": p.get("pivot_W"),
+                                     "M": p.get("pivot_M")})
+                    st.caption(p.get("note", ""))
+                    with st.expander(f"planned tickets for {r['sym']} — both directions"):
+                        kA, kB = st.columns(2)
+                        with kA:
+                            if p.get("ticket"):
+                                ticket_card(p["ticket"])
+                        with kB:
+                            if p.get("ticket_short"):
+                                ticket_card(p["ticket_short"], low_conf=True)
+            dl(_clean(res.get("table")), "eod_full.csv", "eod_full")
+        else:
+            st.info("No EOD scan yet.")
+
+    with sub[3]:
+        render_aggressive_tab(capital)
+
+with colS:
+    st.markdown("## 📈 SWING")
     tab_header("📈 Weekly swing plan", "swing",
                f"SWING profile · Daily chart for the full-day structure → Monday "
                f"{ORB_TF_LABEL.get(CFG['SWING_ORB_MINUTES'], CFG['SWING_ORB_MINUTES'])} "
@@ -4402,11 +4591,12 @@ with TABS[3]:
     st.caption("Calibrated on 133 weeks of 60-min bars. P(+10% before a −5% stop) is 2.2% "
                "unconditionally and 11.1% on the top-3 ranked names, so the ladder is "
                "+3% / +5% / +10% — the 10% is the runner, not the plan.")
-    if st.button("📈 Run swing scan", type="primary", key="btn_sw"):
-        with st.spinner("building weekly features…"):
-            st.session_state.res_sw = scan_swing(
-                capital=capital, orb_minutes=CFG["SWING_ORB_MINUTES"],
-                profile=PROFILE_SWING)
+    _sw_out = scan_button("📈 Run swing scan", "sw", scan_swing,
+                          help_running="building weekly features…",
+                          capital=capital, orb_minutes=CFG["SWING_ORB_MINUTES"],
+                          profile=PROFILE_SWING)
+    if _sw_out is not None:
+        st.session_state.res_sw = _sw_out
     res = st.session_state.get("res_sw") or load_scan("swing")
     if res and not res.get("error"):
         st.caption(f"for week starting {res.get('for_week', '—')} · generated "
@@ -4447,8 +4637,11 @@ with TABS[3]:
     else:
         st.info("No swing scan yet. Run it on Friday after the close or over the weekend.")
 
+
+st.divider()
+MORE_TABS = st.tabs(["🔁 Replay / backtest", "📊 Movers", "🧠 Learning", "📓 Journal"])
 # ---------------------------------------------------------------- REPLAY
-with TABS[4]:
+with MORE_TABS[0]:
     tab_header("🔁 Replay & backtest", "replay",
                f"Profile {MTF_PROFILE} · entry range "
                f"{ORB_TF_LABEL.get(CFG['ORB_MINUTES'], CFG['ORB_MINUTES'])}")
@@ -4672,7 +4865,7 @@ with TABS[4]:
                                                "pnl": "Day P&L %"}), key="bt_days")
 
 # ---------------------------------------------------------------- MOVERS
-with TABS[5]:
+with MORE_TABS[1]:
     tab_header("📊 Top gainers & losers", "movers", "Automatic from the price panel, "
                                                      "plus your own manual list")
     st.caption("Automatic: computed from the F&O price panel. Daily = intraday open-to-close, "
@@ -4759,7 +4952,7 @@ with TABS[5]:
                 dl(man, "manual_movers.csv", "mv_man_cards")
 
 # ---------------------------------------------------------------- LEARNING
-with TABS[6]:
+with MORE_TABS[2]:
     tab_header("🧠 What separates the big movers", "learn",
                "Measured on the PREVIOUS day's features, so it is usable before the move")
     st.caption("Built from the 24–26 Aug case study and from every session in the sample. "
@@ -4899,7 +5092,7 @@ automation runs all three jobs; nothing needs to be triggered by hand.
         st.write(rf)
 
 # ---------------------------------------------------------------- JOURNAL
-with TABS[7]:
+with MORE_TABS[3]:
     tab_header("📓 Journal", "journal",
                "Every generated signal is logged automatically · add your own fills manually")
     j1, j2 = st.tabs(["🤖 Automatic (every signal)", "✍️ Manual (your trades)"])
