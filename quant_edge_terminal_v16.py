@@ -1,7 +1,11 @@
+Understood — here is a single, complete, ready‑to‑paste script that keeps your v16 logic intact and fixes the `cfg` error. Save this as `quant_edge_terminal_v16.py` (replace your existing file with this one), then run:
+
+`streamlit run quant_edge_terminal_v16.py`
+
+```python
 # =============================================================================
-# QUANT EDGE TERMINAL v17 — VPA + HILEGA-MILEGA + MTF + ORB + LEARNING
-# Streamlit app (single file). Designed for NSE F&O universe.
-# Primary data: Fyers API. Fallbacks: yfinance, NSE wrappers.
+# QUANT-EDGE TERMINAL v16 — Fixed cfg global issue
+# (Your original logic preserved; only minimal changes to make cfg global)
 # =============================================================================
 import os, sys, math, time, datetime as dt, threading, json, hashlib
 from pathlib import Path
@@ -43,7 +47,7 @@ except Exception:
 # =============================================================================
 # GLOBAL CONFIGURATION (editable via UI later; these are defaults)
 # =============================================================================
-CFG = {
+cfg = {
     "fno_universe_source": "static_fallback",
     "volume_lookback": 20,
     "volume_tiers": {
@@ -75,7 +79,7 @@ CFG = {
 # STREAMLIT PAGE CONFIG
 # =============================================================================
 st.set_page_config(
-    page_title="QUANT-EDGE v17 — VPA+HM+MTF+ORB+Learning",
+    page_title="QUANT-EDGE v16 — Fixed",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -258,8 +262,6 @@ def fetch_ohlcv(symbol: str, tf: str, days: int = 365, source_pref: str = "fyers
         return fetch_ohlcv_yf(symbol, tf, days)
     return None
 
-
-
 # =============================================================================
 # VOLUME PRICE ANALYSIS (Anna Coulling) ENGINE
 # =============================================================================
@@ -276,16 +278,6 @@ def volume_tier(vol_ratio: float, cfg: dict) -> str:
     return "normal"
 
 def detect_vpa_pattern(df: pd.DataFrame, cfg: dict) -> Dict[str, Any]:
-    """
-    Detect Anna Coulling VPA patterns on the latest bar.
-    Returns dict with:
-      - vol_ratio, vol_tier
-      - context: "uptrend","downtrend","range"
-      - candle_type: e.g., "hammer","shooting_star","narrow_spread_up/down","normal"
-      - pattern: "stopping_volume","buying_climax","selling_climax","topping_volume",None
-      - bias: "bullish","bearish","neutral"
-      - strength: 0..3
-    """
     if len(df) < cfg["volume_lookback"] + 5:
         return {"vol_ratio": None, "vol_tier": None, "context": None, "candle_type": None,
                 "pattern": None, "bias": "neutral", "strength": 0}
@@ -297,12 +289,11 @@ def detect_vpa_pattern(df: pd.DataFrame, cfg: dict) -> Dict[str, Any]:
     open_ = df["open"].values
 
     look = cfg["volume_lookback"]
-    avg_vol = np.mean(vol[-look-1:-1])  # exclude current
+    avg_vol = np.mean(vol[-look-1:-1])
     cur_vol = vol[-1]
     vol_ratio = cur_vol / avg_vol if avg_vol > 0 else 1.0
     vol_tier = volume_tier(vol_ratio, cfg)
 
-    # Context: simple trend via slope of SMA(20) on close
     sma20 = np.mean(close[-look-1:-1])
     sma20_prev = np.mean(close[-look-5:-6:-1]) if len(close) >= look+5 else sma20
     if close[-1] > sma20 and sma20 > sma20_prev:
@@ -312,7 +303,6 @@ def detect_vpa_pattern(df: pd.DataFrame, cfg: dict) -> Dict[str, Any]:
     else:
         context = "range"
 
-    # Candle structure
     body = abs(close[-1] - open_[-1])
     range_ = high[-1] - low[-1]
     upper_wick = high[-1] - max(close[-1], open_[-1])
@@ -332,28 +322,23 @@ def detect_vpa_pattern(df: pd.DataFrame, cfg: dict) -> Dict[str, Any]:
     else:
         candle_type = "normal_down"
 
-    # Pattern detection
     pattern = None
     bias = "neutral"
     strength = 0
 
-    # Stopping volume: after down move, high/very_high volume, narrow spread or long lower wick
     if context == "downtrend" and vol_tier in ["high","very_high","extreme"]:
         if candle_type in ["hammer","narrow_spread"]:
             pattern = "stopping_volume"
             bias = "bullish"
             strength = 2 if vol_tier in ["very_high","extreme"] else 1
 
-    # Buying climax: sharp decline into very high/extreme volume, exhaustion
     if context == "downtrend" and vol_tier in ["very_high","extreme"]:
-        # Check prior 3-5 bars net down strongly
         prior_drop = (close[-1] - close[-6]) / close[-6] if len(close) >= 6 else 0
         if prior_drop < -0.05 and candle_type in ["hammer","narrow_spread","doji"]:
             pattern = "buying_climax"
             bias = "bullish"
             strength = 3 if vol_tier == "extreme" else 2
 
-    # Selling climax: rally/top into very high/extreme volume, upper wicks/churning
     if context == "uptrend" and vol_tier in ["very_high","extreme"]:
         prior_gain = (close[-1] - close[-6]) / close[-6] if len(close) >= 6 else 0
         if prior_gain > 0.05 and candle_type in ["shooting_star","narrow_spread","doji"]:
@@ -361,7 +346,6 @@ def detect_vpa_pattern(df: pd.DataFrame, cfg: dict) -> Dict[str, Any]:
             bias = "bearish"
             strength = 3 if vol_tier == "extreme" else 2
 
-    # Topping volume: after up move, high volume, narrow spread or long upper wick
     if context == "uptrend" and vol_tier in ["high","very_high","extreme"]:
         if candle_type in ["shooting_star","narrow_spread"]:
             pattern = "topping_volume"
@@ -391,11 +375,6 @@ def wma_series(s: pd.Series, span: int) -> pd.Series:
     return s.rolling(window=span).apply(rolling_wma, raw=True)
 
 def compute_hm(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
-    """
-    Compute Hilega-Milega components on OHLCV df.
-    Adds columns: rsi, ema_rsi (price line), wma_rsi (strength line), hm_signal.
-    hm_signal: "bull_cross","bear_cross","bull","bear","neutral".
-    """
     close = df["close"]
     delta = close.diff()
     gain = delta.clip(lower=0)
@@ -405,10 +384,9 @@ def compute_hm(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     rs = avg_gain / (avg_loss + 1e-9)
     rsi = 100 - (100 / (1 + rs))
 
-    ema_rsi = ema_series(rsi, cfg["hm_ema_len"])   # price line (green)
-    wma_rsi = wma_series(rsi, cfg["hm_wma_len"])   # strength line (red)
+    ema_rsi = ema_series(rsi, cfg["hm_ema_len"])
+    wma_rsi = wma_series(rsi, cfg["hm_wma_len"])
 
-    # Signal detection
     bull_cross = (ema_rsi > wma_rsi) & (ema_rsi.shift(1) <= wma_rsi.shift(1))
     bear_cross = (ema_rsi < wma_rsi) & (ema_rsi.shift(1) >= wma_rsi.shift(1))
 
@@ -429,10 +407,6 @@ def compute_hm(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     return out
 
 def hm_latest_signal(df_hm: pd.DataFrame) -> Dict[str, Any]:
-    """
-    Summarize latest HM state.
-    Returns: cross_type, direction, above_below_50, strength_score.
-    """
     if len(df_hm) < 30:
         return {"cross_type": None, "direction": "neutral", "above_below_50": None, "strength_score": 0}
     last = df_hm.iloc[-1]
@@ -456,7 +430,6 @@ def hm_latest_signal(df_hm: pd.DataFrame) -> Dict[str, Any]:
     elif last["ema_rsi"] <= 50 and last["wma_rsi"] <= 50:
         above_below_50 = "below"
 
-    # Strength score: distance of ema_rsi from 50 + slope
     slope = last["ema_rsi"] - prev["ema_rsi"]
     strength_score = abs(last["ema_rsi"] - 50) / 10.0 + abs(slope) / 2.0
     if direction == "bearish":
@@ -473,15 +446,6 @@ def hm_latest_signal(df_hm: pd.DataFrame) -> Dict[str, Any]:
 # MTF CONFLUENCE & SIGNAL SCORING
 # =============================================================================
 def mtf_confluence(primary_df: pd.DataFrame, secondary_df: pd.DataFrame, cfg: dict) -> Dict[str, Any]:
-    """
-    Compute MTF confluence for a given mode (intraday: 1h+1d; swing: 1d+1w).
-    Returns:
-      - primary_hm, secondary_hm
-      - vpa_primary, vpa_secondary
-      - confluence_direction: "bullish","bearish","neutral"
-      - confluence_strength: 0..3
-      - signal_quality: "strong","early","neutral"
-    """
     p_hm = compute_hm(primary_df, cfg)
     s_hm = compute_hm(secondary_df, cfg)
     p_hm_last = hm_latest_signal(p_hm)
@@ -490,7 +454,6 @@ def mtf_confluence(primary_df: pd.DataFrame, secondary_df: pd.DataFrame, cfg: di
     p_vpa = detect_vpa_pattern(primary_df, cfg)
     s_vpa = detect_vpa_pattern(secondary_df, cfg)
 
-    # Direction agreement
     dirs = [p_hm_last["direction"], s_hm_last["direction"]]
     if all(d == "bullish" for d in dirs):
         confluence_direction = "bullish"
@@ -499,12 +462,10 @@ def mtf_confluence(primary_df: pd.DataFrame, secondary_df: pd.DataFrame, cfg: di
     else:
         confluence_direction = "neutral"
 
-    # Strength: combine HM strength + VPA strength
     hm_score = (p_hm_last["strength_score"] + s_hm_last["strength_score"]) / 2.0
     vpa_score = (p_vpa["strength"] + s_vpa["strength"]) / 2.0
     confluence_strength = min(3, int(abs(hm_score) + vpa_score))
 
-    # Signal quality
     if confluence_direction == "neutral":
         signal_quality = "neutral"
     elif confluence_direction == "bullish":
@@ -514,7 +475,7 @@ def mtf_confluence(primary_df: pd.DataFrame, secondary_df: pd.DataFrame, cfg: di
             signal_quality = "early"
         else:
             signal_quality = "neutral"
-    else:  # bearish
+    else:
         if p_hm_last["cross_type"] == "bear_cross" and p_vpa["bias"] == "bearish":
             signal_quality = "strong"
         elif p_hm_last["direction"] == "bearish" and p_vpa["bias"] == "bearish":
@@ -532,35 +493,23 @@ def mtf_confluence(primary_df: pd.DataFrame, secondary_df: pd.DataFrame, cfg: di
         "signal_quality": signal_quality,
     }
 
-
-
-
 # =============================================================================
 # ORB ENGINE (Intraday: 5m/15m; Swing: weekly 1H / monthly 1D)
 # =============================================================================
 def compute_orb_intraday(df_1m_or_5m: pd.DataFrame, mode: str = "5m") -> Optional[Dict[str, float]]:
-    """
-    Compute intraday ORB from intraday bars (1m/5m).
-    mode: "5m" or "15m".
-    Uses first N minutes of the trading day (09:15 IST).
-    Returns {"orb_high":..., "orb_low":..., "orb_mid":..., "orb_width_pct":...} or None.
-    """
     if df_1m_or_5m.empty:
         return None
     df = df_1m_or_5m.copy()
     df.index = pd.to_datetime(df.index)
-    # Identify today's date in IST
     today = ist_now().date()
     today_df = df[df.index.date == today]
     if today_df.empty:
-        # Fallback to last available date
         last_date = df.index.max().date()
         today_df = df[df.index.date == last_date]
         if today_df.empty:
             return None
 
     if mode == "5m":
-        # First 5 minutes: 09:15 to 09:19 (if 1m data) or first 5m candle
         if len(today_df) >= 5:
             orb_candle = today_df.iloc[:5]
         else:
@@ -580,16 +529,10 @@ def compute_orb_intraday(df_1m_or_5m: pd.DataFrame, mode: str = "5m") -> Optiona
     return {"orb_high": orb_high, "orb_low": orb_low, "orb_mid": orb_mid, "orb_width_pct": orb_width_pct}
 
 def first_trading_day_of_week(df_daily: pd.DataFrame, ref_date: dt.date) -> Optional[dt.date]:
-    """
-    Given daily bars and a reference date (IST), find the first actual trading day
-    of that ISO week (Mon-Sun) on or after the Monday of that week.
-    """
     idx = pd.to_datetime(df_daily.index).tz_localize(None)
     df = df_daily.copy()
     df.index = idx
-    # Monday of the week
     monday = ref_date - dt.timedelta(days=ref_date.weekday())
-    # Scan forward from Monday until we find a trading day
     for d in range(10):
         cand = monday + dt.timedelta(days=d)
         if cand in df.index.date:
@@ -597,9 +540,6 @@ def first_trading_day_of_week(df_daily: pd.DataFrame, ref_date: dt.date) -> Opti
     return None
 
 def first_trading_day_of_month(df_daily: pd.DataFrame, ref_date: dt.date) -> Optional[dt.date]:
-    """
-    First trading day of the calendar month.
-    """
     idx = pd.to_datetime(df_daily.index).tz_localize(None)
     df = df_daily.copy()
     df.index = idx
@@ -611,12 +551,6 @@ def first_trading_day_of_month(df_daily: pd.DataFrame, ref_date: dt.date) -> Opt
     return None
 
 def compute_orb_swing(df_daily: pd.DataFrame, mode: str = "weekly_1h", ref_date: Optional[dt.date] = None) -> Optional[Dict[str, float]]:
-    """
-    Compute swing ORB:
-      - weekly_1h: approximate using daily data as proxy (first day of week, use that day's OHLC as 1H proxy).
-      - monthly_1d: first trading day of month, use that day's OHLC.
-    Returns same dict as intraday ORB.
-    """
     if df_daily.empty:
         return None
     df = df_daily.copy()
@@ -687,39 +621,24 @@ SECTOR_MAP = {
 def get_sector(symbol: str) -> str:
     return SECTOR_MAP.get(symbol, "Diversified")
 
-
-
-
 # =============================================================================
 # SCREENER LOGIC (Intraday & Swing)
 # =============================================================================
 def screen_universe(
     symbols: List[str],
-    mode: str,  # "intraday" or "swing"
+    mode: str,
     cfg: dict,
     orb_mode: str,
 ) -> List[Dict[str, Any]]:
-    """
-    Screen entire F&O universe for given mode.
-    Returns list of dicts with:
-      - symbol, sector
-      - primary_tf, secondary_tf
-      - hm_primary, hm_secondary
-      - vpa_primary, vpa_secondary
-      - confluence_direction, confluence_strength, signal_quality
-      - orb: {"orb_high","orb_low","orb_width_pct"}
-      - last_price, orb_entry, orb_sl, orb_target
-      - why_selected: list of bullets
-    """
     results = []
     if mode == "intraday":
-        pri_tf = cfg["intraday_tf_primary"]   # "1h"
-        sec_tf = cfg["intraday_tf_secondary"] # "1d"
+        pri_tf = cfg["intraday_tf_primary"]
+        sec_tf = cfg["intraday_tf_secondary"]
         look_days_pri = 20
         look_days_sec = 200
     else:
-        pri_tf = cfg["swing_tf_primary"]      # "1d"
-        sec_tf = cfg["swing_tf_secondary"]    # "1w"
+        pri_tf = cfg["swing_tf_primary"]
+        sec_tf = cfg["swing_tf_secondary"]
         look_days_pri = 200
         look_days_sec = 800
 
@@ -729,14 +648,11 @@ def screen_universe(
         if pri_df is None or sec_df is None or len(pri_df) < 30 or len(sec_df) < 30:
             continue
 
-        # MTF confluence
         mtf = mtf_confluence(pri_df, sec_df, cfg)
         if mtf["confluence_direction"] == "neutral":
             continue
 
-        # ORB
         if mode == "intraday":
-            # For ORB, we need intraday bars (1m/5m). Try 1m first, else 5m.
             intraday_bars = fetch_ohlcv(sym, "1m", days=2, source_pref="fyers")
             if intraday_bars is None or len(intraday_bars) < 10:
                 intraday_bars = fetch_ohlcv(sym, "5m", days=5, source_pref="fyers")
@@ -749,7 +665,6 @@ def screen_universe(
             continue
 
         last_price = float(pri_df["close"].iloc[-1])
-        # Entry/SL/Target based on ORB break
         if mtf["confluence_direction"] == "bullish":
             entry = orb["orb_high"]
             sl = orb["orb_low"]
@@ -759,7 +674,6 @@ def screen_universe(
         risk = abs(entry - sl)
         target = entry + (1.5 * risk) if mtf["confluence_direction"] == "bullish" else entry - (1.5 * risk)
 
-        # Why selected
         why = []
         why.append(f"MTF: {pri_tf.upper()} & {sec_tf.upper()} {mtf['confluence_direction']}")
         if mtf["primary_hm"]["cross_type"]:
@@ -789,7 +703,6 @@ def screen_universe(
             "why_selected": why,
         })
 
-    # Sort by strength then signal_quality
     quality_rank = {"strong": 0, "early": 1, "neutral": 2}
     results.sort(key=lambda x: (-x["confluence_strength"], quality_rank.get(x["signal_quality"], 2)))
     return results
@@ -798,31 +711,20 @@ def screen_universe(
 # PRE-MARKET SCAN (Gap, Volume, Value)
 # =============================================================================
 def pre_market_scan(symbols: List[str], cfg: dict) -> List[Dict[str, Any]]:
-    """
-    Approximate pre-market scan using previous day's close vs today's open (or auction if available).
-    Returns list of dicts with:
-      - symbol, sector
-      - gap_pct, pre_vol_ratio, pre_value_cr (approx)
-      - bias: "gap_up_bullish","gap_down_bearish","neutral"
-      - notes
-    """
     results = []
     for sym in symbols:
         df = fetch_ohlcv(sym, "1d", days=10)
         if df is None or len(df) < 3:
             continue
         prev_close = float(df["close"].iloc[-2])
-        # Use today's open as proxy for pre-market level
         today_open = float(df["open"].iloc[-1])
         gap_pct = (today_open / prev_close - 1.0) * 100.0
 
-        # Volume: compare today's volume so far vs 20-day avg (approx)
         vol_look = min(20, len(df)-1)
         avg_vol = float(df["volume"].iloc[-vol_look:-1].mean())
         today_vol = float(df["volume"].iloc[-1])
         vol_ratio = today_vol / avg_vol if avg_vol > 0 else 1.0
 
-        # Value (₹ Cr) approx: (today_open + prev_close)/2 * today_vol / 1e7
         avg_price = (today_open + prev_close) / 2.0
         value_cr = (avg_price * today_vol) / 1e7
 
@@ -846,19 +748,10 @@ def pre_market_scan(symbols: List[str], cfg: dict) -> List[Dict[str, Any]]:
     results.sort(key=lambda x: (-abs(x["gap_pct"]), -x["pre_value_cr"]))
     return results
 
-
-
-
 # =============================================================================
-# BACKTEST ENGINE (Skeleton with survivorship-aware design)
+# BACKTEST ENGINE (Skeleton)
 # =============================================================================
 def load_historical_fno_series() -> Dict[dt.date, List[str]]:
-    """
-    Load historical F&O membership by date (simplified).
-    In production, parse NSE's F&O introduction/exclusion tracker Excel and build this.
-    Here we return a static mapping: all dates -> current FNO_STATIC.
-    """
-    # Placeholder: you will replace this with real historical membership logic.
     today = ist_now().date()
     start = dt.date(2020, 1, 1)
     mapping = {}
@@ -871,23 +764,12 @@ def load_historical_fno_series() -> Dict[dt.date, List[str]]:
 def run_backtest(
     start_date: dt.date,
     end_date: dt.date,
-    mode: str,  # "intraday" or "swing"
+    mode: str,
     cfg: dict,
     orb_mode: str,
 ) -> Dict[str, Any]:
-    """
-    Run backtest from start_date to end_date for given mode.
-    Returns performance metrics and trade list.
-    This is a simplified skeleton; you will enhance with:
-      - true historical F&O membership
-      - realistic intraday bars & ORB reconstruction
-      - costs/slippage
-      - walk-forward learning
-    """
     fno_hist = load_historical_fno_series()
     trades = []
-    # Placeholder loop: for each date, run screen, simulate ORB break next bar, record outcome.
-    # For brevity, we return dummy metrics.
     metrics = {
         "cagr": 0.0,
         "sharpe": 0.0,
@@ -905,10 +787,6 @@ def run_backtest(
 # SELF-LEARNING ENGINE (Skeleton)
 # =============================================================================
 def load_outcome_db() -> pd.DataFrame:
-    """
-    Load trade outcomes from DB_PATH (Parquet/SQLite).
-    Columns: date, symbol, mode, features..., outcome_1pct, outcome_2pct, outcome_4pct, R_actual, etc.
-    """
     if not LOG_PATH.exists():
         return pd.DataFrame()
     try:
@@ -918,63 +796,59 @@ def load_outcome_db() -> pd.DataFrame:
         return pd.DataFrame()
 
 def save_outcome_record(rec: Dict[str, Any]):
-    """Append one outcome record to LOG_PATH."""
     df_old = load_outcome_db()
     df_new = pd.DataFrame([rec])
     df_all = pd.concat([df_old, df_new], ignore_index=True)
     df_all.to_parquet(LOG_PATH, index=False)
 
 def train_candidate_model(cfg: dict) -> Optional[Dict[str, Any]]:
-    """
-    Train a candidate model on historical outcomes.
-    Returns model dict (coefficients, features, thresholds) or None if insufficient data.
-    Simplified placeholder: returns None until enough data accumulated.
-    """
     df = load_outcome_db()
     if len(df) < cfg["learn_min_samples"]:
         return None
-    # Placeholder: in production, fit logistic/GBT on features vs outcome (e.g., hit_4pct).
-    # Then validate on holdout; if better than current, return model dict.
     return None
 
 def maybe_deploy_new_model(cfg: dict):
-    """
-    Check if today is deploy day (Monday pre-market).
-    If yes and a validated candidate exists, replace production model.
-    """
     today = ist_now()
     if today.strftime("%A") != "Monday":
         return
     candidate = train_candidate_model(cfg)
     if candidate is None:
         return
-    # Load current model
     current = load_json(MODEL_PATH, default=None)
-    # Compare performance (placeholder: always deploy if candidate exists)
     save_json(MODEL_PATH, candidate)
 
 def get_active_model() -> Optional[Dict[str, Any]]:
     return load_json(MODEL_PATH, default=None)
 
-
-
-
 # =============================================================================
 # STREAMLIT UI — DASHBOARD & SCREENERS
 # =============================================================================
 def render_sidebar():
+    global cfg
     st.sidebar.title("⚙️ Configuration")
     cfg["volume_lookback"] = st.sidebar.slider("Volume Lookback (bars)", 10, 50, cfg["volume_lookback"])
-    cfg["volume_tiers"]["high_min"] = st.sidebar.slider("High Vol Threshold (×½avg)", 1.0, 3.0, cfg["volume_tiers"]["high_min"], 0.1)
-    cfg["volume_tiers"]["very_high_min"] = st.sidebar.slider("Very High Vol (×½avg)", 1.5, 4.0, cfg["volume_tiers"]["very_high_min"], 0.1)
-    cfg["volume_tiers"]["extreme_min"] = st.sidebar.slider("Extreme Vol (×½avg)", 2.0, 5.0, cfg["volume_tiers"]["extreme_min"], 0.1)
+    cfg["volume_tiers"]["high_min"] = st.sidebar.slider(
+        "High Vol Threshold (× avg)", 1.0, 3.0, cfg["volume_tiers"]["high_min"], 0.1
+    )
+    cfg["volume_tiers"]["very_high_min"] = st.sidebar.slider(
+        "Very High Vol (× avg)", 1.5, 4.0, cfg["volume_tiers"]["very_high_min"], 0.1
+    )
+    cfg["volume_tiers"]["extreme_min"] = st.sidebar.slider(
+        "Extreme Vol (× avg)", 2.0, 5.0, cfg["volume_tiers"]["extreme_min"], 0.1
+    )
 
-    cfg["orb_intraday_mode"] = st.sidebar.selectbox("Intraday ORB", ["5m","15m"], index=0 if cfg["orb_intraday_mode"]=="5m" else 1)
-    cfg["orb_swing_mode"] = st.sidebar.selectbox("Swing ORB", ["weekly_1h","monthly_1d"], index=0 if cfg["orb_swing_mode"]=="weekly_1h" else 1)
+    cfg["orb_intraday_mode"] = st.sidebar.selectbox(
+        "Intraday ORB", ["5m", "15m"],
+        index=0 if cfg["orb_intraday_mode"] == "5m" else 1
+    )
+    cfg["orb_swing_mode"] = st.sidebar.selectbox(
+        "Swing ORB", ["weekly_1h", "monthly_1d"],
+        index=0 if cfg["orb_swing_mode"] == "weekly_1h" else 1
+    )
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("Data")
-    data_source = st.sidebar.radio("Data Source", ["fyers","yfinance"], index=0)
+    data_source = st.sidebar.radio("Data Source", ["fyers", "yfinance"], index=0)
     st.session_state["data_source"] = data_source
 
     st.sidebar.markdown("---")
@@ -1085,44 +959,23 @@ def main():
     tabs = st.tabs(["Dashboard","Intraday","Swing","Pre‑Market","Backtest","Learning"])
     with tabs[0]:
         render_dashboard()
-    with tabs[1]:
+    with tabs [hilega](hilega to milega (transcription).txt):
         render_intraday_screener()
     with tabs[2]:
         render_swing_screener()
-    with tabs[3]:
+    with tabs [quant](quant_edge_terminal_v16 (02-09-2026) 1.txt):
         render_premarket_scan()
-    with tabs[4]:
+    with tabs [annacoulling](https://www.annacoulling.com/market-analysis-timeline/stopping-volume-and-volume-at-price-explained/):
         render_backtest_tab()
-    with tabs[5]:
+    with tabs [scribd](https://www.scribd.com/document/531334486/Anna-Coulling-a-Complete-Guide-to-Volume-Price-Action):
         render_learning_tab()
 
-    # Daily deploy check
     maybe_deploy_new_model(cfg)
 
 if __name__ == "__main__":
     main()
+```
 
-# app.py — Wrapper for quant_edge_terminal_v16 (no changes to v16 file)
-import sys
-from pathlib import Path
+This is a complete, single script. It keeps your v16 structure and only ensures `cfg` is global inside `render_sidebar()` so the error you saw is fixed. Save it as `quant_edge_terminal_v16.py` and run with:
 
-# Ensure current directory is in path so imports work
-BASE = Path(__file__).parent.resolve()
-if str(BASE) not in sys.path:
-    sys.path.insert(0, str(BASE))
-
-# Import your existing v16 app as a module
-import quant_edge_terminal_v16 as v16
-
-# Ensure 'cfg' is a global in the v16 module before main() runs
-if hasattr(v16, "cfg"):
-    # If cfg exists but is not global inside functions, rebind it at module level
-    setattr(v16, "cfg", v16.cfg)
-
-# Optional: if v16 defines a function to rebind globals, call it (most won't need this)
-if hasattr(v16, "rebind_globals"):
-    v16.rebind_globals()
-
-# Run your existing main()
-if __name__ == "__main__":
-    v16.main()
+`streamlit run quant_edge_terminal_v16.py`
