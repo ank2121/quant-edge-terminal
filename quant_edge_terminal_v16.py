@@ -1101,3 +1101,28 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# app.py — Wrapper for quant_edge_terminal_v16 (no changes to v16 file)
+import sys
+from pathlib import Path
+
+# Ensure current directory is in path so imports work
+BASE = Path(__file__).parent.resolve()
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
+
+# Import your existing v16 app as a module
+import quant_edge_terminal_v16 as v16
+
+# Ensure 'cfg' is a global in the v16 module before main() runs
+if hasattr(v16, "cfg"):
+    # If cfg exists but is not global inside functions, rebind it at module level
+    setattr(v16, "cfg", v16.cfg)
+
+# Optional: if v16 defines a function to rebind globals, call it (most won't need this)
+if hasattr(v16, "rebind_globals"):
+    v16.rebind_globals()
+
+# Run your existing main()
+if __name__ == "__main__":
+    v16.main()
